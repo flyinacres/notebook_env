@@ -1,0 +1,15 @@
+# Virtual Environment (do not commit!)
+notebook_env/
+.venv/
+venv/
+
+# Python cache & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Execution outputs / temporary files
+pinned_requirements.txt
+*.ipynb_checkpoints/
+output_executed.ipynb
