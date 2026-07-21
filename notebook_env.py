@@ -308,25 +308,28 @@ print("Syncing notebook dependencies...")
 print("\\n? Setup complete! Environment ready.")""")
     print("\n" + "="*80)
 
-# Execution entry point
-generate_production_blueprint(full_freeze=False)
 
 # =====================================================================
 # CLI / STANDALONE ENTRY POINT
 # =====================================================================
+# =====================================================================
+# DUAL-MODE EXECUTION ENTRY POINT
+# =====================================================================
 if __name__ == "__main__":
     import argparse
 
-    # Detect if running inside an active IPython/Jupyter notebook cell
+    # Check if running inside an active interactive IPython/Jupyter cell
     try:
         get_ipython()
-        is_notebook = True
+        is_notebook_cell = True
     except NameError:
-        is_notebook = False
+        is_notebook_cell = False
 
-    if is_notebook:
+    if is_notebook_cell:
+        # Running directly inside a Jupyter notebook cell
         generate_production_blueprint(full_freeze=False)
     else:
+        # Running via Windows CMD
         parser = argparse.ArgumentParser(
             description="Project Environment-Lock: Generate venv-like dependency lockfiles for notebooks."
         )
@@ -339,7 +342,7 @@ if __name__ == "__main__":
         parser.add_argument(
             "--full-freeze",
             action="store_true",
-            help="Append a complete system package snapshot to the generated manifest.",
+            help="Append a complete system package snapshot to generated manifest.",
         )
 
         args = parser.parse_args()
@@ -356,7 +359,14 @@ if __name__ == "__main__":
             with open(args.file, "r", encoding="utf-8") as f:
                 nb = nbformat.read(f, as_version=4)
 
-            # Read own file source code to inject directly into notebook execution stream
+            # 1. Force the notebook metadata to use the active Python executable path
+            nb.metadata["kernelspec"] = {
+                "name": "python3",
+                "display_name": "Python 3 (Active .venv)",
+                "language": "python",
+            }
+
+            # 2. Inject script source code into the notebook execution stream
             with open(__file__, "r", encoding="utf-8") as f:
                 self_code = f.read()
 
@@ -366,9 +376,9 @@ if __name__ == "__main__":
             )
             nb.cells.append(nbformat.v4.new_code_cell(runner_code))
 
-            # Ensure current .venv Scripts directory is prioritized in PATH for kernel execution
-            venv_bin = os.path.dirname(sys.executable)
-            os.environ["PATH"] = venv_bin + os.pathsep + os.environ.get("PATH", "")
+            # 3. Ensure active .venv Python binary takes priority on PATH during kernel launch
+            venv_dir = os.path.dirname(sys.executable)
+            os.environ["PATH"] = venv_dir + os.pathsep + os.environ.get("PATH", "")
 
             ep = ExecutePreprocessor(timeout=300, kernel_name="python3")
 
@@ -380,7 +390,7 @@ if __name__ == "__main__":
                 # Output captured from executed compiler cell
                 for out in nb.cells[-1].outputs:
                     if out.output_type == "stream":
-                        print(out.text)
+                        print(out.text.strip())
                     elif out.output_type == "error":
                         print(f"❌ Execution Error: {out.ename} - {out.evalue}")
 
