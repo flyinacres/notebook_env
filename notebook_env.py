@@ -310,3 +310,82 @@ print("\\n? Setup complete! Environment ready.")""")
 
 # Execution entry point
 generate_production_blueprint(full_freeze=False)
+
+# =====================================================================
+# CLI / STANDALONE ENTRY POINT
+# =====================================================================
+if __name__ == "__main__":
+    import argparse
+
+    # Detect if running inside an active IPython/Jupyter notebook cell
+    try:
+        get_ipython()
+        is_notebook = True
+    except NameError:
+        is_notebook = False
+
+    if is_notebook:
+        generate_production_blueprint(full_freeze=False)
+    else:
+        parser = argparse.ArgumentParser(
+            description="Project Environment-Lock: Generate venv-like dependency lockfiles for notebooks."
+        )
+        parser.add_argument(
+            "-f",
+            "--file",
+            type=str,
+            help="Path to target .ipynb notebook to evaluate headlessly.",
+        )
+        parser.add_argument(
+            "--full-freeze",
+            action="store_true",
+            help="Append a complete system package snapshot to the generated manifest.",
+        )
+
+        args = parser.parse_args()
+
+        if args.file:
+            import nbformat
+            from nbconvert.preprocessors import ExecutePreprocessor
+
+            if not os.path.exists(args.file):
+                print(f"❌ Error: Notebook '{args.file}' not found.")
+                sys.exit(1)
+
+            print(f"⚡ Headlessly evaluating notebook: {args.file}")
+            with open(args.file, "r", encoding="utf-8") as f:
+                nb = nbformat.read(f, as_version=4)
+
+            # Read own file source code to inject directly into notebook execution stream
+            with open(__file__, "r", encoding="utf-8") as f:
+                self_code = f.read()
+
+            runner_code = (
+                f"{self_code}\n\n"
+                f"generate_production_blueprint(full_freeze={args.full_freeze})"
+            )
+            nb.cells.append(nbformat.v4.new_code_cell(runner_code))
+
+            # Ensure current .venv Scripts directory is prioritized in PATH for kernel execution
+            venv_bin = os.path.dirname(sys.executable)
+            os.environ["PATH"] = venv_bin + os.pathsep + os.environ.get("PATH", "")
+
+            ep = ExecutePreprocessor(timeout=300, kernel_name="python3")
+
+            try:
+                ep.preprocess(
+                    nb, {"metadata": {"path": os.path.dirname(args.file) or "."}}
+                )
+
+                # Output captured from executed compiler cell
+                for out in nb.cells[-1].outputs:
+                    if out.output_type == "stream":
+                        print(out.text)
+                    elif out.output_type == "error":
+                        print(f"❌ Execution Error: {out.ename} - {out.evalue}")
+
+            except Exception as e:
+                print(f"🚨 Headless kernel execution failed: {e}")
+                sys.exit(1)
+        else:
+            generate_production_blueprint(full_freeze=args.full_freeze)
