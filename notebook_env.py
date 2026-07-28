@@ -342,17 +342,25 @@ This notebook includes an explicit library configuration block designed to match
 # =====================================================================
 
 import sys
-import urllib.request
+import subprocess
 
-# Task 1 Guard: Ensure Python Major.Minor alignment
 REQUIRED_PYTHON = ({py_major}, {py_minor})
 CURRENT_PYTHON = (sys.version_info.major, sys.version_info.minor)
 
-if CURRENT_PYTHON != REQUIRED_PYTHON:
-    raise RuntimeError(
-        f"Environment mismatch: Notebook requires Python {{REQUIRED_PYTHON[0]}}.{{REQUIRED_PYTHON[1]}}, "
-        f"but current environment is Python {{CURRENT_PYTHON[0]}}.{{CURRENT_PYTHON[1]}}."
-    )
+# Major version mismatch -> Clean hard stop
+if CURRENT_PYTHON[0] != REQUIRED_PYTHON[0]:
+    req_major = REQUIRED_PYTHON[0]
+    curr_major = CURRENT_PYTHON[0]
+    print(f"❌ Error: Major Python version mismatch!")
+    print(f"This notebook requires Python {{req_major}}.x, but your environment is running Python {{curr_major}}.x.\\n")
+    sys.exit("Execution stopped due to Python major version incompatibility.")
+
+# Minor version mismatch -> Non-blocking warning
+if CURRENT_PYTHON[1] != REQUIRED_PYTHON[1]:
+    req_ver = f"{{REQUIRED_PYTHON[0]}}.{{REQUIRED_PYTHON[1]}}"
+    curr_ver = f"{{CURRENT_PYTHON[0]}}.{{CURRENT_PYTHON[1]}}"
+    print(f"⚠️ This code was created with Python {{req_ver}}. You are trying to run it with {{curr_ver}}.")
+    print(f"If installation fails, you may need to change your Python version back to {{req_ver}}.\\n")
 
 # Write explicit library requirements to a local file
 requirements_content = \"\"\"# Tested top-level packages for this notebook
@@ -362,20 +370,21 @@ requirements_content = \"\"\"# Tested top-level packages for this notebook
 with open("pinned_requirements.txt", "w") as f:
     f.write(requirements_content.strip())
 
-print(f"-> Running on Python {{sys.version.split()[0]}}")
+print(f"Applying pinned environment manifest [{timestamp}]...")
+print("💡 Note: If you see 'Retrying...' messages below while offline, enable Internet access and re-run this cell.\\n")
 
-# Pre-check internet availability before attempting pip sync
-try:
-    urllib.request.urlopen('https://pypi.org', timeout=1.0)
-    print("Syncing notebook dependencies via PyPI...")
-    !pip install -r pinned_requirements.txt
+# Run single-pass installation natively via pip
+result = subprocess.run(
+    [sys.executable, "-m", "pip", "install", "-r", "pinned_requirements.txt"],
+    capture_output=False
+)
+
+if result.returncode == 0:
     print("\\n✅ Setup complete! Environment ready.")
-except Exception:
-    print("\\n⚠️ Offline mode detected. Attempting installation from local cache...")
-    !pip install --no-index --find-links ~/.cache/pip -r pinned_requirements.txt
-    print("\\n✅ Offline setup complete.")""")
+else:
+    print("\\n❌ Dependency sync failed.")
+    print("Ensure internet access is enabled in your environment settings and re-run.")""")
     print("\n" + "="*80)
-
 
 # =====================================================================
 # DUAL-MODE EXECUTION ENTRY POINT
