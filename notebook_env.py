@@ -1,5 +1,5 @@
 # =====================================================================
-# PROJECT ENVIRONMENT-LOCK: NOTEBOOK SNAPSHOT TOOL (v15)
+# PROJECT ENVIRONMENT-LOCK: NOTEBOOK SNAPSHOT TOOL (v16)
 # Paste this into the LAST cell of your working notebook and run it.
 # =====================================================================
 
@@ -20,8 +20,8 @@ def clean_hardware_version(pkg_name, version_str):
     """
     hardware_frameworks = {'torch', 'tensorflow', 'jax', 'cupy'}
     if pkg_name in hardware_frameworks and '+' in version_str:
-        return version_str.split('+')[0]
-    return version_str
+        return version_str.split('+')[0], True
+    return version_str, False
 
 def is_internet_available():
     """Fast network probe (0.5s timeout) to prevent silent timeouts on offline runtimes."""
@@ -57,20 +57,34 @@ def is_inside_try_block(node):
         curr = getattr(curr, '_parent', None)
     return False
 
+def resolve_opencv_variant(pypi_candidates, submodules):
+    """
+    Resolves cv2 to a single headless distribution suitable for notebooks,
+    preferring headless variants to avoid GUI system dependency crashes.
+    """
+    has_contrib = any('contrib' in s.lower() or 'aruco' in s.lower() for s.lower in submodules) if submodules else False
+
+    if has_contrib:
+        if 'opencv-contrib-python-headless' in pypi_candidates:
+            return 'opencv-contrib-python-headless'
+        if 'opencv-contrib-python' in pypi_candidates:
+            return 'opencv-contrib-python'
+
+    if 'opencv-python-headless' in pypi_candidates:
+        return 'opencv-python-headless'
+    if 'opencv-python' in pypi_candidates:
+        return 'opencv-python'
+    
+    return pypi_candidates[0]
+
 def generate_production_blueprint(full_freeze=False):
     """
     Generates environment setup blocks for shareable notebooks.
-    
-    Parameters:
-    -----------
-    full_freeze : bool (default=False)
-        - If False: Locks explicit top-level dependencies discovered via AST scan.
-        - If True: Locks explicit top-level dependencies AND appends a complete 
-          commented-out system snapshot at the bottom of the manifest.
     """
-    print("?? Analyzing notebook imports and checking library versions...\n")
+    print("🔍 Analyzing notebook imports and checking library versions...\n")
     
     errors = []
+    warnings_and_defaults = []
     outdated_packages = []
     imported_modules = {} 
     
@@ -80,7 +94,7 @@ def generate_production_blueprint(full_freeze=False):
         ipython = IPython.get_ipython()
         history = ipython.user_ns.get('_ih', []) if ipython else []
     except Exception as e:
-        print(f"? Could not access notebook cell history: {e}")
+        print(f"❌ Could not access notebook cell history: {e}")
         return
 
     # 2. Parse code lines into AST nodes
@@ -129,8 +143,8 @@ def generate_production_blueprint(full_freeze=False):
 
     if not filtered_modules:
         print("!"*80)
-        print("??  No external library imports were found in this session.")
-        print("?? How to fix: Run your notebook code cells first, then re-run this tool.")
+        print("⚠️  No external library imports were found in this session.")
+        print("💡 How to fix: Run your notebook code cells first, then re-run this tool.")
         print("!"*80)
         return
 
@@ -138,7 +152,7 @@ def generate_production_blueprint(full_freeze=False):
     try:
         pkg_dist_map = importlib.metadata.packages_distributions()
     except Exception as e:
-        print(f"? Failed to read system package metadata: {e}")
+        print(f"❌ Failed to read system package metadata: {e}")
         return
 
     detected_packages = {}
@@ -156,14 +170,32 @@ def generate_production_blueprint(full_freeze=False):
             if is_optional:
                 continue
             else:
-                errors.append(f"? Missing Package: You imported '{root_module}', but it is not installed in this environment.")
+                errors.append(f"❌ Missing Package: You imported '{root_module}', but it is not installed in this environment.")
                 continue
 
         if root_module not in pkg_dist_map or not pkg_dist_map[root_module]:
-            errors.append(f"? Unmapped Package: '{root_module}' is installed, but its installer metadata could not be found.")
+            errors.append(f"❌ Unmapped Package: '{root_module}' is installed, but its installer metadata could not be found.")
             continue
 
-        for pypi_name in pkg_dist_map[root_module]:
+        candidates = pkg_dist_map[root_module]
+
+        # OpenCV Disambiguation Logic
+        if root_module == 'cv2' and len(candidates) > 1:
+            chosen = resolve_opencv_variant(candidates, submodules)
+            warnings_and_defaults.append(
+                f"📷 OpenCV Default Choice: 'cv2' mapped to multiple installed packages ({', '.join(candidates)}).\n"
+                f"   Selected '{chosen}' for headless notebook container compatibility."
+            )
+            candidates = [chosen]
+        elif len(candidates) > 1:
+            chosen = candidates[0]
+            warnings_and_defaults.append(
+                f"⚠️ Ambiguous Namespace: Module '{root_module}' maps to multiple installed packages ({', '.join(candidates)}).\n"
+                f"   Selected '{chosen}' by default."
+            )
+            candidates = [chosen]
+
+        for pypi_name in candidates:
             try:
                 version_str = importlib.metadata.version(pypi_name)
                 
@@ -177,6 +209,10 @@ def generate_production_blueprint(full_freeze=False):
                             for sub in submodules:
                                 if sub in provides_extra:
                                     matched_target = f"{pypi_name}[{sub}]"
+                                    warnings_and_defaults.append(
+                                        f"📦 Extra Dependency Promotion: Importing '{root_module}.{sub}' automatically promoted "
+                                        f"dependency to '{matched_target}'."
+                                    )
                                     break
                     except Exception:
                         pass
@@ -184,29 +220,34 @@ def generate_production_blueprint(full_freeze=False):
                 detected_packages[matched_target] = version_str
                 
             except importlib.metadata.PackageNotFoundError:
-                errors.append(f"? Missing Version: Version details for '{pypi_name}' could not be read.")
+                errors.append(f"❌ Missing Version: Version details for '{pypi_name}' could not be read.")
 
     manifest_lines = []
 
     # Fast offline probe gatekeeper
     has_internet = is_internet_available()
     if not has_internet:
-        print("?? Offline mode: Skipping online package freshness check.\n")
+        print("⚠️ Offline mode: Skipping online package freshness check.\n")
 
     # 5. Validate targeted versions and run optional freshness checks
     for pkg_target, ver in sorted(detected_packages.items()):
         base_pkg_name = pkg_target.split('[')[0]
         
         if "/" in ver or "\\" in ver:
-            errors.append(f"? Local Path Warning: '{base_pkg_name}' uses a custom local file path ('{ver}').")
+            errors.append(f"❌ Local Path Warning: '{base_pkg_name}' uses a custom local file path ('{ver}').")
             continue
         try:
             parse_version(ver)
         except Exception:
-            errors.append(f"? Non-standard Version: '{base_pkg_name}' uses an unrecognized version format ('{ver}').")
+            errors.append(f"❌ Non-standard Version: '{base_pkg_name}' uses an unrecognized version format ('{ver}').")
             continue
 
-        cleaned_local_ver = clean_hardware_version(base_pkg_name, ver)
+        cleaned_local_ver, was_stripped = clean_hardware_version(base_pkg_name, ver)
+        if was_stripped:
+            warnings_and_defaults.append(
+                f"⚙️ Hardware Tag Stripped: Cleaned '{base_pkg_name}=={ver}' to '{base_pkg_name}=={cleaned_local_ver}' "
+                f"so pip can select target drivers cleanly."
+            )
         
         if has_internet:
             latest_ver = fetch_latest_pypi_version(base_pkg_name)
@@ -217,7 +258,7 @@ def generate_production_blueprint(full_freeze=False):
 
     if errors:
         print("!"*80)
-        print("?? CANNOT GENERATE SETUP BLOCKS")
+        print("❌ CANNOT GENERATE SETUP BLOCKS")
         print("Please resolve the following issues before sharing this notebook:")
         print("!"*80 + "\n")
         for err in errors:
@@ -237,7 +278,6 @@ def generate_production_blueprint(full_freeze=False):
             p_name = dist.metadata['Name']
             p_ver = dist.version
             
-            # Soft-comment problematic or local versions in full snapshot without crashing script
             if "/" in p_ver or "\\" in p_ver:
                 full_freeze_lines.append(f"# local-path: {p_name}=={p_ver}")
             else:
@@ -247,10 +287,20 @@ def generate_production_blueprint(full_freeze=False):
                 except Exception:
                     full_freeze_lines.append(f"# invalid-version: {p_name}=={p_ver}")
 
+    # Print Warnings and Assumed Overrides Summary
+    if warnings_and_defaults:
+        print("-" * 80)
+        print("💡 ASSUMED DEFAULTS & OVERRIDES APPLIED")
+        print("Review these automatically applied resolutions:")
+        print("-" * 80)
+        for w in warnings_and_defaults:
+            print(f" • {w}")
+        print("-" * 80 + "\n")
+
     # Print compact freshness summary if outdated packages exist
     if outdated_packages:
         print("-" * 80)
-        print("??  NOTICE: SOME LIBRARIES IN THIS ENVIRONMENT ARE OUTDATED")
+        print("⚠️  NOTICE: SOME LIBRARIES IN THIS ENVIRONMENT ARE OUTDATED")
         print("The setup block was generated using your current versions, but updating them")
         print("before sharing can prevent issues caused by older background code.")
         print("-" * 80)
@@ -260,21 +310,23 @@ def generate_production_blueprint(full_freeze=False):
             print(f"{pkg:<25} {curr:<15} {online:<15}")
         print("-" * 80 + "\n")
 
+    py_major = sys.version_info.major
+    py_minor = sys.version_info.minor
     timestamp = datetime.date.today().strftime("%Y-%m-%d")
     
     print("="*80)
-    print("?? HOW TO USE THIS OUTPUT:")
+    print("📋 HOW TO USE THIS OUTPUT:")
     print("1. Create two empty cells at the VERY TOP of your notebook.")
     print("2. Change Cell 1 to 'Markdown' and paste STEP 1 into it.")
     print("3. Keep Cell 2 as 'Code' and paste STEP 2 into it.")
     print("="*80 + "\n")
 
     print("--- [ STEP 1: PASTE INTO CELL 1 (MARKDOWN) ] ---\n")
-    print(f"""# ??? Environment Alignment & Setup
+    print(f"""# 🔒 Environment Alignment & Setup
 
 This notebook includes an explicit library configuration block designed to match the environment used during its creation.
 
-### ?? Why is this setup cell here?
+### ❓ Why is this setup cell here?
 * **Reduces Compatibility Issues:** Locking core library versions helps prevent errors caused when underlying packages release breaking changes later on.
 * **Single-Pass Installation:** Installs required dependencies together to allow the package manager to find compatible versions before code executes.""")
 
@@ -289,36 +341,48 @@ This notebook includes an explicit library configuration block designed to match
 # VERIFIED ENVIRONMENT DEPENDENCIES ({timestamp})
 # =====================================================================
 
+import sys
+import urllib.request
+
+# Task 1 Guard: Ensure Python Major.Minor alignment
+REQUIRED_PYTHON = ({py_major}, {py_minor})
+CURRENT_PYTHON = (sys.version_info.major, sys.version_info.minor)
+
+if CURRENT_PYTHON != REQUIRED_PYTHON:
+    raise RuntimeError(
+        f"Environment mismatch: Notebook requires Python {{REQUIRED_PYTHON[0]}}.{{REQUIRED_PYTHON[1]}}, "
+        f"but current environment is Python {{CURRENT_PYTHON[0]}}.{{CURRENT_PYTHON[1]}}."
+    )
+
 # Write explicit library requirements to a local file
 requirements_content = \"\"\"# Tested top-level packages for this notebook
-# Note: If an installation fails in the future, check whether a sub-dependency 
-# introduced a breaking change or update the specific version tag below.
 {payload_string}
 \"\"\"
 
 with open("pinned_requirements.txt", "w") as f:
     f.write(requirements_content.strip())
 
-# Run single-pass installation without forcing unwanted upgrades to pre-installed tools
-import sys
 print(f"-> Running on Python {{sys.version.split()[0]}}")
-print("Syncing notebook dependencies...")
 
-!pip install -r pinned_requirements.txt
-print("\\n? Setup complete! Environment ready.")""")
+# Pre-check internet availability before attempting pip sync
+try:
+    urllib.request.urlopen('https://pypi.org', timeout=1.0)
+    print("Syncing notebook dependencies via PyPI...")
+    !pip install -r pinned_requirements.txt
+    print("\\n✅ Setup complete! Environment ready.")
+except Exception:
+    print("\\n⚠️ Offline mode detected. Attempting installation from local cache...")
+    !pip install --no-index --find-links ~/.cache/pip -r pinned_requirements.txt
+    print("\\n✅ Offline setup complete.")""")
     print("\n" + "="*80)
 
 
-# =====================================================================
-# CLI / STANDALONE ENTRY POINT
-# =====================================================================
 # =====================================================================
 # DUAL-MODE EXECUTION ENTRY POINT
 # =====================================================================
 if __name__ == "__main__":
     import argparse
 
-    # Check if running inside an active interactive IPython/Jupyter cell
     try:
         get_ipython()
         is_notebook_cell = True
@@ -326,10 +390,8 @@ if __name__ == "__main__":
         is_notebook_cell = False
 
     if is_notebook_cell:
-        # Running directly inside a Jupyter notebook cell
         generate_production_blueprint(full_freeze=False)
     else:
-        # Running via Windows CMD
         parser = argparse.ArgumentParser(
             description="Project Environment-Lock: Generate venv-like dependency lockfiles for notebooks."
         )
@@ -359,14 +421,12 @@ if __name__ == "__main__":
             with open(args.file, "r", encoding="utf-8") as f:
                 nb = nbformat.read(f, as_version=4)
 
-            # 1. Force the notebook metadata to use the active Python executable path
             nb.metadata["kernelspec"] = {
                 "name": "python3",
                 "display_name": "Python 3 (Active .venv)",
                 "language": "python",
             }
 
-            # 2. Inject script source code into the notebook execution stream
             with open(__file__, "r", encoding="utf-8") as f:
                 self_code = f.read()
 
@@ -376,7 +436,6 @@ if __name__ == "__main__":
             )
             nb.cells.append(nbformat.v4.new_code_cell(runner_code))
 
-            # 3. Ensure active .venv Python binary takes priority on PATH during kernel launch
             venv_dir = os.path.dirname(sys.executable)
             os.environ["PATH"] = venv_dir + os.pathsep + os.environ.get("PATH", "")
 
@@ -387,7 +446,6 @@ if __name__ == "__main__":
                     nb, {"metadata": {"path": os.path.dirname(args.file) or "."}}
                 )
 
-                # Output captured from executed compiler cell
                 for out in nb.cells[-1].outputs:
                     if out.output_type == "stream":
                         print(out.text.strip())
