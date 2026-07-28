@@ -1,343 +1,339 @@
-# =====================================================================
-# PROJECT ENVIRONMENT-LOCK: NOTEBOOK SNAPSHOT TOOL (v16)
-# Paste this into the LAST cell of your working notebook and run it.
-# =====================================================================
+#!/usr/bin/env python3
+"""
+PROJECT ENVIRONMENT-LOCK: NOTEBOOK SNAPSHOT TOOL (v18)
 
-import sys
-import os
+Headless Jupyter Notebook Dependency Scanner & Lockfile Generator.
+Scans notebook imports via AST, correlates against active environment,
+and generates self-contained setup blueprints.
+
+Supports dual-path execution:
+  - Path A (CLI / Disk): Parses saved .ipynb file on disk.
+  - Path B (Live Session): Parses live IPython execution history (__main__.In).
+"""
+
 import ast
-import urllib.request
 import json
-import datetime
-import importlib.metadata
-import importlib.util
-from packaging.version import parse as parse_version
+import os
+import re
+import sys
+import argparse
+import subprocess
+from datetime import datetime
 
-def clean_hardware_version(pkg_name, version_str):
+# =====================================================================
+# AST VISITOR & SOURCE PARSERS
+# =====================================================================
+
+class NotebookImportVisitor(ast.NodeVisitor):
+    def __init__(self):
+        self.imports = set()
+        self.submodules = {}
+
+    def visit_Import(self, node):
+        for alias in node.names:
+            base_pkg = alias.name.split('.')[0]
+            self.imports.add(base_pkg)
+            if '.' in alias.name:
+                self.submodules.setdefault(base_pkg, set()).add(alias.name)
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node):
+        if node.module:
+            base_pkg = node.module.split('.')[0]
+            self.imports.add(base_pkg)
+            self.submodules.setdefault(base_pkg, set()).add(node.module)
+        self.generic_visit(node)
+
+
+def harvest_index_urls_from_sources(code_sources):
     """
-    Strips system-specific build tags (+cu121, +cpu) from frameworks like PyTorch
-    for top-level targeted installs, allowing pip to select local machine drivers.
+    Scans raw code strings (from file or live kernel) to find --extra-index-url or -i flags.
+    Returns a set of discovered index URL strings.
     """
-    hardware_frameworks = {'torch', 'tensorflow', 'jax', 'cupy'}
-    if pkg_name in hardware_frameworks and '+' in version_str:
-        return version_str.split('+')[0], True
-    return version_str, False
+    index_urls = set()
+    pattern = re.compile(r'(?:--extra-index-url|-i)\s+([^\s]+)')
+    for source in code_sources:
+        matches = pattern.findall(source)
+        for url in matches:
+            index_urls.add(url.strip("'\""))
+    return index_urls
 
-def is_internet_available():
-    """Fast network probe (0.5s timeout) to prevent silent timeouts on offline runtimes."""
-    try:
-        urllib.request.urlopen('https://pypi.org', timeout=0.5)
-        return True
-    except Exception:
-        return False
 
-def fetch_latest_pypi_version(pypi_name):
-    """Fetches the current public release version from PyPI."""
-    url = f"https://pypi.org/pypi/{pypi_name}/json"
-    try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Environment-Lock-Linter'})
-        with urllib.request.urlopen(req, timeout=2) as response:
-            data = json.loads(response.read().decode())
-            return data.get('info', {}).get('version', None)
-    except Exception:
-        return None
-
-def add_ast_parent_references(tree):
-    """Attaches parent references to AST nodes to track try/except wrapper contexts."""
-    for parent in ast.walk(tree):
-        for child in ast.iter_child_nodes(parent):
-            child._parent = parent
-
-def is_inside_try_block(node):
-    """Identifies if an import lives inside a try/except block (optional check)."""
-    curr = getattr(node, '_parent', None)
-    while curr is not None:
-        if isinstance(curr, ast.Try):
-            return True
-        curr = getattr(curr, '_parent', None)
-    return False
-
-def resolve_opencv_variant(pypi_candidates, submodules):
+def extract_imports_from_sources(code_sources):
     """
-    Resolves cv2 to a single headless distribution suitable for notebooks,
-    preferring headless variants to avoid GUI system dependency crashes.
+    Core AST parser: Takes a list of raw code strings (from disk cells OR live kernel history).
+    Strips magics (%) and shell commands (!) prior to parsing.
     """
-    has_contrib = any('contrib' in s.lower() or 'aruco' in s.lower() for s.lower in submodules) if submodules else False
-
-    if has_contrib:
-        if 'opencv-contrib-python-headless' in pypi_candidates:
-            return 'opencv-contrib-python-headless'
-        if 'opencv-contrib-python' in pypi_candidates:
-            return 'opencv-contrib-python'
-
-    if 'opencv-python-headless' in pypi_candidates:
-        return 'opencv-python-headless'
-    if 'opencv-python' in pypi_candidates:
-        return 'opencv-python'
-    
-    return pypi_candidates[0]
-
-def generate_production_blueprint(full_freeze=False):
-    """
-    Generates environment setup blocks for shareable notebooks.
-    """
-    print("🔍 Analyzing notebook imports and checking library versions...\n")
-    
-    errors = []
-    warnings_and_defaults = []
-    outdated_packages = []
-    imported_modules = {} 
-    
-    # 1. Inspect execution history stored in IPython memory
-    try:
-        import IPython
-        ipython = IPython.get_ipython()
-        history = ipython.user_ns.get('_ih', []) if ipython else []
-    except Exception as e:
-        print(f"❌ Could not access notebook cell history: {e}")
-        return
-
-    # 2. Parse code lines into AST nodes
-    for cell_code in history:
-        clean_lines = [line for line in cell_code.splitlines() if not line.strip().startswith(('%', '!'))]
+    visitor = NotebookImportVisitor()
+    for source in code_sources:
+        clean_source = "\n".join([
+            line for line in source.splitlines() 
+            if not line.strip().startswith('%') and not line.strip().startswith('!')
+        ])
         try:
-            tree = ast.parse("\n".join(clean_lines))
-            add_ast_parent_references(tree)
-            
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    for alias in node.names:
-                        parts = alias.name.split('.')
-                        base_mod = parts[0]
-                        
-                        entry = imported_modules.setdefault(base_mod, {'subs': set(), 'is_optional': True})
-                        if not is_inside_try_block(node):
-                            entry['is_optional'] = False
-                            
-                        if len(parts) > 1:
-                            entry['subs'].add(parts[1])
-
-                elif isinstance(node, ast.ImportFrom) and node.module:
-                    parts = node.module.split('.')
-                    base_mod = parts[0]
-                    
-                    entry = imported_modules.setdefault(base_mod, {'subs': set(), 'is_optional': True})
-                    if not is_inside_try_block(node):
-                        entry['is_optional'] = False
-                        
-                    if len(parts) > 1:
-                        entry['subs'].add(parts[1])
-                    for alias in node.names:
-                        entry['subs'].add(alias.name)
+            tree = ast.parse(clean_source)
+            visitor.visit(tree)
         except SyntaxError:
             continue
 
-    # 3. Filter out standard library modules
-    stdlib_modules = getattr(sys, "stdlib_module_names", set())
-    internal_tools = {'sys', 'os', 'socket', 'ast', 'importlib', 'IPython', 'json', 'datetime', 'packaging', 'urllib'}
+    return visitor.imports, visitor.submodules
+
+
+def extract_from_file(notebook_path):
+    """
+    Path A (CLI / Disk): Reads saved .ipynb file off disk.
+    Returns: imports, submodules, code_sources
+    """
+    with open(notebook_path, 'r', encoding='utf-8') as f:
+        nb_data = json.load(f)
+    cells = nb_data.get("cells", [])
+    code_sources = ["".join(c.get("source", [])) for c in cells if c.get("cell_type") == "code"]
+    imports, submodules = extract_imports_from_sources(code_sources)
+    return imports, submodules, code_sources
+
+
+def extract_from_active_session():
+    """
+    Path B (Live Kernel): Reads IPython execution history (__main__.In).
+    NOTE: Stale/deleted cells from earlier in the session remain until Kernel Restart.
+    Returns: imports, submodules, code_sources
+    """
+    import __main__
+    code_sources = [src for src in getattr(__main__, 'In', []) if src and isinstance(src, str)]
+    imports, submodules = extract_imports_from_sources(code_sources)
+    return imports, submodules, code_sources
+
+
+# =====================================================================
+# ENVIRONMENT CORRELATION & HARDWARE INSPECTION
+# =====================================================================
+
+# Standard mapping overrides for packages whose import name != PyPI package name
+IMPORT_TO_PYPI_MAP = {
+    "cv2": "opencv-python",
+    "sklearn": "scikit-learn",
+    "PIL": "Pillow",
+    "yaml": "PyYAML",
+    "bs4": "beautifulsoup4",
+    "attr": "attrs",
+    "serial": "pyserial"
+}
+
+# Standard library modules to ignore during requirement generation
+STD_LIB = set(sys.stdlib_module_names) if hasattr(sys, 'stdlib_module_names') else {
+    "os", "sys", "re", "json", "ast", "subprocess", "datetime", "math", "random", 
+    "time", "pathlib", "typing", "collections", "itertools", "functools", "shutil"
+}
+
+
+def inspect_gpu_environment(imported_packages):
+    """
+    Per-framework GPU/accelerator inspection logic. Queries only the frameworks imported:
+      - PyTorch: checks torch.cuda and torch.backends.mps
+      - TensorFlow: checks tf.config.list_physical_devices('GPU')
+      - JAX: checks jax.devices() for non-CPU platforms (GPU/TPU)
+    """
+    gpu_frameworks = {"torch", "tensorflow", "jax"}
+    found_frameworks = gpu_frameworks.intersection(imported_packages)
     
-    filtered_modules = {
-        mod: info for mod, info in imported_modules.items() 
-        if mod not in stdlib_modules and mod not in internal_tools
+    if not found_frameworks:
+        return None
+
+    # 1. Inspect PyTorch if imported
+    if "torch" in found_frameworks:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return {
+                    "has_gpu": True,
+                    "type": "NVIDIA CUDA (via PyTorch)",
+                    "device_name": torch.cuda.get_device_name(0),
+                    "frameworks": list(found_frameworks)
+                }
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                return {
+                    "has_gpu": True,
+                    "type": "Apple Silicon MPS (via PyTorch)",
+                    "device_name": "Apple Silicon GPU (Metal)",
+                    "frameworks": list(found_frameworks)
+                }
+        except Exception:
+            pass
+
+    # 2. Inspect TensorFlow if imported
+    if "tensorflow" in found_frameworks:
+        try:
+            import tensorflow as tf
+            gpus = tf.config.list_physical_devices('GPU')
+            if gpus:
+                dev_name = "NVIDIA GPU (via TensorFlow)"
+                try:
+                    details = tf.config.experimental.get_device_details(gpus[0])
+                    dev_name = details.get('device_name', dev_name)
+                except Exception:
+                    pass
+                return {
+                    "has_gpu": True,
+                    "type": "GPU (via TensorFlow)",
+                    "device_name": dev_name,
+                    "frameworks": list(found_frameworks)
+                }
+        except Exception:
+            pass
+
+    # 3. Inspect JAX if imported
+    if "jax" in found_frameworks:
+        try:
+            import jax
+            devices = jax.devices()
+            accelerators = [d for d in devices if d.platform in ("gpu", "tpu")]
+            if accelerators:
+                first_accel = accelerators[0]
+                accel_type = first_accel.platform.upper()
+                dev_name = f"{accel_type} ({first_accel.device_kind}) via JAX"
+                return {
+                    "has_gpu": True,
+                    "type": f"{accel_type} (via JAX)",
+                    "device_name": dev_name,
+                    "frameworks": list(found_frameworks)
+                }
+        except Exception:
+            pass
+
+    # Frameworks imported, but no active GPU/accelerator detected for any imported framework
+    return {
+        "has_gpu": False,
+        "type": None,
+        "device_name": None,
+        "frameworks": list(found_frameworks)
     }
 
-    if not filtered_modules:
-        print("!"*80)
-        print("⚠️  No external library imports were found in this session.")
-        print("💡 How to fix: Run your notebook code cells first, then re-run this tool.")
-        print("!"*80)
-        return
 
-    # 4. Map import names to installed PyPI packages
-    try:
-        pkg_dist_map = importlib.metadata.packages_distributions()
-    except Exception as e:
-        print(f"❌ Failed to read system package metadata: {e}")
-        return
-
-    detected_packages = {}
-
-    for root_module, info in sorted(filtered_modules.items()):
-        submodules = info['subs']
-        is_optional = info['is_optional']
-
-        try:
-            spec = importlib.util.find_spec(root_module)
-        except Exception:
-            spec = None
-            
-        if spec is None:
-            if is_optional:
-                continue
-            else:
-                errors.append(f"❌ Missing Package: You imported '{root_module}', but it is not installed in this environment.")
-                continue
-
-        if root_module not in pkg_dist_map or not pkg_dist_map[root_module]:
-            errors.append(f"❌ Unmapped Package: '{root_module}' is installed, but its installer metadata could not be found.")
-            continue
-
-        candidates = pkg_dist_map[root_module]
-
-        # OpenCV Disambiguation Logic
-        if root_module == 'cv2' and len(candidates) > 1:
-            chosen = resolve_opencv_variant(candidates, submodules)
-            warnings_and_defaults.append(
-                f"📷 OpenCV Default Choice: 'cv2' mapped to multiple installed packages ({', '.join(candidates)}).\n"
-                f"   Selected '{chosen}' for headless notebook container compatibility."
-            )
-            candidates = [chosen]
-        elif len(candidates) > 1:
-            chosen = candidates[0]
-            warnings_and_defaults.append(
-                f"⚠️ Ambiguous Namespace: Module '{root_module}' maps to multiple installed packages ({', '.join(candidates)}).\n"
-                f"   Selected '{chosen}' by default."
-            )
-            candidates = [chosen]
-
-        for pypi_name in candidates:
-            try:
-                version_str = importlib.metadata.version(pypi_name)
-                
-                # Targeted Extra Variant Match
-                matched_target = pypi_name
-                if submodules:
-                    try:
-                        metadata = importlib.metadata.metadata(pypi_name)
-                        provides_extra = metadata.get_all('Provides-Extra', [])
-                        if provides_extra:
-                            for sub in submodules:
-                                if sub in provides_extra:
-                                    matched_target = f"{pypi_name}[{sub}]"
-                                    warnings_and_defaults.append(
-                                        f"📦 Extra Dependency Promotion: Importing '{root_module}.{sub}' automatically promoted "
-                                        f"dependency to '{matched_target}'."
-                                    )
-                                    break
-                    except Exception:
-                        pass
-                
-                detected_packages[matched_target] = version_str
-                
-            except importlib.metadata.PackageNotFoundError:
-                errors.append(f"❌ Missing Version: Version details for '{pypi_name}' could not be read.")
-
-    manifest_lines = []
-
-    # Fast offline probe gatekeeper
-    has_internet = is_internet_available()
-    if not has_internet:
-        print("⚠️ Offline mode: Skipping online package freshness check.\n")
-
-    # 5. Validate targeted versions and run optional freshness checks
-    for pkg_target, ver in sorted(detected_packages.items()):
-        base_pkg_name = pkg_target.split('[')[0]
-        
-        if "/" in ver or "\\" in ver:
-            errors.append(f"❌ Local Path Warning: '{base_pkg_name}' uses a custom local file path ('{ver}').")
-            continue
-        try:
-            parse_version(ver)
-        except Exception:
-            errors.append(f"❌ Non-standard Version: '{base_pkg_name}' uses an unrecognized version format ('{ver}').")
-            continue
-
-        cleaned_local_ver, was_stripped = clean_hardware_version(base_pkg_name, ver)
-        if was_stripped:
-            warnings_and_defaults.append(
-                f"⚙️ Hardware Tag Stripped: Cleaned '{base_pkg_name}=={ver}' to '{base_pkg_name}=={cleaned_local_ver}' "
-                f"so pip can select target drivers cleanly."
-            )
-        
-        if has_internet:
-            latest_ver = fetch_latest_pypi_version(base_pkg_name)
-            if latest_ver and parse_version(cleaned_local_ver) < parse_version(latest_ver):
-                outdated_packages.append((base_pkg_name, cleaned_local_ver, latest_ver))
-
-        manifest_lines.append(f"{pkg_target}=={cleaned_local_ver}")
-
-    if errors:
-        print("!"*80)
-        print("❌ CANNOT GENERATE SETUP BLOCKS")
-        print("Please resolve the following issues before sharing this notebook:")
-        print("!"*80 + "\n")
-        for err in errors:
-            print(err)
-        print("\n" + "!"*80)
-        return
-
-    # 6. Optional Additive Full Freeze Generation
-    full_freeze_lines = []
-    if full_freeze:
-        full_freeze_lines.append("\n# =====================================================================")
-        full_freeze_lines.append("# FULL ENVIRONMENT SNAPSHOT (ALL INSTALLED PACKAGES)")
-        full_freeze_lines.append("# Uncomment individual lines below if you need to recreate the entire container bit-for-bit.")
-        full_freeze_lines.append("# =====================================================================")
-        
-        for dist in sorted(importlib.metadata.distributions(), key=lambda d: d.metadata['Name'].lower()):
-            p_name = dist.metadata['Name']
-            p_ver = dist.version
-            
-            if "/" in p_ver or "\\" in p_ver:
-                full_freeze_lines.append(f"# local-path: {p_name}=={p_ver}")
-            else:
-                try:
-                    parse_version(p_ver)
-                    full_freeze_lines.append(f"# {p_name}=={p_ver}")
-                except Exception:
-                    full_freeze_lines.append(f"# invalid-version: {p_name}=={p_ver}")
-
-    # Print Warnings and Assumed Overrides Summary
-    if warnings_and_defaults:
-        print("-" * 80)
-        print("💡 ASSUMED DEFAULTS & OVERRIDES APPLIED")
-        print("Review these automatically applied resolutions:")
-        print("-" * 80)
-        for w in warnings_and_defaults:
-            print(f" • {w}")
-        print("-" * 80 + "\n")
-
-    # Print compact freshness summary if outdated packages exist
-    if outdated_packages:
-        print("-" * 80)
-        print("⚠️  NOTICE: SOME LIBRARIES IN THIS ENVIRONMENT ARE OUTDATED")
-        print("The setup block was generated using your current versions, but updating them")
-        print("before sharing can prevent issues caused by older background code.")
-        print("-" * 80)
-        print(f"{'PACKAGE':<25} {'INSTALLED':<15} {'LATEST ONLINE':<15}")
-        print("-" * 55)
-        for pkg, curr, online in outdated_packages:
-            print(f"{pkg:<25} {curr:<15} {online:<15}")
-        print("-" * 80 + "\n")
-
-    py_major = sys.version_info.major
-    py_minor = sys.version_info.minor
-    timestamp = datetime.date.today().strftime("%Y-%m-%d")
+def resolve_opencv_variant(submodules=None):
+    """
+    Determines the appropriate OpenCV package variant installed in the environment.
+    Fixed: Generator target correctly uses 'for s in submodules'.
+    """
+    has_contrib = any('contrib' in s.lower() or 'aruco' in s.lower() for s in submodules) if submodules else False
     
-    print("="*80)
-    print("📋 HOW TO USE THIS OUTPUT:")
-    print("1. Create two empty cells at the VERY TOP of your notebook.")
-    print("2. Change Cell 1 to 'Markdown' and paste STEP 1 into it.")
-    print("3. Keep Cell 2 as 'Code' and paste STEP 2 into it.")
-    print("="*80 + "\n")
+    try:
+        res = subprocess.run([sys.executable, "-m", "pip", "list"], capture_output=True, text=True)
+        installed = res.stdout.lower()
+        if "opencv-contrib-python-headless" in installed:
+            return "opencv-contrib-python-headless"
+        elif "opencv-python-headless" in installed:
+            return "opencv-python-headless"
+        elif "opencv-contrib-python" in installed:
+            return "opencv-contrib-python"
+        elif "opencv-python" in installed:
+            return "opencv-python"
+    except Exception:
+        pass
+    
+    return "opencv-contrib-python" if has_contrib else "opencv-python"
+
+
+def get_installed_environment():
+    """
+    Runs `pip freeze` to get precise version snapshots of the current runtime.
+    """
+    res = subprocess.run([sys.executable, "-m", "pip", "freeze"], capture_output=True, text=True)
+    frozen = {}
+    for line in res.stdout.splitlines():
+        if "==" in line:
+            pkg, ver = line.split("==", 1)
+            frozen[pkg.lower()] = line.strip()
+    return frozen, res.stdout.splitlines()
+
+
+def process_package_requirements(pinned_list, harvested_urls):
+    """
+    Processes pinned packages, identifies local (+build) tags,
+    and correlates them with harvested index URLs.
+    """
+    manifest_output = []
+    local_tagged_info = []
+    
+    if harvested_urls:
+        print("\nℹ️ Preserving download location(s) found in notebook cells:")
+        for url in harvested_urls:
+            print(f"   • {url}")
+            manifest_output.append(f"--extra-index-url {url}")
+        print()
+
+    for item in pinned_list:
+        manifest_output.append(item)
+        if '+' in item:
+            local_tagged_info.append((item, list(harvested_urls)))
+            if not harvested_urls:
+                print(f"⚠️ Specific hardware build detected: '{item}'")
+                print("   No download link was found in your notebook cells for this version.\n")
+                print("   If students or reviewers run this notebook on a different platform,")
+                print("   installation may fail unless you specify where to find this hardware build.\n")
+                print("   To fix this, include the full download command in your setup cell like this:")
+                print(f"   !pip install {item} --extra-index-url <YOUR_HARDWARE_INDEX_URL>\n")
+            
+    return manifest_output, local_tagged_info
+
+
+# =====================================================================
+# BLUEPRINT GENERATOR
+# =====================================================================
+
+def generate_production_blueprint(manifest_lines, full_freeze_lines=None, local_tagged_info=None, gpu_info=None):
+    """
+    Generates Cell 1 Markdown (with exact packages, index URLs, and GPU state) and Cell 2 Python code.
+    """
+    py_major, py_minor = sys.version_info.major, sys.version_info.minor
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Build GPU hardware line if an active GPU was captured
+    gpu_markdown_section = ""
+    if gpu_info and gpu_info.get("has_gpu"):
+        dev_name = gpu_info["device_name"]
+        gpu_markdown_section = (
+            f"- **Hardware Acceleration:** This notebook was created using an active accelerator (`{dev_name}`).\n"
+            f"  If execution is slow or fails, you MAY need to enable a GPU accelerator in your environment settings (e.g. CUDA/MPS/TPU)."
+        )
+
+    # Build local packages and index URLs section
+    local_builds_section = ""
+    if local_tagged_info:
+        bullet_lines = []
+        for pkg, urls in local_tagged_info:
+            bullet_lines.append(f"  • `{pkg}`")
+            if urls:
+                for u in urls:
+                    bullet_lines.append(f"    Download index: `{u}`")
+            else:
+                bullet_lines.append("    ⚠️ No download URL was specified in notebook cells. If installation fails, ensure your target runtime matches this build or supply an `--extra-index-url`.")
+        local_builds_section = f"- **Specific Package Builds Detected:** The following package(s) use custom or platform-specific local builds:\n" + "\n".join(bullet_lines)
+
+    # Assemble Cell 1 Markdown
+    markdown_lines = [
+        "### 🛠️ Environment Setup & Dependency Verification",
+        "This notebook includes a pinned environment manifest (`pinned_requirements.txt`) to ensure reproducible execution.\n",
+        "- **Dependency Sync:** Cell 2 will verify your active Python version and apply the exact package manifest recorded by the author."
+    ]
+    
+    if gpu_markdown_section:
+        markdown_lines.append(gpu_markdown_section)
+    if local_builds_section:
+        markdown_lines.append(local_builds_section)
+        
+    markdown_lines.append("- **Network Notice:** If required packages are not already cached in your current runtime environment, internet access may be needed to download missing wheels.")
 
     print("--- [ STEP 1: PASTE INTO CELL 1 (MARKDOWN) ] ---\n")
-    print(f"""# 🔒 Environment Alignment & Setup
+    print("\n".join(markdown_lines))
+    print("\n" + "="*80 + "\n")
 
-This notebook includes an explicit library configuration block designed to match the environment used during its creation.
-
-### ❓ Why is this setup cell here?
-* **Reduces Compatibility Issues:** Locking core library versions helps prevent errors caused when underlying packages release breaking changes later on.
-* **Single-Pass Installation:** Installs required dependencies together to allow the package manager to find compatible versions before code executes.""")
-
-    print("\n" + "-"*80 + "\n")
     print("--- [ STEP 2: PASTE INTO CELL 2 (CODE) ] ---\n")
     
     payload_string = "\n".join(manifest_lines).strip()
     if full_freeze_lines:
-        payload_string += "\n" + "\n".join(full_freeze_lines)
+        payload_string += "\n\n# --- FULL FREEZE FALLBACK BLOCK ---\n" + "\n".join(full_freeze_lines)
 
-    print(f"""# =====================================================================
+    blueprint_code = f"""# =====================================================================
 # VERIFIED ENVIRONMENT DEPENDENCIES ({timestamp})
 # =====================================================================
 
@@ -382,87 +378,96 @@ result = subprocess.run(
 if result.returncode == 0:
     print("\\n✅ Setup complete! Environment ready.")
 else:
-    print("\\n❌ Dependency sync failed.")
-    print("Ensure internet access is enabled in your environment settings and re-run.")""")
+    print("\\n❌ Setup failed while installing pinned dependencies.")
+    print("It looks like your environment could not locate a matching wheel for local tag builds (e.g. +cu121, +cpu).\\n")
+    print("Possible solutions:")
+    print("1. Make sure your notebook runtime matches the required hardware (e.g. GPU vs CPU).")
+    print("2. Or try installing the standard version directly in a code cell (e.g. !pip install torch).")"""
+
+    print(blueprint_code)
     print("\n" + "="*80)
+    return blueprint_code
+
 
 # =====================================================================
-# DUAL-MODE EXECUTION ENTRY POINT
+# MAIN EXECUTION ENTRYPOINT
 # =====================================================================
-if __name__ == "__main__":
-    import argparse
 
+def main():
+    parser = argparse.ArgumentParser(description="Generate environment lockfiles for Jupyter Notebooks.")
+    parser.add_argument("notebook", nargs="?", help="Path to target .ipynb file (optional when running in live session).")
+    parser.add_argument("--full-freeze", action="store_true", help="Append full environment pip freeze after targeted manifest.")
+    
+    # Use parse_known_args to ignore Jupyter/Colab kernel flags (-f connection_file)
+    args, unknown = parser.parse_known_args()
+
+    # Detect execution environment (CLI vs Live Kernel)
+    in_live_ipython = False
     try:
-        get_ipython()
-        is_notebook_cell = True
-    except NameError:
-        is_notebook_cell = False
+        from IPython import get_ipython
+        if get_ipython() is not None:
+            in_live_ipython = True
+    except ImportError:
+        pass
 
-    if is_notebook_cell:
-        generate_production_blueprint(full_freeze=False)
+    # Route ingestion based on execution mode
+    if args.notebook:
+        if not os.path.exists(args.notebook):
+            print(f"❌ Error: File '{args.notebook}' not found.")
+            sys.exit(1)
+        print(f"🔍 [Path A] Analyzing saved notebook file '{args.notebook}' via AST...")
+        imports, submodules, code_sources = extract_from_file(args.notebook)
+    elif in_live_ipython:
+        print("🔍 [Path B] Analyzing live IPython session kernel history via AST...")
+        print("💡 Note: Ensure kernel was restarted before snapshot to flush stale/deleted imports.\n")
+        imports, submodules, code_sources = extract_from_active_session()
     else:
-        parser = argparse.ArgumentParser(
-            description="Project Environment-Lock: Generate venv-like dependency lockfiles for notebooks."
-        )
-        parser.add_argument(
-            "-f",
-            "--file",
-            type=str,
-            help="Path to target .ipynb notebook to evaluate headlessly.",
-        )
-        parser.add_argument(
-            "--full-freeze",
-            action="store_true",
-            help="Append a complete system package snapshot to generated manifest.",
-        )
+        parser.print_help()
+        sys.exit(1)
 
-        args = parser.parse_args()
-
-        if args.file:
-            import nbformat
-            from nbconvert.preprocessors import ExecutePreprocessor
-
-            if not os.path.exists(args.file):
-                print(f"❌ Error: Notebook '{args.file}' not found.")
-                sys.exit(1)
-
-            print(f"⚡ Headlessly evaluating notebook: {args.file}")
-            with open(args.file, "r", encoding="utf-8") as f:
-                nb = nbformat.read(f, as_version=4)
-
-            nb.metadata["kernelspec"] = {
-                "name": "python3",
-                "display_name": "Python 3 (Active .venv)",
-                "language": "python",
-            }
-
-            with open(__file__, "r", encoding="utf-8") as f:
-                self_code = f.read()
-
-            runner_code = (
-                f"{self_code}\n\n"
-                f"generate_production_blueprint(full_freeze={args.full_freeze})"
-            )
-            nb.cells.append(nbformat.v4.new_code_cell(runner_code))
-
-            venv_dir = os.path.dirname(sys.executable)
-            os.environ["PATH"] = venv_dir + os.pathsep + os.environ.get("PATH", "")
-
-            ep = ExecutePreprocessor(timeout=300, kernel_name="python3")
-
-            try:
-                ep.preprocess(
-                    nb, {"metadata": {"path": os.path.dirname(args.file) or "."}}
-                )
-
-                for out in nb.cells[-1].outputs:
-                    if out.output_type == "stream":
-                        print(out.text.strip())
-                    elif out.output_type == "error":
-                        print(f"❌ Execution Error: {out.ename} - {out.evalue}")
-
-            except Exception as e:
-                print(f"🚨 Headless kernel execution failed: {e}")
-                sys.exit(1)
+    harvested_urls = harvest_index_urls_from_sources(code_sources)
+    
+    # Check GPU/accelerator environment state per-framework
+    gpu_info = inspect_gpu_environment(imports)
+    if gpu_info:
+        if gpu_info["has_gpu"]:
+            print(f"⚡ Active accelerator detected during snapshot: {gpu_info['device_name']}")
+            print("   Captured device name for end-user Cell 1 Markdown.\n")
         else:
-            generate_production_blueprint(full_freeze=args.full_freeze)
+            frameworks_str = ", ".join(gpu_info["frameworks"])
+            print(f"⚠️ Acceleration Framework ({frameworks_str}) imported, but NO active GPU/TPU accelerator was found!")
+            print("   Your notebook imported an accelerator library, but hardware acceleration was not active during this run.")
+            print("   If you intended to require a GPU/TPU, note that this test run executed on CPU.\n")
+
+    frozen_env, raw_full_freeze = get_installed_environment()
+    
+    pinned_manifest = []
+    for imp in sorted(imports):
+        if imp in STD_LIB:
+            continue
+        
+        # Map import name to PyPI package name
+        pypi_name = IMPORT_TO_PYPI_MAP.get(imp, imp)
+        
+        if imp == "cv2":
+            pypi_name = resolve_opencv_variant(submodules.get("cv2"))
+
+        matched_pin = frozen_env.get(pypi_name.lower())
+        if matched_pin:
+            pinned_manifest.append(matched_pin)
+        else:
+            pinned_manifest.append(f"# {pypi_name} (imported as '{imp}', not currently found in active env)")
+
+    manifest_lines, local_tagged_info = process_package_requirements(pinned_manifest, harvested_urls)
+    full_freeze_lines = raw_full_freeze if args.full_freeze else None
+
+    generate_production_blueprint(
+        manifest_lines, 
+        full_freeze_lines=full_freeze_lines, 
+        local_tagged_info=local_tagged_info,
+        gpu_info=gpu_info
+    )
+
+
+if __name__ == "__main__":
+    main()
