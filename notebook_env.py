@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PROJECT ENVIRONMENT-LOCK: NOTEBOOK SNAPSHOT TOOL (v18)
+PROJECT ENVIRONMENT-LOCK: NOTEBOOK SNAPSHOT TOOL (v19)
 
 Headless Jupyter Notebook Dependency Scanner & Lockfile Generator.
 Scans notebook imports via AST, correlates against active environment,
@@ -47,15 +47,20 @@ class NotebookImportVisitor(ast.NodeVisitor):
 
 def harvest_index_urls_from_sources(code_sources):
     """
-    Scans raw code strings (from file or live kernel) to find --extra-index-url or -i flags.
+    Scans raw code strings to find --extra-index-url or -i flags.
+    Ignores commented lines starting with '#' to prevent harvesting dead code.
     Returns a set of discovered index URL strings.
     """
     index_urls = set()
     pattern = re.compile(r'(?:--extra-index-url|-i)\s+([^\s]+)')
     for source in code_sources:
-        matches = pattern.findall(source)
-        for url in matches:
-            index_urls.add(url.strip("'\""))
+        for line in source.splitlines():
+            clean_line = line.strip()
+            if clean_line.startswith('#'):
+                continue
+            matches = pattern.findall(clean_line)
+            for url in matches:
+                index_urls.add(url.strip("'\""))
     return index_urls
 
 
@@ -82,10 +87,19 @@ def extract_imports_from_sources(code_sources):
 def extract_from_file(notebook_path):
     """
     Path A (CLI / Disk): Reads saved .ipynb file off disk.
+    Handles JSON errors cleanly if file is corrupted.
     Returns: imports, submodules, code_sources
     """
-    with open(notebook_path, 'r', encoding='utf-8') as f:
-        nb_data = json.load(f)
+    try:
+        with open(notebook_path, 'r', encoding='utf-8') as f:
+            nb_data = json.load(f)
+    except json.JSONDecodeError:
+        print(f"❌ Error: File '{notebook_path}' is not a valid Jupyter Notebook JSON format.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ Error reading notebook file: {e}")
+        sys.exit(1)
+
     cells = nb_data.get("cells", [])
     code_sources = ["".join(c.get("source", [])) for c in cells if c.get("cell_type") == "code"]
     imports, submodules = extract_imports_from_sources(code_sources)
@@ -132,6 +146,7 @@ def inspect_gpu_environment(imported_packages):
       - PyTorch: checks torch.cuda and torch.backends.mps
       - TensorFlow: checks tf.config.list_physical_devices('GPU')
       - JAX: checks jax.devices() for non-CPU platforms (GPU/TPU)
+    Returns exact active_framework alongside device details.
     """
     gpu_frameworks = {"torch", "tensorflow", "jax"}
     found_frameworks = gpu_frameworks.intersection(imported_packages)
@@ -146,15 +161,17 @@ def inspect_gpu_environment(imported_packages):
             if torch.cuda.is_available():
                 return {
                     "has_gpu": True,
-                    "type": "NVIDIA CUDA (via PyTorch)",
-                    "device_name": torch.cuda.get_device_name(0),
+                    "type": "NVIDIA CUDA",
+                    "active_framework": "PyTorch",
+                    "device_name": f"{torch.cuda.get_device_name(0)} (via PyTorch)",
                     "frameworks": list(found_frameworks)
                 }
             elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
                 return {
                     "has_gpu": True,
-                    "type": "Apple Silicon MPS (via PyTorch)",
-                    "device_name": "Apple Silicon GPU (Metal)",
+                    "type": "Apple Silicon MPS",
+                    "active_framework": "PyTorch",
+                    "device_name": "Apple Silicon GPU (Metal via PyTorch)",
                     "frameworks": list(found_frameworks)
                 }
         except Exception:
@@ -169,12 +186,13 @@ def inspect_gpu_environment(imported_packages):
                 dev_name = "NVIDIA GPU (via TensorFlow)"
                 try:
                     details = tf.config.experimental.get_device_details(gpus[0])
-                    dev_name = details.get('device_name', dev_name)
+                    dev_name = f"{details.get('device_name', 'NVIDIA GPU')} (via TensorFlow)"
                 except Exception:
                     pass
                 return {
                     "has_gpu": True,
-                    "type": "GPU (via TensorFlow)",
+                    "type": "GPU",
+                    "active_framework": "TensorFlow",
                     "device_name": dev_name,
                     "frameworks": list(found_frameworks)
                 }
@@ -193,7 +211,8 @@ def inspect_gpu_environment(imported_packages):
                 dev_name = f"{accel_type} ({first_accel.device_kind}) via JAX"
                 return {
                     "has_gpu": True,
-                    "type": f"{accel_type} (via JAX)",
+                    "type": accel_type,
+                    "active_framework": "JAX",
                     "device_name": dev_name,
                     "frameworks": list(found_frameworks)
                 }
@@ -204,6 +223,7 @@ def inspect_gpu_environment(imported_packages):
     return {
         "has_gpu": False,
         "type": None,
+        "active_framework": None,
         "device_name": None,
         "frameworks": list(found_frameworks)
     }
@@ -212,7 +232,6 @@ def inspect_gpu_environment(imported_packages):
 def resolve_opencv_variant(submodules=None):
     """
     Determines the appropriate OpenCV package variant installed in the environment.
-    Fixed: Generator target correctly uses 'for s in submodules'.
     """
     has_contrib = any('contrib' in s.lower() or 'aruco' in s.lower() for s in submodules) if submodules else False
     
@@ -282,7 +301,8 @@ def process_package_requirements(pinned_list, harvested_urls):
 
 def generate_production_blueprint(manifest_lines, full_freeze_lines=None, local_tagged_info=None, gpu_info=None):
     """
-    Generates Cell 1 Markdown (with exact packages, index URLs, and GPU state) and Cell 2 Python code.
+    Assembles Cell 1 Markdown and Cell 2 Python code.
+    Returns dict {"step1_markdown": str, "step2_code": str} for direct programmatic/test assertion.
     """
     py_major, py_minor = sys.version_info.major, sys.version_info.minor
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -291,8 +311,9 @@ def generate_production_blueprint(manifest_lines, full_freeze_lines=None, local_
     gpu_markdown_section = ""
     if gpu_info and gpu_info.get("has_gpu"):
         dev_name = gpu_info["device_name"]
+        active_fw = gpu_info.get("active_framework", "Framework")
         gpu_markdown_section = (
-            f"- **Hardware Acceleration:** This notebook was created using an active accelerator (`{dev_name}`).\n"
+            f"- **Hardware Acceleration:** This notebook was created using an active accelerator (`{dev_name}`, verified via {active_fw}).\n"
             f"  If execution is slow or fails, you MAY need to enable a GPU accelerator in your environment settings (e.g. CUDA/MPS/TPU)."
         )
 
@@ -323,17 +344,13 @@ def generate_production_blueprint(manifest_lines, full_freeze_lines=None, local_
         
     markdown_lines.append("- **Network Notice:** If required packages are not already cached in your current runtime environment, internet access may be needed to download missing wheels.")
 
-    print("--- [ STEP 1: PASTE INTO CELL 1 (MARKDOWN) ] ---\n")
-    print("\n".join(markdown_lines))
-    print("\n" + "="*80 + "\n")
+    step1_markdown = "\n".join(markdown_lines)
 
-    print("--- [ STEP 2: PASTE INTO CELL 2 (CODE) ] ---\n")
-    
     payload_string = "\n".join(manifest_lines).strip()
     if full_freeze_lines:
         payload_string += "\n\n# --- FULL FREEZE FALLBACK BLOCK ---\n" + "\n".join(full_freeze_lines)
 
-    blueprint_code = f"""# =====================================================================
+    step2_code = f"""# =====================================================================
 # VERIFIED ENVIRONMENT DEPENDENCIES ({timestamp})
 # =====================================================================
 
@@ -384,9 +401,10 @@ else:
     print("1. Make sure your notebook runtime matches the required hardware (e.g. GPU vs CPU).")
     print("2. Or try installing the standard version directly in a code cell (e.g. !pip install torch).")"""
 
-    print(blueprint_code)
-    print("\n" + "="*80)
-    return blueprint_code
+    return {
+        "step1_markdown": step1_markdown,
+        "step2_code": step2_code
+    }
 
 
 # =====================================================================
@@ -461,12 +479,20 @@ def main():
     manifest_lines, local_tagged_info = process_package_requirements(pinned_manifest, harvested_urls)
     full_freeze_lines = raw_full_freeze if args.full_freeze else None
 
-    generate_production_blueprint(
+    blueprint = generate_production_blueprint(
         manifest_lines, 
         full_freeze_lines=full_freeze_lines, 
         local_tagged_info=local_tagged_info,
         gpu_info=gpu_info
     )
+
+    print("--- [ STEP 1: PASTE INTO CELL 1 (MARKDOWN) ] ---\n")
+    print(blueprint["step1_markdown"])
+    print("\n" + "="*80 + "\n")
+
+    print("--- [ STEP 2: PASTE INTO CELL 2 (CODE) ] ---\n")
+    print(blueprint["step2_code"])
+    print("\n" + "="*80)
 
 
 if __name__ == "__main__":

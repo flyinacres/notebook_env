@@ -1,1 +1,65 @@
-?? Project Environment-Lock: Architecture & RoadmapCore PhilosophyA lightweight, self-contained Python snapshot tool for Jupyter notebooks. It prevents the "It worked on my machine" problem when distributing notebooks (especially for courseware/education) by embedding deterministic environment setup blocks into Cell 2 of .ipynb files.Key Architectural DecisionsGeneration Strategy (In-Environment Static AST):Must inspect the author's active working environment (importlib.metadata) where all packages/drivers are already installed and verified.Uses static ast parsing to target only explicit top-level imports, avoiding transitive package bloat.Strips hardware build tags (e.g., torch==2.3.0+cu121 $\rightarrow$ torch==2.3.0) so pip resolves local hardware binaries cleanly on recipient machines.Embedded directly in the notebook (Cell 2) so the notebook is a self-contained artifact requiring no adjacent files.Batch Processing Strategy:Operates as a fast, static linter/formatter directly against the active environment across a directory of .ipynb files.No headless nbconvert subprocess execution during generation�just pure AST parsing + metadata lookup.Validation / Smoke-Testing Strategy (Separate Harness):A standalone test script whose only job is CI/CD verification.Takes a generated notebook, creates a clean temporary .venv, runs pip install -r pinned_requirements.txt, and executes the notebook headlessly.No complex auto-patching magic: If it fails, it provides a clear diagnostic (e.g., "Missing scipy in Cell 4"), letting the author manually tweak their lockfile/cell.Task List & Implementation Order[x] v15 Compiler Core (notebook_env.py)Top-level import extraction via AST.importlib.metadata package mapping.Hardware tag cleaning (clean_hardware_version).Additive --full-freeze snapshot support.[ ] Task 1: Environment & Guard Metadata (Current Focus)Capture sys.version_info (e.g., Python >= 3.11) and embed an explicit compatibility guard in Cell 2.[ ] Task 2: Clean In-Environment Batch GeneratorUpdate notebook_env.py to batch-process a directory of notebooks (--dir ./test_corpus) using pure AST parsing without spawning nbconvert kernels.[ ] Task 3: Standalone Clean-Venv Smoke Tester (validate_lock.py)Create a isolated test runner to verify generated lockfiles inside a fresh temporary .venv and report PASS/FAIL diagnostics.Whenever you want to start a fresh thread or refocus, just point to Task 1, Task 2, or Task 3, and we'll execute it cleanly with zero fluff. Where would you like to start?
+PROJECT ENVIRONMENT-LOCK: ARCHITECTURE AND ROADMAP
+
+CORE PHILOSOPHY:
+A self-contained Python snapshot tool for Jupyter notebooks. Prevents dependency failures when distributing notebooks by embedding deterministic environment setup blocks into Cell 2 of .ipynb files.
+
+KEY ARCHITECTURAL DECISIONS:
+
+GENERATION STRATEGY (In-Environment Static AST):
+
+Inspects the author's active working environment via importlib.metadata.
+
+Uses static ast parsing to target only explicit top-level imports.
+
+Strips hardware build tags (e.g., torch2.3.0+cu121 becomes torch2.3.0) so pip resolves local hardware binaries cleanly.
+
+Embedded directly in Cell 2 of the notebook so it acts as a self-contained artifact.
+
+BATCH PROCESSING STRATEGY:
+
+Operates as a fast, static linter directly against the active environment across a directory of .ipynb files.
+
+No headless nbconvert subprocess execution during generation. Pure AST parsing and metadata lookup only.
+
+VALIDATION AND SMOKE-TESTING STRATEGY (Separate Harness):
+
+A standalone test script used for CI/CD verification.
+
+Creates a clean temporary .venv, runs pip install -r pinned_requirements.txt, and executes the notebook headlessly.
+
+No complex auto-patching magic. If it fails, it reports a clear diagnostic (e.g., Missing scipy in Cell 4) so the author can manually tweak their lockfile.
+
+TASK LIST AND IMPLEMENTATION ORDER:
+
+Task 1: Environment and Guard Metadata
+Capture sys.version_info and embed an explicit Python version guard in Cell 2.
+
+Task 2: Clean In-Environment Batch Generator
+Update notebook_env.py to batch-process a directory of notebooks (--dir ./test_corpus) using pure AST parsing.
+
+Task 3: Standalone Clean-Venv Smoke Tester (validate_lock.py)
+Create an isolated test runner to verify generated lockfiles inside a fresh temporary .venv and report PASS/FAIL diagnostics.
+
+
+Features & Enhancements NOT Yet Implemented (Missing/Optional Backlog)
+If you plan to evolve notebook_env.py beyond v18, here are the primary gaps and potential future features based on our past discussions:
+
+1. Automated Cell Injection (Writing directly into .ipynb files)
+Current State: The script outputs the Step 1 Markdown and Step 2 Code blocks to stdout, requiring the author to copy and paste them into Cell 1 and Cell 2 manually.
+
+Missing Feature: A programmatic --write or --inject CLI flag that parses the .ipynb JSON structure, prepends or overwrites the first two cells directly, and saves the file back to disk.
+
+2. Conda / Non-Pip Environment Detection
+Current State: The script relies entirely on sys.executable -m pip freeze and PyPI naming conventions.
+
+Missing Feature: Handling packages installed exclusively via conda or non-standard system channels that do not register cleanly under pip list/pip freeze (e.g., system C++ libraries or CUDA toolkits installed outside pip).
+
+3. Dynamic Package Name Aliasing Beyond IMPORT_TO_PYPI_MAP
+Current State: Handled via a static dictionary (cv2 → opencv-python, sklearn → scikit-learn, PIL → Pillow, etc.).
+
+Missing Feature: Dynamic metadata lookup (e.g., inspecting importlib.metadata or pkg_resources at runtime) to resolve obscure or newly installed third-party package import names that aren't hardcoded in IMPORT_TO_PYPI_MAP.
+
+4. Automated Dry-Run / Verification Mode
+Current State: The author runs notebook_env.py to obtain the blueprint, but testing whether pinned_requirements.txt installs cleanly requires running Cell 2 inside the notebook manually.
+
+Missing Feature: A --test or --verify flag in notebook_env.py that spins up a temporary virtual environment (venv), attempts a trial pip install -r pinned_requirements.txt, and verifies that all top-level imports load successfully before generating the output text.
