@@ -134,6 +134,24 @@ class TestDualPathIngestion:
         assert "📌 Active Python Interpreter:" in captured.out
         assert sys.executable in captured.out
 
+    def test_uninstalled_package_produces_fallback_comment_in_main(self, tmp_path, monkeypatch, capsys):
+        # Create a synthetic notebook importing an uninstalled package
+        nb = {"cells": [{"cell_type": "code", "source": ["import fake_uninstalled_pkg\n"]}]}
+        nb_path = tmp_path / "test_uninstalled.ipynb"
+        nb_path.write_text(json.dumps(nb))
+
+        # Mock pip freeze to return an environment where fake_uninstalled_pkg is missing
+        monkeypatch.setattr(ne, "get_installed_environment", lambda: ({}, []))
+        
+        # Mock CLI arguments: python notebook_env.py test_uninstalled.ipynb
+        monkeypatch.setattr(sys, "argv", ["notebook_env.py", str(nb_path)])
+
+        ne.main()
+        captured = capsys.readouterr()
+
+        expected_comment = "# fake_uninstalled_pkg (imported as 'fake_uninstalled_pkg', not currently found in active env)"
+        assert expected_comment in captured.out
+
     def test_path_a_missing_file_exits(self, capsys):
         with pytest.raises(SystemExit) as exc:
             ne.extract_from_file("does_not_exist.ipynb")
