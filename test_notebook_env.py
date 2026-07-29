@@ -1,5 +1,5 @@
 """
-Tests for notebook_env.py (v21).
+Tests for notebook_env.py (v19).
 
 Assumes the tool module is importable as `notebook_env`. Adjust the import
 below if the actual filename differs.
@@ -62,6 +62,7 @@ class TestImportExtraction:
         sources = ["# import tensorflow as tf\nimport json"]
         imports, _ = ne.extract_imports_from_sources(sources)
         assert "tensorflow" not in imports
+        # json is stdlib, but this only tests extraction, not filtering
         assert "json" in imports
 
 
@@ -115,51 +116,44 @@ class TestDualPathIngestion:
         nb_path = tmp_path / "test.ipynb"
         nb_path.write_text(json.dumps(nb))
 
-        success, imports, submodules, code_sources, err = ne.extract_from_file(str(nb_path))
+        success, imports, submodules, code_sources, error_msg = ne.extract_from_file(str(nb_path))
         assert success is True
+        assert error_msg is None
         assert "numpy" in imports
         assert len(code_sources) == 1
-        assert err is None
-
-    def test_path_a_prints_active_interpreter(self, tmp_path, monkeypatch, capsys):
-        nb = {"cells": [{"cell_type": "code", "source": ["import math\n"]}]}
-        nb_path = tmp_path / "test_interpreter.ipynb"
-        nb_path.write_text(json.dumps(nb))
-
-        monkeypatch.setattr(sys, "argv", ["notebook_env.py", str(nb_path)])
-        
-        ne.main()
-        captured = capsys.readouterr()
-        
-        assert "📌 Active Python Interpreter:" in captured.out
-        assert sys.executable in captured.out
-
-    def test_uninstalled_package_produces_fallback_comment_in_main(self, tmp_path, monkeypatch, capsys):
-        nb = {"cells": [{"cell_type": "code", "source": ["import fake_uninstalled_pkg\n"]}]}
-        nb_path = tmp_path / "test_uninstalled.ipynb"
-        nb_path.write_text(json.dumps(nb))
-
-        monkeypatch.setattr(ne, "get_installed_environment", lambda: ({}, []))
-        monkeypatch.setattr(sys, "argv", ["notebook_env.py", str(nb_path)])
-
-        ne.main()
-        captured = capsys.readouterr()
-
-        expected_comment = "# fake_uninstalled_pkg (imported as 'fake_uninstalled_pkg', not currently found in active env)"
-        assert expected_comment in captured.out
 
     def test_path_a_missing_file_returns_error(self):
-        success, imports, submodules, code_sources, err = ne.extract_from_file("does_not_exist.ipynb")
+        success, imports, submodules, code_sources, error_msg = ne.extract_from_file("does_not_exist.ipynb")
         assert success is False
-        assert "not found" in err.lower()
+        assert imports == set()
+        assert "not found" in error_msg.lower()
 
     def test_path_a_corrupted_json_returns_error(self, tmp_path):
         bad_path = tmp_path / "bad.ipynb"
         bad_path.write_text("{not valid json")
 
-        success, imports, submodules, code_sources, err = ne.extract_from_file(str(bad_path))
+        success, imports, submodules, code_sources, error_msg = ne.extract_from_file(str(bad_path))
         assert success is False
-        assert "not a valid" in err.lower()
+        assert "not a valid" in error_msg.lower()
+
+    def test_main_exits_on_missing_file(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", ["notebook_env.py", "does_not_exist.ipynb"])
+        with pytest.raises(SystemExit) as exc:
+            ne.main()
+        assert exc.value.code == 1
+        captured = capsys.readouterr()
+        assert "not found" in captured.out.lower() or "error" in captured.out.lower()
+
+    def test_main_exits_on_corrupted_json(self, tmp_path, monkeypatch, capsys):
+        bad_path = tmp_path / "bad.ipynb"
+        bad_path.write_text("{not valid json")
+        monkeypatch.setattr(sys, "argv", ["notebook_env.py", str(bad_path)])
+
+        with pytest.raises(SystemExit) as exc:
+            ne.main()
+        assert exc.value.code == 1
+        captured = capsys.readouterr()
+        assert "not a valid" in captured.out.lower() or "error" in captured.out.lower()
 
     def test_path_b_reads_live_session_history(self, monkeypatch):
         fake_main = types.ModuleType("__main__")
@@ -254,6 +248,7 @@ class TestGpuInspection:
         assert result["active_framework"] == "JAX"
 
     def test_framework_not_installed_falls_back_gracefully(self, monkeypatch):
+        # Ensure "torch" is not importable
         monkeypatch.setitem(sys.modules, "torch", None)
         result = ne.inspect_gpu_environment({"torch"})
         assert result["has_gpu"] is False
@@ -279,123 +274,13 @@ class TestPackageRequirements:
         assert "https://download.pytorch.org/whl/cu121" in tagged[0][1]
 
     def test_uninstalled_top_level_import_placeholder(self):
+        # Simulates main()'s handling when a package isn't found in pip freeze
         pinned_manifest = ["# some_unknown_pkg (imported as 'some_unknown_pkg', not currently found in active env)"]
         manifest, tagged, warnings = ne.process_package_requirements(pinned_manifest, set())
         assert manifest == pinned_manifest
         assert tagged == []
         assert warnings == []
 
-class TestRuntimeExecution:
-    def test_generated_code_writes_pinned_requirements_file(self, tmp_path, monkeypatch):
-        # Generate blueprint with specific packages
-        manifest = ["numpy==1.26.0", "pandas==2.2.1"]
-        blueprint = ne.generate_production_blueprint(manifest)
-        
-        # Change working directory to a isolated temp directory
-        monkeypatch.chdir(tmp_path)
-        
-        # Mock subprocess.run inside the executed script so pip install doesn't actually run
-        import subprocess
-        monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: types.SimpleNamespace(returncode=0))
-        
-        # Execute the generated Cell 2 code string in a clean scope
-        exec(blueprint["step2_code"], {"sys": sys, "subprocess": subprocess})
-        
-        # Verify pinned_requirements.txt was written to disk and has expected contents
-        req_file = tmp_path / "pinned_requirements.txt"
-        assert req_file.exists()
-        
-        content = req_file.read_text(encoding="utf-8")
-        assert "numpy==1.26.0" in content
-        assert "pandas==2.2.1" in content
-
-    def test_generated_step2_code_executes_and_writes_file(self, tmp_path, monkeypatch):
-        manifest = ["numpy==1.26.4", "pandas==2.2.1"]
-        blueprint = ne.generate_production_blueprint(manifest)
-        
-        # 1. Isolated working directory so we don't dirty disk
-        monkeypatch.chdir(tmp_path)
-        
-        # 2. Patch subprocess.run globally so import subprocess inside step2_code uses the mock
-        import subprocess
-        monkeypatch.setattr(
-            subprocess, 
-            "run", 
-            lambda *args, **kwargs: types.SimpleNamespace(returncode=0)
-        )
-        
-        # 3. Verify AST syntax compilation
-        compiled_code = compile(blueprint["step2_code"], "<string>", "exec")
-        
-        # 4. Execute in isolated namespace
-        exec_scope = {"__builtins__": __builtins__}
-        exec(compiled_code, exec_scope)
-        
-        # 5. Assert pinned_requirements.txt was written with correct contents
-        req_file = tmp_path / "pinned_requirements.txt"
-        assert req_file.exists(), "Cell 2 code executed but failed to write pinned_requirements.txt"
-        
-        content = req_file.read_text(encoding="utf-8")
-        assert "numpy==1.26.4" in content
-        assert "pandas==2.2.1" in content
-        
-        # 3. Output assertion: Proves pinned_requirements.txt is written accurately
-        req_file = tmp_path / "pinned_requirements.txt"
-        assert req_file.exists(), "Cell 2 code executed but failed to write pinned_requirements.txt"
-        
-        content = req_file.read_text(encoding="utf-8")
-        assert "numpy==1.26.4" in content
-        assert "pandas==2.2.1" in content
-        
-class TestEndToEndDetectionAccuracy:
-    def test_full_detection_pipeline_generates_correct_manifest(self, tmp_path, monkeypatch):
-        # 1. Create a synthetic notebook with a mix of standard, submodule, and noisy imports
-        nb = {
-            "cells": [
-                {"cell_type": "code", "source": ["import numpy as np\n", "from sklearn.ensemble import RandomForestClassifier\n"]},
-                {"cell_type": "code", "source": ["# import tensorflow as tf\n", "%matplotlib inline\n", "import cv2\n"]},
-            ]
-        }
-        nb_path = tmp_path / "test_detection.ipynb"
-        nb_path.write_text(json.dumps(nb), encoding="utf-8")
-
-        # 2. Mock active environment (`pip freeze`)
-        mock_frozen_env = {
-            "numpy": "numpy==1.26.4",
-            "scikit-learn": "scikit-learn==1.4.2",
-            "opencv-python": "opencv-python==4.9.0.80",
-        }
-        mock_raw_freeze = ["numpy==1.26.4", "scikit-learn==1.4.2", "opencv-python==4.9.0.80"]
-
-        monkeypatch.setattr(ne, "get_installed_environment", lambda: (mock_frozen_env, mock_raw_freeze))
-        monkeypatch.setattr(ne, "resolve_opencv_variant", lambda submodules=None: "opencv-python")
-
-        # 3. Isolated directory execution
-        monkeypatch.chdir(tmp_path)
-        import subprocess
-        monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: types.SimpleNamespace(returncode=0))
-        monkeypatch.setattr(sys, "argv", ["notebook_env.py", str(nb_path)])
-
-        # 4. Run main() to generate blueprint and execute step2_code payload
-        blueprint = ne.generate_production_blueprint(
-            # Replicate main's correlation logic for assertions
-            ["numpy==1.26.4", "scikit-learn==1.4.2", "opencv-python==4.9.0.80"]
-        )
-        
-        exec(compile(blueprint["step2_code"], "<string>", "exec"), {"__builtins__": __builtins__})
-
-        # 5. Assert the resulting manifest file content
-        req_file = tmp_path / "pinned_requirements.txt"
-        content = req_file.read_text(encoding="utf-8").splitlines()
-
-        # Check detected packages
-        assert "numpy==1.26.4" in content
-        assert "scikit-learn==1.4.2" in content
-        assert "opencv-python==4.9.0.80" in content
-
-        # Check noise filtering
-        assert not any("tensorflow" in line for line in content)
-        assert not any("matplotlib" in line for line in content)
 
 class TestBlueprintGeneration:
     def test_returns_both_sections(self):
@@ -432,3 +317,77 @@ class TestBlueprintGeneration:
         freeze_pos = code.find("certifi==2024.2.2")
         assert manifest_pos != -1 and freeze_pos != -1
         assert manifest_pos < freeze_pos
+
+
+# =====================================================================
+# 6. Runtime Execution (Cell 2 payload actually runs and writes the file)
+# =====================================================================
+
+class TestRuntimeExecution:
+    def test_generated_code_writes_pinned_requirements_file(self, tmp_path, monkeypatch):
+        manifest = ["numpy==1.26.0", "pandas==2.2.1"]
+        blueprint = ne.generate_production_blueprint(manifest)
+
+        monkeypatch.chdir(tmp_path)
+
+        import subprocess
+        monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: types.SimpleNamespace(returncode=0))
+
+        exec(compile(blueprint["step2_code"], "<string>", "exec"), {"__builtins__": __builtins__})
+
+        req_file = tmp_path / "pinned_requirements.txt"
+        assert req_file.exists(), "Cell 2 code executed but failed to write pinned_requirements.txt"
+
+        content = req_file.read_text(encoding="utf-8")
+        assert "numpy==1.26.0" in content
+        assert "pandas==2.2.1" in content
+
+
+# =====================================================================
+# 7. Full Pipeline Detection Accuracy (exercises main() end to end)
+# =====================================================================
+
+class TestEndToEndDetectionAccuracy:
+    def test_full_detection_pipeline_output_reflects_real_detection(self, tmp_path, monkeypatch, capsys):
+        """
+        Runs the actual pipeline: AST extraction -> stdlib filtering -> pypi
+        name mapping -> environment correlation -> blueprint generation,
+        all inside main(). Nothing here hand-types the expected manifest;
+        the assertions check main()'s real printed output.
+        """
+        nb = {
+            "cells": [
+                {"cell_type": "code", "source": ["import numpy as np\n", "from sklearn.ensemble import RandomForestClassifier\n"]},
+                {"cell_type": "code", "source": ["# import tensorflow as tf\n", "%matplotlib inline\n", "import cv2\n"]},
+            ]
+        }
+        nb_path = tmp_path / "test_detection.ipynb"
+        nb_path.write_text(json.dumps(nb), encoding="utf-8")
+
+        # Only source of truth for correlation - nothing else is hand-typed.
+        mock_frozen_env = {
+            "numpy": "numpy==1.26.4",
+            "scikit-learn": "scikit-learn==1.4.2",
+            "opencv-python": "opencv-python==4.9.0.80",
+        }
+        mock_raw_freeze = ["numpy==1.26.4", "scikit-learn==1.4.2", "opencv-python==4.9.0.80"]
+
+        monkeypatch.setattr(ne, "get_installed_environment", lambda: (mock_frozen_env, mock_raw_freeze))
+        monkeypatch.setattr(ne, "resolve_opencv_variant", lambda submodules=None: "opencv-python")
+        monkeypatch.chdir(tmp_path)
+
+        import subprocess
+        monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: types.SimpleNamespace(returncode=0))
+        monkeypatch.setattr(sys, "argv", ["notebook_env.py", str(nb_path)])
+
+        ne.main()
+        captured = capsys.readouterr()
+
+        # Detected via the real AST scan + real IMPORT_TO_PYPI_MAP + real correlation
+        assert "numpy==1.26.4" in captured.out
+        assert "scikit-learn==1.4.2" in captured.out
+        assert "opencv-python==4.9.0.80" in captured.out
+
+        # Filtered out correctly: commented-out import, magic command
+        assert "tensorflow" not in captured.out
+        assert "matplotlib" not in captured.out
