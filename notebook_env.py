@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PROJECT ENVIRONMENT-LOCK: NOTEBOOK SNAPSHOT TOOL (v19)
+PROJECT ENVIRONMENT-LOCK: NOTEBOOK SNAPSHOT TOOL (v20)
 
 Headless Jupyter Notebook Dependency Scanner & Lockfile Generator.
 Scans notebook imports via AST, correlates against active environment,
@@ -434,10 +434,12 @@ def main():
             print(f"❌ Error: File '{args.notebook}' not found.")
             sys.exit(1)
         print(f"🔍 [Path A] Analyzing saved notebook file '{args.notebook}' via AST...")
+        print(f"📌 Active Python Interpreter: {sys.executable}")
+        print("   (Verify this matches the environment/kernel used for your notebook)\n")
         imports, submodules, code_sources = extract_from_file(args.notebook)
     elif in_live_ipython:
         print("🔍 [Path B] Analyzing live IPython session kernel history via AST...")
-        print("💡 Note: Ensure kernel was restarted before snapshot to flush stale/deleted imports.\n")
+        print("💡 Note: Always restart kernel & run all first to flush stale/deleted imports from session memory.\n")
         imports, submodules, code_sources = extract_from_active_session()
     else:
         parser.print_help()

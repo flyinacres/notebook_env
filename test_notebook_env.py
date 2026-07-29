@@ -1,5 +1,5 @@
 """
-Tests for notebook_env.py (v19).
+Tests for notebook_env.py (v20).
 
 Assumes the tool module is importable as `notebook_env`. Adjust the import
 below if the actual filename differs.
@@ -119,6 +119,20 @@ class TestDualPathIngestion:
         imports, submodules, code_sources = ne.extract_from_file(str(nb_path))
         assert "numpy" in imports
         assert len(code_sources) == 1
+
+    def test_path_a_prints_active_interpreter(self, tmp_path, monkeypatch, capsys):
+        nb = {"cells": [{"cell_type": "code", "source": ["import math\n"]}]}
+        nb_path = tmp_path / "test_interpreter.ipynb"
+        nb_path.write_text(json.dumps(nb))
+
+        # Mock CLI arguments: python notebook_env.py test_interpreter.ipynb
+        monkeypatch.setattr(sys, "argv", ["notebook_env.py", str(nb_path)])
+        
+        ne.main()
+        captured = capsys.readouterr()
+        
+        assert "📌 Active Python Interpreter:" in captured.out
+        assert sys.executable in captured.out
 
     def test_path_a_missing_file_exits(self, capsys):
         with pytest.raises(SystemExit) as exc:
