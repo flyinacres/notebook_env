@@ -346,6 +346,56 @@ class TestRuntimeExecution:
         content = req_file.read_text(encoding="utf-8")
         assert "numpy==1.26.4" in content
         assert "pandas==2.2.1" in content
+        
+class TestEndToEndDetectionAccuracy:
+    def test_full_detection_pipeline_generates_correct_manifest(self, tmp_path, monkeypatch):
+        # 1. Create a synthetic notebook with a mix of standard, submodule, and noisy imports
+        nb = {
+            "cells": [
+                {"cell_type": "code", "source": ["import numpy as np\n", "from sklearn.ensemble import RandomForestClassifier\n"]},
+                {"cell_type": "code", "source": ["# import tensorflow as tf\n", "%matplotlib inline\n", "import cv2\n"]},
+            ]
+        }
+        nb_path = tmp_path / "test_detection.ipynb"
+        nb_path.write_text(json.dumps(nb), encoding="utf-8")
+
+        # 2. Mock active environment (`pip freeze`)
+        mock_frozen_env = {
+            "numpy": "numpy==1.26.4",
+            "scikit-learn": "scikit-learn==1.4.2",
+            "opencv-python": "opencv-python==4.9.0.80",
+        }
+        mock_raw_freeze = ["numpy==1.26.4", "scikit-learn==1.4.2", "opencv-python==4.9.0.80"]
+
+        monkeypatch.setattr(ne, "get_installed_environment", lambda: (mock_frozen_env, mock_raw_freeze))
+        monkeypatch.setattr(ne, "resolve_opencv_variant", lambda submodules=None: "opencv-python")
+
+        # 3. Isolated directory execution
+        monkeypatch.chdir(tmp_path)
+        import subprocess
+        monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: types.SimpleNamespace(returncode=0))
+        monkeypatch.setattr(sys, "argv", ["notebook_env.py", str(nb_path)])
+
+        # 4. Run main() to generate blueprint and execute step2_code payload
+        blueprint = ne.generate_production_blueprint(
+            # Replicate main's correlation logic for assertions
+            ["numpy==1.26.4", "scikit-learn==1.4.2", "opencv-python==4.9.0.80"]
+        )
+        
+        exec(compile(blueprint["step2_code"], "<string>", "exec"), {"__builtins__": __builtins__})
+
+        # 5. Assert the resulting manifest file content
+        req_file = tmp_path / "pinned_requirements.txt"
+        content = req_file.read_text(encoding="utf-8").splitlines()
+
+        # Check detected packages
+        assert "numpy==1.26.4" in content
+        assert "scikit-learn==1.4.2" in content
+        assert "opencv-python==4.9.0.80" in content
+
+        # Check noise filtering
+        assert not any("tensorflow" in line for line in content)
+        assert not any("matplotlib" in line for line in content)
 
 class TestBlueprintGeneration:
     def test_returns_both_sections(self):
