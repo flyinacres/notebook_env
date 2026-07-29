@@ -36,7 +36,7 @@ class TestImportExtraction:
         sources = ["import torch.nn.functional as F"]
         imports, submodules = ne.extract_imports_from_sources(sources)
         assert "torch" in imports
-        assert "nn" in submodules.get("torch", set()) or "torch.nn" in submodules.get("torch", set())
+        assert "torch.nn.functional" in submodules.get("torch", set())
 
     def test_magics_and_shell_escapes_stripped(self):
         sources = ["%matplotlib inline\n%%writefile foo.py\n!pip install foo\nimport pandas as pd"]
