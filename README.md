@@ -1,4 +1,4 @@
-# Notebook Environment-Lock Tool (v18)
+# Notebook Environment-Lock Tool (v19)
 
 A dependency and hardware-requirement scanner for Jupyter/Kaggle notebooks. It scans a notebook's imports, correlates them against the environment you actually ran it in, and generates two paste-in cells (a Markdown explainer and a setup/install cell) so the notebook is reproducible when shared.
 
@@ -24,17 +24,27 @@ This tool must be run **by the notebook's author, in the same environment used t
 
 ## Usage
 
-**Path A — against a saved `.ipynb` file (recommended):**
+There are two ways to run this tool. Neither is strictly "recommended" over the other — which one fits depends on where you're working.
+
+**Path A — CLI, against a saved `.ipynb` file:**
 
 ```bash
 python env_lock.py your_notebook.ipynb
 ```
 
+Reads the notebook's source directly from the saved `.ipynb` file on disk and runs AST parsing over it. This is the natural fit for local development (VS Code, JupyterLab, PyCharm, a terminal in your project directory) — you save the notebook, then run the script from your shell, without adding any extra code to the notebook itself.
+
+A `.ipynb` file never stores live memory or execution state, on any platform — it only stores whatever cell source was last saved. So Path A reflects exactly what's on disk as of your last save, nothing more and nothing less. If you tested interactively and made further changes without saving, Path A won't see them.
+
 **Path B — pasted into a live notebook cell:**
 
-Paste the tool's code into a cell and call `main()`, or adapt it to call `extract_from_active_session()` directly. This reads IPython's `In` history rather than the saved file, so it reflects whatever ran in the current kernel session — restart the kernel before this final run if you fixed anything earlier, or stale/removed cells will still be counted.
+Paste the tool's code into a cell and call `main()`, or adapt it to call `extract_from_active_session()` directly. This reads IPython's `In` history (via `__main__.In`) rather than the saved file, so it reflects what has actually executed in the current kernel session, which can be _ahead of_ disk (recent edits not yet saved) or _behind_ it (cells that ran earlier and were later deleted from the notebook, but are still sitting in `In`). This is generally the better fit for ephemeral cloud runtimes (Colab, Kaggle, remote JupyterHub), where running a separate CLI step against a freshly-saved file is more friction than just running one more cell.
+
+**The stale-memory trap (Path B only):** `__main__.In` accumulates every statement executed for the life of the kernel. If you spent time trying (and then abandoning) `seaborn`, `plotly`, or `bokeh` imports before settling on your final approach, and never restarted the kernel, `In` still contains those abandoned imports even though they're no longer in the notebook. **Restart the kernel and run all cells fresh before the final snapshot** — this flushes the history so only your actual, final code path gets captured.
 
 Do **not** invoke this tool via `import your_module; your_module.main()` inside the notebook you're scanning — the import line itself becomes part of the session history and may show up as a spurious entry in the generated manifest. Paste the tool inline instead.
+
+**Desktop-specific caveat (Path A):** running the CLI correlates imports against whatever Python interpreter runs the script (`pip freeze` under `sys.executable`), not against the notebook's own kernel. On a desktop machine with multiple virtual environments (venv/conda/poetry), it's easy to accidentally run the script from the wrong terminal or the wrong activated environment — the script has no way to detect this, and would silently produce a plausible-looking but wrong manifest rather than an error. **Before running Path A, make sure the environment active in your terminal is the same one the notebook's kernel actually uses.** This is generally less of a concern on Kaggle/Colab, where there's typically only one active kernel environment to begin with.
 
 **Optional flag:**
 
@@ -63,7 +73,8 @@ The tool prints two blocks to paste into new cells at the top of your notebook:
 - **Transitive dependencies are not pinned**, only top-level imports. Sub-dependencies can still drift between installs.
 - **GPU checks confirm availability, not actual usage** — a GPU can be available and imported without every tensor operation running on it.
 - **No Kaggle Docker image tag detection** — no documented environment variable exposes this from inside a running kernel.
-- **Path A vs Path B can diverge**: Path A reads the saved `.ipynb` file from disk; Path B reads live kernel history. If you test interactively without saving intermediate states, these can disagree about what was actually exercised.
+- **Path A vs Path B can diverge**: Path A reflects only what's saved to disk; Path B reflects live kernel history, which can be ahead of disk (unsaved edits) or behind it (deleted cells still in `In`). They are not interchangeable views of the same state.
+- **No automatic detection of interpreter/kernel mismatch**: Path A correlates against whatever environment is running the script, not necessarily the one the notebook's kernel used. This is not checked or warned about beyond printing the interpreter path — verifying the match is the author's responsibility.
 - Hardware-tagged builds (`+cu121`, etc.) are flagged, not auto-corrected — pip's default wheel selection when reinstalling an untagged version is not guaranteed to match the original hardware target.
 
 ## Roadmap
