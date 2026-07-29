@@ -11,6 +11,13 @@ This tool does not guarantee bit-for-bit reproducibility. It gives actionable, h
 - **Hardware-tagged builds**: flags packages with build-specific version tags (e.g. `torch==2.3.1+cu121`) and checks whether your notebook already specifies a download index for them.
 - **GPU/accelerator usage**: if your notebook imports `torch`, `tensorflow`, or `jax`, checks whether an active GPU/MPS/TPU accelerator was available in your session for that specific framework.
 
+## Why both Code Scanning and Environment Correlation are required
+
+- **Code AST gives the _Names_:** Scanning your code cells via AST identifies exactly which top-level packages your notebook imported (filtering out the hundreds of unrelated background packages installed in your environment).
+- **Environment gives the _Versions_:** Querying `pip freeze` finds the exact version numbers (`pandas==2.2.1`) and hardware tags (`+cu121`) that made your code work during testing.
+
+Without code scanning, you'd dump an overwhelming, noisy list of every package on your machine. Without environment correlation, you'd only get unpinned names (`pandas`), leaving future readers vulnerable to breaking version drift.
+
 ## Required workflow
 
 This tool must be run **by the notebook's author, in the same environment used to develop the notebook**, immediately after testing it. It reads the live state of your session (installed packages, GPU availability) — running it anywhere else, or later, tells you about that environment, not the notebook's actual requirements.

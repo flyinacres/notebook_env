@@ -1,5 +1,5 @@
 """
-Tests for notebook_env.py (v20).
+Tests for notebook_env.py (v21).
 
 Assumes the tool module is importable as `notebook_env`. Adjust the import
 below if the actual filename differs.
@@ -62,7 +62,6 @@ class TestImportExtraction:
         sources = ["# import tensorflow as tf\nimport json"]
         imports, _ = ne.extract_imports_from_sources(sources)
         assert "tensorflow" not in imports
-        # json is stdlib, but this only tests extraction, not filtering
         assert "json" in imports
 
 
@@ -116,16 +115,17 @@ class TestDualPathIngestion:
         nb_path = tmp_path / "test.ipynb"
         nb_path.write_text(json.dumps(nb))
 
-        imports, submodules, code_sources = ne.extract_from_file(str(nb_path))
+        success, imports, submodules, code_sources, err = ne.extract_from_file(str(nb_path))
+        assert success is True
         assert "numpy" in imports
         assert len(code_sources) == 1
+        assert err is None
 
     def test_path_a_prints_active_interpreter(self, tmp_path, monkeypatch, capsys):
         nb = {"cells": [{"cell_type": "code", "source": ["import math\n"]}]}
         nb_path = tmp_path / "test_interpreter.ipynb"
         nb_path.write_text(json.dumps(nb))
 
-        # Mock CLI arguments: python notebook_env.py test_interpreter.ipynb
         monkeypatch.setattr(sys, "argv", ["notebook_env.py", str(nb_path)])
         
         ne.main()
@@ -135,15 +135,11 @@ class TestDualPathIngestion:
         assert sys.executable in captured.out
 
     def test_uninstalled_package_produces_fallback_comment_in_main(self, tmp_path, monkeypatch, capsys):
-        # Create a synthetic notebook importing an uninstalled package
         nb = {"cells": [{"cell_type": "code", "source": ["import fake_uninstalled_pkg\n"]}]}
         nb_path = tmp_path / "test_uninstalled.ipynb"
         nb_path.write_text(json.dumps(nb))
 
-        # Mock pip freeze to return an environment where fake_uninstalled_pkg is missing
         monkeypatch.setattr(ne, "get_installed_environment", lambda: ({}, []))
-        
-        # Mock CLI arguments: python notebook_env.py test_uninstalled.ipynb
         monkeypatch.setattr(sys, "argv", ["notebook_env.py", str(nb_path)])
 
         ne.main()
@@ -152,21 +148,18 @@ class TestDualPathIngestion:
         expected_comment = "# fake_uninstalled_pkg (imported as 'fake_uninstalled_pkg', not currently found in active env)"
         assert expected_comment in captured.out
 
-    def test_path_a_missing_file_exits(self, capsys):
-        with pytest.raises(SystemExit) as exc:
-            ne.extract_from_file("does_not_exist.ipynb")
-        assert exc.value.code == 1
-        captured = capsys.readouterr()
-        assert "not found" in captured.out.lower() or "error" in captured.out.lower()
+    def test_path_a_missing_file_returns_error(self):
+        success, imports, submodules, code_sources, err = ne.extract_from_file("does_not_exist.ipynb")
+        assert success is False
+        assert "not found" in err.lower()
 
-    def test_path_a_corrupted_json_exits_cleanly(self, tmp_path, capsys):
+    def test_path_a_corrupted_json_returns_error(self, tmp_path):
         bad_path = tmp_path / "bad.ipynb"
         bad_path.write_text("{not valid json")
 
-        with pytest.raises(SystemExit):
-            ne.extract_from_file(str(bad_path))
-        captured = capsys.readouterr()
-        assert "not a valid" in captured.out.lower() or "error" in captured.out.lower()
+        success, imports, submodules, code_sources, err = ne.extract_from_file(str(bad_path))
+        assert success is False
+        assert "not a valid" in err.lower()
 
     def test_path_b_reads_live_session_history(self, monkeypatch):
         fake_main = types.ModuleType("__main__")
@@ -261,7 +254,6 @@ class TestGpuInspection:
         assert result["active_framework"] == "JAX"
 
     def test_framework_not_installed_falls_back_gracefully(self, monkeypatch):
-        # Ensure "torch" is not importable
         monkeypatch.setitem(sys.modules, "torch", None)
         result = ne.inspect_gpu_environment({"torch"})
         assert result["has_gpu"] is False
@@ -272,29 +264,88 @@ class TestGpuInspection:
 # =====================================================================
 
 class TestPackageRequirements:
-    def test_local_tag_without_harvested_url_warns(self, capsys):
-        manifest, tagged = ne.process_package_requirements(["torch==2.3.1+cu121"], set())
-        captured = capsys.readouterr()
-        assert "Specific hardware build detected" in captured.out
+    def test_local_tag_without_harvested_url_warns(self):
+        manifest, tagged, warnings = ne.process_package_requirements(["torch==2.3.1+cu121"], set())
+        assert "torch==2.3.1+cu121" in warnings
         assert tagged == [("torch==2.3.1+cu121", [])]
 
-    def test_local_tag_with_harvested_url_no_warning(self, capsys):
-        manifest, tagged = ne.process_package_requirements(
+    def test_local_tag_with_harvested_url_no_warning(self):
+        manifest, tagged, warnings = ne.process_package_requirements(
             ["torch==2.3.1+cu121"], {"https://download.pytorch.org/whl/cu121"}
         )
-        captured = capsys.readouterr()
-        assert "Specific hardware build detected" not in captured.out
+        assert warnings == []
         assert "--extra-index-url https://download.pytorch.org/whl/cu121" in manifest
         assert tagged[0][0] == "torch==2.3.1+cu121"
         assert "https://download.pytorch.org/whl/cu121" in tagged[0][1]
 
     def test_uninstalled_top_level_import_placeholder(self):
-        # Simulates main()'s handling when a package isn't found in pip freeze
         pinned_manifest = ["# some_unknown_pkg (imported as 'some_unknown_pkg', not currently found in active env)"]
-        manifest, tagged = ne.process_package_requirements(pinned_manifest, set())
+        manifest, tagged, warnings = ne.process_package_requirements(pinned_manifest, set())
         assert manifest == pinned_manifest
         assert tagged == []
+        assert warnings == []
 
+class TestRuntimeExecution:
+    def test_generated_code_writes_pinned_requirements_file(self, tmp_path, monkeypatch):
+        # Generate blueprint with specific packages
+        manifest = ["numpy==1.26.0", "pandas==2.2.1"]
+        blueprint = ne.generate_production_blueprint(manifest)
+        
+        # Change working directory to a isolated temp directory
+        monkeypatch.chdir(tmp_path)
+        
+        # Mock subprocess.run inside the executed script so pip install doesn't actually run
+        import subprocess
+        monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: types.SimpleNamespace(returncode=0))
+        
+        # Execute the generated Cell 2 code string in a clean scope
+        exec(blueprint["step2_code"], {"sys": sys, "subprocess": subprocess})
+        
+        # Verify pinned_requirements.txt was written to disk and has expected contents
+        req_file = tmp_path / "pinned_requirements.txt"
+        assert req_file.exists()
+        
+        content = req_file.read_text(encoding="utf-8")
+        assert "numpy==1.26.0" in content
+        assert "pandas==2.2.1" in content
+
+    def test_generated_step2_code_executes_and_writes_file(self, tmp_path, monkeypatch):
+        manifest = ["numpy==1.26.4", "pandas==2.2.1"]
+        blueprint = ne.generate_production_blueprint(manifest)
+        
+        # 1. Isolated working directory so we don't dirty disk
+        monkeypatch.chdir(tmp_path)
+        
+        # 2. Patch subprocess.run globally so import subprocess inside step2_code uses the mock
+        import subprocess
+        monkeypatch.setattr(
+            subprocess, 
+            "run", 
+            lambda *args, **kwargs: types.SimpleNamespace(returncode=0)
+        )
+        
+        # 3. Verify AST syntax compilation
+        compiled_code = compile(blueprint["step2_code"], "<string>", "exec")
+        
+        # 4. Execute in isolated namespace
+        exec_scope = {"__builtins__": __builtins__}
+        exec(compiled_code, exec_scope)
+        
+        # 5. Assert pinned_requirements.txt was written with correct contents
+        req_file = tmp_path / "pinned_requirements.txt"
+        assert req_file.exists(), "Cell 2 code executed but failed to write pinned_requirements.txt"
+        
+        content = req_file.read_text(encoding="utf-8")
+        assert "numpy==1.26.4" in content
+        assert "pandas==2.2.1" in content
+        
+        # 3. Output assertion: Proves pinned_requirements.txt is written accurately
+        req_file = tmp_path / "pinned_requirements.txt"
+        assert req_file.exists(), "Cell 2 code executed but failed to write pinned_requirements.txt"
+        
+        content = req_file.read_text(encoding="utf-8")
+        assert "numpy==1.26.4" in content
+        assert "pandas==2.2.1" in content
 
 class TestBlueprintGeneration:
     def test_returns_both_sections(self):

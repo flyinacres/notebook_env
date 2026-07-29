@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PROJECT ENVIRONMENT-LOCK: NOTEBOOK SNAPSHOT TOOL (v20)
+PROJECT ENVIRONMENT-LOCK: NOTEBOOK SNAPSHOT TOOL (v21)
 
 Headless Jupyter Notebook Dependency Scanner & Lockfile Generator.
 Scans notebook imports via AST, correlates against active environment,
@@ -87,23 +87,23 @@ def extract_imports_from_sources(code_sources):
 def extract_from_file(notebook_path):
     """
     Path A (CLI / Disk): Reads saved .ipynb file off disk.
-    Handles JSON errors cleanly if file is corrupted.
-    Returns: imports, submodules, code_sources
+    Returns: (success: bool, imports: set, submodules: dict, code_sources: list, error_msg: str)
     """
+    if not os.path.exists(notebook_path):
+        return False, set(), {}, [], f"File '{notebook_path}' not found."
+
     try:
         with open(notebook_path, 'r', encoding='utf-8') as f:
             nb_data = json.load(f)
     except json.JSONDecodeError:
-        print(f"❌ Error: File '{notebook_path}' is not a valid Jupyter Notebook JSON format.")
-        sys.exit(1)
+        return False, set(), {}, [], f"File '{notebook_path}' is not a valid Jupyter Notebook JSON format."
     except Exception as e:
-        print(f"❌ Error reading notebook file: {e}")
-        sys.exit(1)
+        return False, set(), {}, [], f"Error reading notebook file: {e}"
 
     cells = nb_data.get("cells", [])
     code_sources = ["".join(c.get("source", [])) for c in cells if c.get("cell_type") == "code"]
     imports, submodules = extract_imports_from_sources(code_sources)
-    return imports, submodules, code_sources
+    return True, imports, submodules, code_sources, None
 
 
 def extract_from_active_session():
@@ -122,7 +122,6 @@ def extract_from_active_session():
 # ENVIRONMENT CORRELATION & HARDWARE INSPECTION
 # =====================================================================
 
-# Standard mapping overrides for packages whose import name != PyPI package name
 IMPORT_TO_PYPI_MAP = {
     "cv2": "opencv-python",
     "sklearn": "scikit-learn",
@@ -133,7 +132,6 @@ IMPORT_TO_PYPI_MAP = {
     "serial": "pyserial"
 }
 
-# Standard library modules to ignore during requirement generation
 STD_LIB = set(sys.stdlib_module_names) if hasattr(sys, 'stdlib_module_names') else {
     "os", "sys", "re", "json", "ast", "subprocess", "datetime", "math", "random", 
     "time", "pathlib", "typing", "collections", "itertools", "functools", "shutil"
@@ -154,7 +152,6 @@ def inspect_gpu_environment(imported_packages):
     if not found_frameworks:
         return None
 
-    # 1. Inspect PyTorch if imported
     if "torch" in found_frameworks:
         try:
             import torch
@@ -177,7 +174,6 @@ def inspect_gpu_environment(imported_packages):
         except Exception:
             pass
 
-    # 2. Inspect TensorFlow if imported
     if "tensorflow" in found_frameworks:
         try:
             import tensorflow as tf
@@ -199,7 +195,6 @@ def inspect_gpu_environment(imported_packages):
         except Exception:
             pass
 
-    # 3. Inspect JAX if imported
     if "jax" in found_frameworks:
         try:
             import jax
@@ -219,7 +214,6 @@ def inspect_gpu_environment(imported_packages):
         except Exception:
             pass
 
-    # Frameworks imported, but no active GPU/accelerator detected for any imported framework
     return {
         "has_gpu": False,
         "type": None,
@@ -269,30 +263,24 @@ def process_package_requirements(pinned_list, harvested_urls):
     """
     Processes pinned packages, identifies local (+build) tags,
     and correlates them with harvested index URLs.
+    Returns: (manifest_output, local_tagged_info, warnings)
     """
     manifest_output = []
     local_tagged_info = []
+    warnings = []
     
     if harvested_urls:
-        print("\nℹ️ Preserving download location(s) found in notebook cells:")
-        for url in harvested_urls:
-            print(f"   • {url}")
+        for url in sorted(harvested_urls):
             manifest_output.append(f"--extra-index-url {url}")
-        print()
 
     for item in pinned_list:
         manifest_output.append(item)
         if '+' in item:
             local_tagged_info.append((item, list(harvested_urls)))
             if not harvested_urls:
-                print(f"⚠️ Specific hardware build detected: '{item}'")
-                print("   No download link was found in your notebook cells for this version.\n")
-                print("   If students or reviewers run this notebook on a different platform,")
-                print("   installation may fail unless you specify where to find this hardware build.\n")
-                print("   To fix this, include the full download command in your setup cell like this:")
-                print(f"   !pip install {item} --extra-index-url <YOUR_HARDWARE_INDEX_URL>\n")
+                warnings.append(item)
             
-    return manifest_output, local_tagged_info
+    return manifest_output, local_tagged_info, warnings
 
 
 # =====================================================================
@@ -307,7 +295,6 @@ def generate_production_blueprint(manifest_lines, full_freeze_lines=None, local_
     py_major, py_minor = sys.version_info.major, sys.version_info.minor
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Build GPU hardware line if an active GPU was captured
     gpu_markdown_section = ""
     if gpu_info and gpu_info.get("has_gpu"):
         dev_name = gpu_info["device_name"]
@@ -317,7 +304,6 @@ def generate_production_blueprint(manifest_lines, full_freeze_lines=None, local_
             f"  If execution is slow or fails, you MAY need to enable a GPU accelerator in your environment settings (e.g. CUDA/MPS/TPU)."
         )
 
-    # Build local packages and index URLs section
     local_builds_section = ""
     if local_tagged_info:
         bullet_lines = []
@@ -330,7 +316,6 @@ def generate_production_blueprint(manifest_lines, full_freeze_lines=None, local_
                 bullet_lines.append("    ⚠️ No download URL was specified in notebook cells. If installation fails, ensure your target runtime matches this build or supply an `--extra-index-url`.")
         local_builds_section = f"- **Specific Package Builds Detected:** The following package(s) use custom or platform-specific local builds:\n" + "\n".join(bullet_lines)
 
-    # Assemble Cell 1 Markdown
     markdown_lines = [
         "### 🛠️ Environment Setup & Dependency Verification",
         "This notebook includes a pinned environment manifest (`pinned_requirements.txt`) to ensure reproducible execution.\n",
@@ -416,10 +401,8 @@ def main():
     parser.add_argument("notebook", nargs="?", help="Path to target .ipynb file (optional when running in live session).")
     parser.add_argument("--full-freeze", action="store_true", help="Append full environment pip freeze after targeted manifest.")
     
-    # Use parse_known_args to ignore Jupyter/Colab kernel flags (-f connection_file)
     args, unknown = parser.parse_known_args()
 
-    # Detect execution environment (CLI vs Live Kernel)
     in_live_ipython = False
     try:
         from IPython import get_ipython
@@ -428,15 +411,15 @@ def main():
     except ImportError:
         pass
 
-    # Route ingestion based on execution mode
     if args.notebook:
-        if not os.path.exists(args.notebook):
-            print(f"❌ Error: File '{args.notebook}' not found.")
-            sys.exit(1)
         print(f"🔍 [Path A] Analyzing saved notebook file '{args.notebook}' via AST...")
         print(f"📌 Active Python Interpreter: {sys.executable}")
         print("   (Verify this matches the environment/kernel used for your notebook)\n")
-        imports, submodules, code_sources = extract_from_file(args.notebook)
+        
+        success, imports, submodules, code_sources, error_msg = extract_from_file(args.notebook)
+        if not success:
+            print(f"❌ Error: {error_msg}")
+            sys.exit(1)
     elif in_live_ipython:
         print("🔍 [Path B] Analyzing live IPython session kernel history via AST...")
         print("💡 Note: Always restart kernel & run all first to flush stale/deleted imports from session memory.\n")
@@ -447,7 +430,6 @@ def main():
 
     harvested_urls = harvest_index_urls_from_sources(code_sources)
     
-    # Check GPU/accelerator environment state per-framework
     gpu_info = inspect_gpu_environment(imports)
     if gpu_info:
         if gpu_info["has_gpu"]:
@@ -466,9 +448,7 @@ def main():
         if imp in STD_LIB:
             continue
         
-        # Map import name to PyPI package name
         pypi_name = IMPORT_TO_PYPI_MAP.get(imp, imp)
-        
         if imp == "cv2":
             pypi_name = resolve_opencv_variant(submodules.get("cv2"))
 
@@ -478,7 +458,22 @@ def main():
         else:
             pinned_manifest.append(f"# {pypi_name} (imported as '{imp}', not currently found in active env)")
 
-    manifest_lines, local_tagged_info = process_package_requirements(pinned_manifest, harvested_urls)
+    manifest_lines, local_tagged_info, warnings = process_package_requirements(pinned_manifest, harvested_urls)
+    
+    if harvested_urls:
+        print("ℹ️ Preserving download location(s) found in notebook cells:")
+        for url in sorted(harvested_urls):
+            print(f"   • {url}")
+        print()
+
+    for item in warnings:
+        print(f"⚠️ Specific hardware build detected: '{item}'")
+        print("   No download link was found in your notebook cells for this version.\n")
+        print("   If students or reviewers run this notebook on a different platform,")
+        print("   installation may fail unless you specify where to find this hardware build.\n")
+        print("   To fix this, include the full download command in your setup cell like this:")
+        print(f"   !pip install {item} --extra-index-url <YOUR_HARDWARE_INDEX_URL>\n")
+
     full_freeze_lines = raw_full_freeze if args.full_freeze else None
 
     blueprint = generate_production_blueprint(
