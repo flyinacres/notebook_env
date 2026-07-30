@@ -151,4 +151,73 @@ class TestKitchenSinkNotebook:
         # GPU: torch was imported, hardware-tagged build present, but no real GPU
         # in this sandbox -> tool correctly reports "imported but not active"
         assert "Acceleration Framework (torch) imported, but NO active GPU/TPU accelerator was found" in out
-        assert "Specific hardware build detected: 'torch==2.3.1+cu121'" in out
+
+        # COMBINED SCENARIO: the fixture notebook includes a cell providing
+        # --extra-index-url for the exact torch build already in the mocked
+        # environment. Confirmed via sandbox run: this suppresses the "no
+        # download link found" warning (harvested_urls applies notebook-wide,
+        # not per-package) and the URL is preserved in the manifest.
+        assert "Specific hardware build detected: 'torch==2.3.1+cu121'" not in out
+        assert "--extra-index-url https://download.pytorch.org/whl/cu121" in out
+
+    def test_relative_import_is_silently_invisible(self, kitchen_sink_notebook):
+        """
+        The fixture includes a bare `from . import helper_module` cell.
+        Confirmed via sandbox: node.module is None for this exact form, so
+        visit_ImportFrom's `if node.module:` check skips it entirely.
+        It is not extracted, not filtered as stdlib, not flagged as missing --
+        just silently absent. This test documents that gap rather than
+        hiding it; if relative-import support is added later, this
+        assertion should be the first thing to fail and get updated.
+        """
+        success, imports, submodules, code_sources, error_msg = ne.extract_from_file(str(kitchen_sink_notebook))
+        assert success is True
+        assert "helper_module" not in imports
+        assert not any("helper" in name for name in imports)
+
+    def test_umap_extras_promotion_KNOWN_REGRESSION(self, kitchen_sink_notebook, monkeypatch, capsys):
+        """
+        THIS TEST IS EXPECTED TO FAIL against the current v21 code.
+
+        The earlier (v16) design promoted `import umap.plot` to the pip
+        extra `umap-learn[plot]`, and mapped the `umap` import name to the
+        `umap-learn` PyPI package via Provides-Extra metadata inspection.
+        Neither piece of that logic exists in v21:
+          1. IMPORT_TO_PYPI_MAP has no "umap" -> "umap-learn" entry at all,
+             so even a plain `import umap` (no extras) fails to correlate
+             against an installed `umap-learn` package.
+          2. There is no Provides-Extra handling, so `umap.plot` never gets
+             promoted to `umap-learn[plot]`.
+
+        Confirmed via sandbox: even with `umap-learn` genuinely present in
+        the mocked environment, the tool still reports `umap` as missing.
+
+        This test is left failing on purpose so the regression is visible
+        in CI rather than silently accepted. Once the mapping and/or
+        extras logic is restored, update this test's expected value to
+        match the corrected output.
+        """
+        import subprocess
+        mock_frozen_env = {
+            "numpy": "numpy==1.26.4",
+            "opencv-python": "opencv-python==4.9.0.80",
+            "scikit-learn": "scikit-learn==1.4.2",
+            "pillow": "pillow==10.3.0",
+            "beautifulsoup4": "beautifulsoup4==4.12.3",
+            "torch": "torch==2.3.1+cu121",
+            "umap-learn": "umap-learn==0.5.5",  # genuinely "installed" here
+        }
+        mock_raw_freeze = list(mock_frozen_env.values())
+        monkeypatch.setattr(ne, "get_installed_environment", lambda: (mock_frozen_env, mock_raw_freeze))
+        monkeypatch.setattr(ne, "resolve_opencv_variant", lambda submodules=None: "opencv-python")
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: types.SimpleNamespace(returncode=0))
+        monkeypatch.setattr(sys, "argv", ["notebook_env.py", str(kitchen_sink_notebook)])
+
+        ne.main()
+        out = capsys.readouterr().out
+
+        # Correct expected behavior, matching the earlier v16 design intent.
+        # Currently fails: actual output contains
+        #   "# umap (imported as 'umap', not currently found in active env)"
+        # instead.
+        assert "umap-learn[plot]==0.5.5" in out
