@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PROJECT ENVIRONMENT-LOCK: NOTEBOOK SNAPSHOT TOOL (v24)
+PROJECT ENVIRONMENT-LOCK: NOTEBOOK SNAPSHOT TOOL (v25)
 
 Headless Jupyter Notebook Dependency Scanner & Lockfile Generator.
 Supports single-file processing and repository-wide batch execution (--batch).
@@ -100,10 +100,6 @@ def detect_notebook_language(nb_data, strict=False):
 
 
 def extract_from_file(notebook_path, strict=False):
-    """
-    Path A (CLI / Disk): Reads saved .ipynb file off disk.
-    Returns: (success: bool, imports: set, submodules: dict, code_sources: list, error_msg: str, lang_label: str)
-    """
     if not os.path.exists(notebook_path):
         return False, set(), {}, [], f"File '{notebook_path}' not found.", "unknown"
 
@@ -115,18 +111,19 @@ def extract_from_file(notebook_path, strict=False):
     except Exception as e:
         return False, set(), {}, [], f"File read failure ({e})", "error"
 
+    # 1. STRUCTURAL SCHEMA CHECK FIRST (Guarantees corrupt schema returns "corrupted")
+    if not isinstance(nb_data, dict) or "cells" not in nb_data or not isinstance(nb_data.get("cells"), list):
+        return False, set(), {}, [], "Unparseable notebook structure (Missing or invalid 'cells' array)", "corrupted"
+
+    # 2. LANGUAGE CHECK SECOND
     is_py, lang_label = detect_notebook_language(nb_data, strict=strict)
     if not is_py:
         return False, set(), {}, [], f"Skipped non-Python notebook (Language: {lang_label})", lang_label
 
     cells = nb_data.get("cells", [])
-    if not isinstance(cells, list):
-        return False, set(), {}, [], "Unparseable notebook structure (Missing 'cells' array)", "corrupted"
-
     code_sources = ["".join(c.get("source", [])) for c in cells if c.get("cell_type") == "code"]
     imports, submodules = extract_imports_from_sources(code_sources)
     return True, imports, submodules, code_sources, None, lang_label
-
 
 def extract_from_active_session():
     """Path B (Live Kernel): Reads IPython execution history."""
@@ -556,11 +553,12 @@ def walk_and_scan_directory(target_dir):
                 full_path = Path(root) / file
                 success, imports, submodules, code_sources, err, lang_label = extract_from_file(str(full_path), strict=True)
                 
+                parse_err = err if (not success and "Skipped non-Python notebook" not in (err or "")) else None                
                 res = NotebookScanResult(
                     path=full_path,
                     is_python=success,
                     lang_label=lang_label,
-                    parse_error=err if not success and lang_label in ("corrupted", "error") else None,
+                    parse_error=parse_err,
                     imports=imports,
                     submodules=submodules,
                     code_sources=code_sources
@@ -816,7 +814,6 @@ def main():
     except ImportError:
         pass
 
-    # FIXED: Check if args.notebook is provided and is NOT a directory
     if args.notebook and not os.path.isdir(args.notebook):
         print(f"🔍 [Path A] Analyzing saved notebook file '{args.notebook}' via AST...")
         print(f"📌 Active Python Interpreter: {sys.executable}\n")
