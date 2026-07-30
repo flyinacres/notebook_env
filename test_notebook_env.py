@@ -1,8 +1,5 @@
 """
-Tests for notebook_env.py (v22).
-
-Assumes the tool module is importable as `notebook_env`. Adjust the import
-below if the actual filename differs.
+Tests for notebook_env.py (v24).
 
 Tiers, per the test architecture doc:
   - Unit tests: pure logic, mocked subprocess/importlib/hardware libs
@@ -150,7 +147,7 @@ class TestDualPathIngestion:
         nb_path = tmp_path / "test.ipynb"
         nb_path.write_text(json.dumps(nb))
 
-        success, imports, submodules, code_sources, err = ne.extract_from_file(str(nb_path))
+        success, imports, submodules, code_sources, err, lang_label = ne.extract_from_file(str(nb_path))
         assert success is True
         assert "numpy" in imports
         assert len(code_sources) == 1
@@ -184,7 +181,7 @@ class TestDualPathIngestion:
         assert expected_comment in captured.out
 
     def test_path_a_missing_file_returns_error(self):
-        success, imports, submodules, code_sources, err = ne.extract_from_file("does_not_exist.ipynb")
+        success, imports, submodules, code_sources, err, lang_label = ne.extract_from_file("does_not_exist.ipynb")
         assert success is False
         assert "not found" in err.lower()
 
@@ -192,9 +189,9 @@ class TestDualPathIngestion:
         bad_path = tmp_path / "bad.ipynb"
         bad_path.write_text("{not valid json")
 
-        success, imports, submodules, code_sources, err = ne.extract_from_file(str(bad_path))
+        success, imports, submodules, code_sources, err, lang_label = ne.extract_from_file(str(bad_path))
         assert success is False
-        assert "not a valid" in err.lower()
+        assert "invalid json" in err.lower()
 
     def test_path_b_reads_live_session_history(self, monkeypatch):
         fake_main = types.ModuleType("__main__")

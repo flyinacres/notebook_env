@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
 """
-PROJECT ENVIRONMENT-LOCK: NOTEBOOK SNAPSHOT TOOL (v23 - BATCH ENGINE)
+PROJECT ENVIRONMENT-LOCK: NOTEBOOK SNAPSHOT TOOL (v24)
 
 Headless Jupyter Notebook Dependency Scanner & Lockfile Generator.
 Supports single-file processing and repository-wide batch execution (--batch).
-
-Modes:
-  - Single File: notebook_env.py target.ipynb
-  - Batch Analysis: notebook_env.py --batch ./path_to_dir
-  - Universal Manifest: notebook_env.py --batch ./path_to_dir --universal
-  - Per-Notebook Output: notebook_env.py --batch ./path_to_dir --output [--in-place]
 """
 
 import ast
@@ -80,10 +74,11 @@ def extract_imports_from_sources(code_sources):
     return visitor.imports, visitor.submodules
 
 
-def detect_notebook_language(nb_data):
+def detect_notebook_language(nb_data, strict=False):
     """
     Inspects kernelspec and language_info metadata.
-    Returns: (is_python: bool, language_label: str)
+    If strict=True (batch mode), missing metadata is rejected as unknown.
+    If strict=False (single-file mode), missing metadata assumes Python.
     """
     metadata = nb_data.get("metadata", {})
     ks_lang = metadata.get("kernelspec", {}).get("language", "").lower()
@@ -99,10 +94,12 @@ def detect_notebook_language(nb_data):
     if active_lang:
         return (active_lang == "python"), active_lang
         
-    return False, "missing metadata"
+    if strict:
+        return False, "missing metadata"
+    return True, "unspecified (assuming python)"
 
 
-def extract_from_file(notebook_path):
+def extract_from_file(notebook_path, strict=False):
     """
     Path A (CLI / Disk): Reads saved .ipynb file off disk.
     Returns: (success: bool, imports: set, submodules: dict, code_sources: list, error_msg: str, lang_label: str)
@@ -118,7 +115,7 @@ def extract_from_file(notebook_path):
     except Exception as e:
         return False, set(), {}, [], f"File read failure ({e})", "error"
 
-    is_py, lang_label = detect_notebook_language(nb_data)
+    is_py, lang_label = detect_notebook_language(nb_data, strict=strict)
     if not is_py:
         return False, set(), {}, [], f"Skipped non-Python notebook (Language: {lang_label})", lang_label
 
@@ -548,7 +545,7 @@ def select_primary_index_url(url_to_notebooks):
 
 
 def walk_and_scan_directory(target_dir):
-    """Recursively scans directory for .ipynb files."""
+    """Recursively scans directory for .ipynb files in strict batch mode."""
     repo_map = RepoEnvironmentMap(target_dir)
     target_path = Path(target_dir)
 
@@ -557,7 +554,7 @@ def walk_and_scan_directory(target_dir):
         for file in sorted(files):
             if file.endswith('.ipynb'):
                 full_path = Path(root) / file
-                success, imports, submodules, code_sources, err, lang_label = extract_from_file(str(full_path))
+                success, imports, submodules, code_sources, err, lang_label = extract_from_file(str(full_path), strict=True)
                 
                 res = NotebookScanResult(
                     path=full_path,
@@ -819,11 +816,12 @@ def main():
     except ImportError:
         pass
 
-    if args.notebook and os.path.isfile(args.notebook):
+    # FIXED: Check if args.notebook is provided and is NOT a directory
+    if args.notebook and not os.path.isdir(args.notebook):
         print(f"🔍 [Path A] Analyzing saved notebook file '{args.notebook}' via AST...")
         print(f"📌 Active Python Interpreter: {sys.executable}\n")
         
-        success, imports, submodules, code_sources, error_msg, _ = extract_from_file(args.notebook)
+        success, imports, submodules, code_sources, error_msg, _ = extract_from_file(args.notebook, strict=False)
         if not success:
             print(f"❌ Error: {error_msg}")
             sys.exit(1)
@@ -849,13 +847,28 @@ def main():
         if notice:
             promotion_notices.append(notice)
 
+    manifest_lines, local_tagged_info, warnings = process_package_requirements(pinned_manifest, harvested_urls)
+    full_freeze_lines = raw_full_freeze if args.full_freeze else None
+
+    # RESTORED TERMINAL WARNINGS: Local Tag Builds
+    if warnings:
+        print("⚠️ HARDWARE BUILD WARNINGS:")
+        for pkg in warnings:
+            print(f"  • Specific hardware build detected: `{pkg}`")
+            print("    No matching download URL was found in code cells. If installation fails on target machines, ensure runtime matches or supply an --extra-index-url.\n")
+
+    # RESTORED TERMINAL WARNINGS: GPU Acceleration Status
+    if gpu_info:
+        if gpu_info.get("has_gpu"):
+            print(f"⚡ Active accelerator detected: {gpu_info['device_name']}\n")
+        elif gpu_info.get("frameworks"):
+            fw_list = ", ".join(gpu_info["frameworks"])
+            print(f"⚠️ Acceleration Framework ({fw_list}) imported, but NO active accelerator detected in host runtime.\n")
+
     if promotion_notices:
         for note in promotion_notices:
             print(note)
         print()
-
-    manifest_lines, local_tagged_info, warnings = process_package_requirements(pinned_manifest, harvested_urls)
-    full_freeze_lines = raw_full_freeze if args.full_freeze else None
 
     blueprint = generate_production_blueprint(
         manifest_lines, 

@@ -87,6 +87,9 @@ class TestBatchOrchestration:
         
         # Create synthetic notebook 1
         nb1 = {
+            "metadata": {
+                "kernelspec": {"language": "python"}
+            },
             "cells": [{"cell_type": "code", "source": ["import numpy as np\n!pip install -i https://index.foo.com pkg"]}]
         }
         nb1_path = tmp_path / "01_test.ipynb"
