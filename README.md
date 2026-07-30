@@ -1,4 +1,4 @@
-# Notebook Environment-Lock Tool (v19)
+# Notebook Environment-Lock Tool (v23)
 
 A dependency and hardware-requirement scanner for Jupyter/Kaggle notebooks. It scans a notebook's imports, correlates them against the environment you actually ran it in, and generates two paste-in cells (a Markdown explainer and a setup/install cell) so the notebook is reproducible when shared.
 
@@ -7,16 +7,12 @@ This tool does not guarantee bit-for-bit reproducibility. It gives actionable, h
 ## What this tool checks
 
 - **Imports**: parses your notebook's code via Python's `ast` module to find every top-level import.
-- **Installed packages**: correlates each import against your live environment (`pip freeze`) to find matching package names and versions.
+- **Installed packages**: correlates each import against your live environment (`pip freeze` plus `importlib.metadata`) to find matching package names and versions. Package name resolution is dynamic — it queries what's actually installed rather than relying solely on a hardcoded map, so it correctly handles cases where the import name differs from the PyPI package name (e.g. `sklearn` → `scikit-learn`) even for packages not explicitly listed in this tool.
+- **Optional extras promotion**: if a submodule import matches a package's declared `Provides-Extra` metadata (e.g. `import umap.plot`), the manifest entry is promoted to include that extra (`umap-learn[plot]==...`), with a visible notice printed when this happens.
 - **Hardware-tagged builds**: flags packages with build-specific version tags (e.g. `torch==2.3.1+cu121`) and checks whether your notebook already specifies a download index for them.
 - **GPU/accelerator usage**: if your notebook imports `torch`, `tensorflow`, or `jax`, checks whether an active GPU/MPS/TPU accelerator was available in your session for that specific framework.
 
-## Why both Code Scanning and Environment Correlation are required
-
-- **Code AST gives the _Names_:** Scanning your code cells via AST identifies exactly which top-level packages your notebook imported (filtering out the hundreds of unrelated background packages installed in your environment).
-- **Environment gives the _Versions_:** Querying `pip freeze` finds the exact version numbers (`pandas==2.2.1`) and hardware tags (`+cu121`) that made your code work during testing.
-
-Without code scanning, you'd dump an overwhelming, noisy list of every package on your machine. Without environment correlation, you'd only get unpinned names (`pandas`), leaving future readers vulnerable to breaking version drift.
+This tool also supports a **batch mode** for scanning many notebooks at once (a course, a team's repo). See Batch Mode below — it's newer and less battle-tested than single-notebook mode; read the Known Issues section before relying on it.
 
 ## Required workflow
 
@@ -68,11 +64,43 @@ The tool prints two blocks to paste into new cells at the top of your notebook:
 1. **Markdown cell** — explains the setup, and if applicable, notes hardware-tagged builds and GPU/accelerator usage detected during authoring.
 2. **Code cell** — checks the Python version, writes a `pinned_requirements.txt`, and installs it via pip.
 
+Before the blueprint, Path A also prints the active Python interpreter path (`sys.executable`). This exists specifically so you can visually confirm it matches the environment your notebook's kernel actually used — see the desktop caveat above.
+
 ## Reading the GPU/accelerator messages
 
 - **"Active accelerator detected"**: a GPU-relevant library was imported and a GPU/MPS/TPU was available and confirmed for that framework in your session. This is a strong signal the notebook needs one, not certainty that every operation used it.
 - **"Framework imported, but no active accelerator found"**: you imported a GPU-capable library, but no accelerator was available in this test run. If you intended to require a GPU, this run doesn't confirm that — it just tells you this particular run happened on CPU.
 - When multiple GPU frameworks are imported together, only the framework(s) actually confirmed to have an accelerator are reflected in the device name — the message doesn't imply every listed framework had GPU access.
+
+## Batch Mode
+
+Scans a directory of notebooks at once, producing an audit-style report rather than per-notebook paste-in blueprints.
+
+```bash
+python notebook_env.py --batch ./course_materials
+```
+
+This always runs analysis first — it scans every `.ipynb` in the directory, skips non-Python kernels (R, Julia), reports parse errors, and summarizes the dependency footprint across the batch (matched packages, missing packages with which notebooks need them, extras promotions, hardware/index-URL audit). No files are written in this mode.
+
+```bash
+python notebook_env.py --batch ./course_materials --universal
+```
+
+Writes one `requirements-all.txt` covering every notebook in the batch, correlated against a single shared reference environment (not each notebook's own author environment — batch mode audits against one common target, since aggregating "each notebook's own environment" doesn't mean anything at the directory level).
+
+```bash
+python notebook_env.py --batch ./course_materials --output
+```
+
+Writes a companion `<name>_merged.ipynb` next to each source notebook, containing the setup cells. The original file is never touched by default. `--in-place` will overwrite the original directly instead (replacing any previously-generated setup cells rather than duplicating them) — use with care, and back up first; this tool does not currently create a backup automatically before an in-place write.
+
+## Known Issues (v23)
+
+The following were found while porting the existing test suite to v23 and confirmed against real runs, not yet fixed:
+
+- **Missing-file error is currently unreachable in single-notebook mode.** `main()`'s dispatch now gates single-file processing on `os.path.isfile(path)`, which is `False` for a nonexistent path — so a typo'd filename silently falls through to the generic help text instead of the specific "File not found" error `extract_from_file` was designed to produce.
+- **Notebooks with no `kernelspec`/`language_info` metadata are incorrectly rejected, even in single-notebook mode.** The language-detection gate added for batch mode's R/Julia filtering is also applied to single-notebook runs. A notebook with no language metadata at all (a common, valid case for minimal or hand-built notebooks) is labeled "missing metadata" and refused outright, even though it may be perfectly good Python. This gate should likely only apply during batch scanning, not single-file mode.
+- **Hardware-tag and GPU status warnings are computed but no longer printed anywhere.** `process_package_requirements` still returns its `warnings` list (hardware-tagged packages with no index URL), and GPU detection still runs, but as of v23 neither is surfaced to the user in single-file mode, and the GPU "imported but not active" case isn't shown in batch mode's report either. This information used to print directly during a scan; it's currently silently dropped in both modes.
 
 ## Known limitations
 
@@ -87,4 +115,5 @@ The tool prints two blocks to paste into new cells at the top of your notebook:
 ## Roadmap
 
 - Package as an installable library rather than a standalone script.
-- A separate static-only scanner for notebooks you don't own (no live execution, no environment correlation — file-based AST scan only).
+- A separate static-only scanner for notebooks you don't own (no live execution, no environment correlation — file-based AST scan only). Deferred in favor of the current single-notebook and batch-mode work; revisit later.
+- Two still-open, undecided items from single-notebook mode also apply at batch scale and are worth resolving before batch mode sees heavier use: imports wrapped in try/except get no special treatment (missing = missing, no "was optional" signal), and bare relative imports (`from . import x`) are silently invisible rather than flagged.
