@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-PROJECT ENVIRONMENT-LOCK: NOTEBOOK SNAPSHOT TOOL (v22)
+PROJECT ENVIRONMENT-LOCK: NOTEBOOK SNAPSHOT TOOL (v23 - BATCH ENGINE)
 
 Headless Jupyter Notebook Dependency Scanner & Lockfile Generator.
-Scans notebook imports via AST, dynamically correlates against active environment metadata,
-promotes submodules to declared package extras, and generates self-contained setup blueprints.
+Supports single-file processing and repository-wide batch execution (--batch).
 
-Supports dual-path execution:
-  - Path A (CLI / Disk): Parses saved .ipynb file on disk.
-  - Path B (Live Session): Parses live IPython execution history (__main__.In).
+Modes:
+  - Single File: notebook_env.py target.ipynb
+  - Batch Analysis: notebook_env.py --batch ./path_to_dir
+  - Universal Manifest: notebook_env.py --batch ./path_to_dir --universal
+  - Per-Notebook Output: notebook_env.py --batch ./path_to_dir --output [--in-place]
 """
 
 import ast
@@ -19,6 +20,7 @@ import sys
 import argparse
 import subprocess
 import importlib.metadata
+from pathlib import Path
 from datetime import datetime
 
 # =====================================================================
@@ -47,11 +49,7 @@ class NotebookImportVisitor(ast.NodeVisitor):
 
 
 def harvest_index_urls_from_sources(code_sources):
-    """
-    Scans raw code strings to find --extra-index-url or -i flags.
-    Ignores commented lines starting with '#' to prevent harvesting dead code.
-    Returns a set of discovered index URL strings.
-    """
+    """Scans code sources for --extra-index-url or -i flags."""
     index_urls = set()
     pattern = re.compile(r'(?:--extra-index-url|-i)\s+([^\s]+)')
     for source in code_sources:
@@ -66,10 +64,7 @@ def harvest_index_urls_from_sources(code_sources):
 
 
 def extract_imports_from_sources(code_sources):
-    """
-    Core AST parser: Takes a list of raw code strings (from disk cells OR live kernel history).
-    Strips magics (%) and shell commands (!) prior to parsing.
-    """
+    """Extracts top-level imports and submodules via AST, stripping magics and shell commands."""
     visitor = NotebookImportVisitor()
     for source in code_sources:
         clean_source = "\n".join([
@@ -85,34 +80,59 @@ def extract_imports_from_sources(code_sources):
     return visitor.imports, visitor.submodules
 
 
+def detect_notebook_language(nb_data):
+    """
+    Inspects kernelspec and language_info metadata.
+    Returns: (is_python: bool, language_label: str)
+    """
+    metadata = nb_data.get("metadata", {})
+    ks_lang = metadata.get("kernelspec", {}).get("language", "").lower()
+    li_lang = metadata.get("language_info", {}).get("name", "").lower()
+
+    if ks_lang and li_lang:
+        if ks_lang == li_lang:
+            return (ks_lang == "python"), ks_lang
+        else:
+            return False, f"conflict ({ks_lang}/{li_lang})"
+    
+    active_lang = ks_lang or li_lang
+    if active_lang:
+        return (active_lang == "python"), active_lang
+        
+    return False, "missing metadata"
+
+
 def extract_from_file(notebook_path):
     """
     Path A (CLI / Disk): Reads saved .ipynb file off disk.
-    Returns: (success: bool, imports: set, submodules: dict, code_sources: list, error_msg: str)
+    Returns: (success: bool, imports: set, submodules: dict, code_sources: list, error_msg: str, lang_label: str)
     """
     if not os.path.exists(notebook_path):
-        return False, set(), {}, [], f"File '{notebook_path}' not found."
+        return False, set(), {}, [], f"File '{notebook_path}' not found.", "unknown"
 
     try:
         with open(notebook_path, 'r', encoding='utf-8') as f:
             nb_data = json.load(f)
-    except json.JSONDecodeError:
-        return False, set(), {}, [], f"File '{notebook_path}' is not a valid Jupyter Notebook JSON format."
+    except json.JSONDecodeError as e:
+        return False, set(), {}, [], f"Invalid JSON structure ({e})", "corrupted"
     except Exception as e:
-        return False, set(), {}, [], f"Error reading notebook file: {e}"
+        return False, set(), {}, [], f"File read failure ({e})", "error"
+
+    is_py, lang_label = detect_notebook_language(nb_data)
+    if not is_py:
+        return False, set(), {}, [], f"Skipped non-Python notebook (Language: {lang_label})", lang_label
 
     cells = nb_data.get("cells", [])
+    if not isinstance(cells, list):
+        return False, set(), {}, [], "Unparseable notebook structure (Missing 'cells' array)", "corrupted"
+
     code_sources = ["".join(c.get("source", [])) for c in cells if c.get("cell_type") == "code"]
     imports, submodules = extract_imports_from_sources(code_sources)
-    return True, imports, submodules, code_sources, None
+    return True, imports, submodules, code_sources, None, lang_label
 
 
 def extract_from_active_session():
-    """
-    Path B (Live Kernel): Reads IPython execution history (__main__.In).
-    NOTE: Stale/deleted cells from earlier in the session remain until Kernel Restart.
-    Returns: imports, submodules, code_sources
-    """
+    """Path B (Live Kernel): Reads IPython execution history."""
     import __main__
     code_sources = [src for src in getattr(__main__, 'In', []) if src and isinstance(src, str)]
     imports, submodules = extract_imports_from_sources(code_sources)
@@ -123,7 +143,6 @@ def extract_from_active_session():
 # ENVIRONMENT CORRELATION & HARDWARE INSPECTION
 # =====================================================================
 
-# Fallback safety net map for packages NOT installed in current environment at snapshot time
 IMPORT_TO_PYPI_MAP = {
     "cv2": "opencv-python",
     "sklearn": "scikit-learn",
@@ -140,23 +159,20 @@ STD_LIB = set(sys.stdlib_module_names) if hasattr(sys, 'stdlib_module_names') el
 }
 
 
-def resolve_pypi_package_and_extras(imp, submodules_set, frozen_env):
+def resolve_pypi_package_and_extras(imp, submodules_set, frozen_env, pkg_dist_map=None):
     """
-    Resolves top-level import to its canonical PyPI package name using live metadata first.
-    Promotes submodules to optional extras if declared in package metadata (e.g. umap.plot -> umap-learn[plot]).
-    Falls back to static map if the package is not installed in active environment.
-    
-    Returns: (pinned_manifest_entry, promotion_notice_str or None)
+    Resolves top-level import to PyPI package name using memoized metadata first.
+    Promotes submodules to optional extras if declared in package metadata.
     """
     pypi_name = None
-    try:
-        if hasattr(importlib.metadata, "packages_distributions"):
+    if pkg_dist_map is None and hasattr(importlib.metadata, "packages_distributions"):
+        try:
             pkg_dist_map = importlib.metadata.packages_distributions()
-            dists = pkg_dist_map.get(imp)
-            if dists:
-                pypi_name = dists[0]
-    except Exception:
-        pass
+        except Exception:
+            pkg_dist_map = {}
+
+    if pkg_dist_map and imp in pkg_dist_map:
+        pypi_name = pkg_dist_map[imp][0]
 
     if imp == "cv2":
         pypi_name = resolve_opencv_variant(submodules_set)
@@ -195,13 +211,7 @@ def resolve_pypi_package_and_extras(imp, submodules_set, frozen_env):
 
 
 def inspect_gpu_environment(imported_packages):
-    """
-    Per-framework GPU/accelerator inspection logic. Queries only the frameworks imported:
-      - PyTorch: checks torch.cuda and torch.backends.mps
-      - TensorFlow: checks tf.config.list_physical_devices('GPU')
-      - JAX: checks jax.devices() for non-CPU platforms (GPU/TPU)
-    Returns exact active_framework alongside device details.
-    """
+    """Per-framework GPU/accelerator inspection logic."""
     gpu_frameworks = {"torch", "tensorflow", "jax"}
     found_frameworks = gpu_frameworks.intersection(imported_packages)
     
@@ -280,11 +290,8 @@ def inspect_gpu_environment(imported_packages):
 
 
 def resolve_opencv_variant(submodules=None):
-    """
-    Determines the appropriate OpenCV package variant installed in the environment.
-    """
+    """Determines the appropriate OpenCV package variant installed in the environment."""
     has_contrib = any('contrib' in s.lower() or 'aruco' in s.lower() for s in submodules) if submodules else False
-    
     try:
         res = subprocess.run([sys.executable, "-m", "pip", "list"], capture_output=True, text=True)
         installed = res.stdout.lower()
@@ -298,14 +305,11 @@ def resolve_opencv_variant(submodules=None):
             return "opencv-python"
     except Exception:
         pass
-    
     return "opencv-contrib-python" if has_contrib else "opencv-python"
 
 
 def get_installed_environment():
-    """
-    Runs `pip freeze` to get precise version snapshots of the current runtime.
-    """
+    """Runs pip freeze to get precise version snapshots."""
     res = subprocess.run([sys.executable, "-m", "pip", "freeze"], capture_output=True, text=True)
     frozen = {}
     for line in res.stdout.splitlines():
@@ -316,11 +320,7 @@ def get_installed_environment():
 
 
 def process_package_requirements(pinned_list, harvested_urls):
-    """
-    Processes pinned packages, identifies local (+build) tags,
-    and correlates them with harvested index URLs.
-    Returns: (manifest_output, local_tagged_info, warnings)
-    """
+    """Correlates pinned packages with harvested index URLs."""
     manifest_output = []
     local_tagged_info = []
     warnings = []
@@ -340,14 +340,11 @@ def process_package_requirements(pinned_list, harvested_urls):
 
 
 # =====================================================================
-# BLUEPRINT GENERATOR
+# BLUEPRINT & CELL METADATA GENERATOR
 # =====================================================================
 
 def generate_production_blueprint(manifest_lines, full_freeze_lines=None, local_tagged_info=None, gpu_info=None):
-    """
-    Assembles Cell 1 Markdown and Cell 2 Python code.
-    Returns dict {"step1_markdown": str, "step2_code": str} for direct programmatic/test assertion.
-    """
+    """Assembles Cell 1 Markdown and Cell 2 Python code dictionary."""
     py_major, py_minor = sys.version_info.major, sys.version_info.minor
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -386,7 +383,6 @@ def generate_production_blueprint(manifest_lines, full_freeze_lines=None, local_
     markdown_lines.append("- **Network Notice:** If required packages are not already cached in your current runtime environment, internet access may be needed to download missing wheels.")
 
     step1_markdown = "\n".join(markdown_lines)
-
     payload_string = "\n".join(manifest_lines).strip()
     if full_freeze_lines:
         payload_string += "\n\n# --- FULL FREEZE FALLBACK BLOCK ---\n" + "\n".join(full_freeze_lines)
@@ -448,17 +444,373 @@ else:
     }
 
 
+def create_managed_cells(blueprint):
+    """Creates cell dicts stamped with notebook_env managed metadata."""
+    cell1 = {
+        "cell_type": "markdown",
+        "metadata": {
+            "notebook_env": {
+                "managed": True,
+                "role": "setup_markdown"
+            }
+        },
+        "source": [line + "\n" for line in blueprint["step1_markdown"].splitlines()]
+    }
+    cell2 = {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {
+            "notebook_env": {
+                "managed": True,
+                "role": "setup_code"
+            }
+        },
+        "outputs": [],
+        "source": [line + "\n" for line in blueprint["step2_code"].splitlines()]
+    }
+    return [cell1, cell2]
+
+
+# =====================================================================
+# BATCH ORCHESTRATION ENGINE
+# =====================================================================
+
+class NotebookScanResult:
+    def __init__(self, path, is_python, lang_label, parse_error=None, imports=None, submodules=None, code_sources=None):
+        self.path = path
+        self.is_python = is_python
+        self.lang_label = lang_label
+        self.parse_error = parse_error
+        self.imports = imports or set()
+        self.submodules = submodules or {}
+        self.code_sources = code_sources or []
+        self.harvested_urls = harvest_index_urls_from_sources(self.code_sources) if self.code_sources else set()
+
+
+class RepoEnvironmentMap:
+    def __init__(self, target_dir):
+        self.target_dir = target_dir
+        self.scan_results = []
+        self.non_python_files = []
+        self.parse_errors = []
+        self.global_imports = set()
+        self.package_to_notebooks = {}
+        self.url_to_notebooks = {}
+        self.promotions = []
+        self.decisions = []
+
+    def add_result(self, result):
+        if result.parse_error:
+            self.parse_errors.append(result)
+            return
+        if not result.is_python:
+            self.non_python_files.append(result)
+            return
+
+        self.scan_results.append(result)
+        for imp in result.imports:
+            if imp not in STD_LIB:
+                self.global_imports.add(imp)
+                self.package_to_notebooks.setdefault(imp, []).append(result.path)
+
+        for url in result.harvested_urls:
+            self.url_to_notebooks.setdefault(url, []).append(result.path)
+
+
+def select_primary_index_url(url_to_notebooks):
+    """
+    Deterministically selects primary index URL:
+    1. Majority notebook frequency rule
+    2. Alphabetical filename tie-break
+    3. Alphabetical URL string tie-break
+    """
+    if not url_to_notebooks:
+        return None, None
+
+    sorted_urls = sorted(url_to_notebooks.keys())
+    
+    def sorting_key(url):
+        notebooks = sorted([str(p) for p in url_to_notebooks[url]])
+        count = len(notebooks)
+        first_nb = notebooks[0] if notebooks else ""
+        return (-count, first_nb, url)
+
+    best_url = sorted(sorted_urls, key=sorting_key)[0]
+    count = len(url_to_notebooks[best_url])
+    total_urls = len(url_to_notebooks)
+    
+    if total_urls > 1:
+        reason = f"Majority rule (used in {count} notebook(s); selected over {total_urls - 1} runner-up URL(s))"
+    else:
+        reason = f"Sole index URL harvested across batch ({count} notebook(s))"
+
+    return best_url, reason
+
+
+def walk_and_scan_directory(target_dir):
+    """Recursively scans directory for .ipynb files."""
+    repo_map = RepoEnvironmentMap(target_dir)
+    target_path = Path(target_dir)
+
+    for root, dirs, files in os.walk(target_path):
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('venv', 'env', '__pycache__')]
+        for file in sorted(files):
+            if file.endswith('.ipynb'):
+                full_path = Path(root) / file
+                success, imports, submodules, code_sources, err, lang_label = extract_from_file(str(full_path))
+                
+                res = NotebookScanResult(
+                    path=full_path,
+                    is_python=success,
+                    lang_label=lang_label,
+                    parse_error=err if not success and lang_label in ("corrupted", "error") else None,
+                    imports=imports,
+                    submodules=submodules,
+                    code_sources=code_sources
+                )
+                repo_map.add_result(res)
+
+    return repo_map
+
+
+def generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, batch_hw_cache):
+    """Generates stdout report for batch analysis mode."""
+    py_count = len(repo_map.scan_results)
+    non_py_count = len(repo_map.non_python_files)
+    err_count = len(repo_map.parse_errors)
+
+    out = []
+    out.append("=" * 80)
+    out.append("BATCH ENVIRONMENT ANALYSIS REPORT")
+    out.append(f"Target Directory: {repo_map.target_dir}")
+    out.append(f"Active Interpreter: {sys.executable}")
+    out.append("=" * 80 + "\n")
+
+    out.append("📁 NOTEBOOK INVENTORY & LANGUAGE SCAN:")
+    out.append(f"  • Python (.ipynb): {py_count} files analyzed")
+    
+    if non_py_count > 0:
+        lang_counts = {}
+        for item in repo_map.non_python_files:
+            lang_counts[item.lang_label] = lang_counts.get(item.lang_label, 0) + 1
+        lang_str = ", ".join([f"{k} ({v})" for k, v in lang_counts.items()])
+        out.append(f"  • Non-Python skipped: {non_py_count} files [{lang_str}]")
+    else:
+        out.append("  • Non-Python skipped: 0 files")
+
+    out.append(f"  • File / Parse Errors: {err_count} files")
+    out.append("")
+
+    if err_count > 0:
+        out.append("❌ FILE & PARSE ERRORS:")
+        for err_res in repo_map.parse_errors:
+            out.append(f"  • {err_res.path}")
+            out.append(f"    └─ Cause: {err_res.parse_error}")
+        out.append("")
+
+    # Dependency correlation
+    matched_packages = set()
+    missing_packages = {}
+    promotions = []
+
+    for res in repo_map.scan_results:
+        for imp in sorted(res.imports):
+            if imp in STD_LIB:
+                continue
+            submods = res.submodules.get(imp, set())
+            pin_entry, notice = resolve_pypi_package_and_extras(imp, submods, frozen_env, pkg_dist_map=pkg_dist_map)
+            
+            if notice and notice not in promotions:
+                promotions.append(notice)
+
+            if pin_entry.startswith("#"):
+                pypi_name = pin_entry.split()[1]
+                missing_packages.setdefault(pypi_name, []).append(res.path.name)
+            else:
+                pkg_name = pin_entry.split("==")[0]
+                matched_packages.add(pkg_name)
+
+    out.append(f"📦 IMPORTED DEPENDENCY FOOTPRINT (Across {py_count} Python notebooks):")
+    out.append(f"  • Installed & Matched: {len(matched_packages)} packages ({', '.join(sorted(matched_packages)[:5])}{'...' if len(matched_packages) > 5 else ''})")
+    
+    if missing_packages:
+        out.append(f"  • Uninstalled in active env: {len(missing_packages)} package(s)")
+        for pkg, nbs in sorted(missing_packages.items()):
+            nb_list = ", ".join(sorted(set(nbs))[:3])
+            more = f", +{len(set(nbs))-3} more" if len(set(nbs)) > 3 else ""
+            out.append(f"      - {pkg} (imported in: {nb_list}{more})")
+    else:
+        out.append("  • Uninstalled in active env: 0 packages")
+    out.append("")
+
+    if promotions:
+        out.append("💡 DYNAMIC PROMOTIONS DETECTED:")
+        for note in promotions:
+            out.append(f"  • {note}")
+        out.append("")
+
+    # Hardware & Index Audit
+    out.append("⚡ HARDWARE & INDEX URL AUDIT:")
+    if batch_hw_cache and batch_hw_cache.get("has_gpu"):
+        out.append(f"  • Active Hardware Accelerator: {batch_hw_cache['device_name']}")
+    else:
+        out.append("  • Active Hardware Accelerator: None (CPU-only execution environment)")
+
+    primary_url, url_reason = select_primary_index_url(repo_map.url_to_notebooks)
+    if primary_url:
+        out.append(f"  • Primary Index URL: {primary_url}")
+        out.append(f"    └─ Selection Rule: {url_reason}")
+    else:
+        out.append("  • Extra Index URLs Harvested: None")
+
+    out.append("\n" + "-" * 80)
+    if err_count > 0:
+        out.append("STATUS: ⚠️ ATTENTION REQUIRED - Parse errors present. Resolve file issues above.")
+    else:
+        out.append(f"STATUS: No blocking file errors found across {py_count} Python notebooks. Output mode (--output) can be executed.")
+    out.append("=" * 80)
+
+    return "\n".join(out), err_count == 0
+
+
+def generate_universal_manifest(repo_map, frozen_env, pkg_dist_map):
+    """Generates content string for requirements-all.txt."""
+    lines = []
+    lines.append("# =====================================================================")
+    lines.append("# REPOSITORY UNIVERSAL DEPENDENCY MANIFEST")
+    lines.append(f"# Target Directory: {repo_map.target_dir}")
+    lines.append(f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    primary_url, url_reason = select_primary_index_url(repo_map.url_to_notebooks)
+    if primary_url:
+        lines.append("#")
+        lines.append(f"# Primary Download Index: {primary_url}")
+        lines.append(f"# Selection Rule: {url_reason}")
+
+    lines.append("# =====================================================================\n")
+
+    if repo_map.url_to_notebooks:
+        for url in sorted(repo_map.url_to_notebooks.keys()):
+            lines.append(f"--extra-index-url {url}")
+
+    pinned_entries = set()
+    for res in repo_map.scan_results:
+        for imp in sorted(res.imports):
+            if imp in STD_LIB:
+                continue
+            submods = res.submodules.get(imp, set())
+            pin_entry, _ = resolve_pypi_package_and_extras(imp, submods, frozen_env, pkg_dist_map=pkg_dist_map)
+            pinned_entries.add(pin_entry)
+
+    for entry in sorted(pinned_entries):
+        lines.append(entry)
+
+    return "\n".join(lines)
+
+
+def apply_output_to_notebook(scan_res, frozen_env, pkg_dist_map, batch_hw_cache, suffix="_merged", in_place=False):
+    """Writes per-notebook locked file or replaces cells in-place."""
+    pinned_manifest = []
+    for imp in sorted(scan_res.imports):
+        if imp in STD_LIB:
+            continue
+        submods = scan_res.submodules.get(imp, set())
+        pin_entry, _ = resolve_pypi_package_and_extras(imp, submods, frozen_env, pkg_dist_map=pkg_dist_map)
+        pinned_manifest.append(pin_entry)
+
+    manifest_lines, local_tagged, _ = process_package_requirements(pinned_manifest, scan_res.harvested_urls)
+    
+    # Filter GPU info for this specific notebook
+    gpu_info = None
+    if batch_hw_cache:
+        nb_fw = set(batch_hw_cache.get("frameworks", [])).intersection(scan_res.imports)
+        if nb_fw:
+            gpu_info = dict(batch_hw_cache)
+            gpu_info["frameworks"] = list(nb_fw)
+
+    blueprint = generate_production_blueprint(manifest_lines, local_tagged_info=local_tagged, gpu_info=gpu_info)
+    managed_cells = create_managed_cells(blueprint)
+
+    with open(scan_res.path, 'r', encoding='utf-8') as f:
+        nb_data = json.load(f)
+
+    cells = nb_data.get("cells", [])
+
+    if in_place:
+        target_path = scan_res.path
+        # Remove existing managed cells
+        non_managed_cells = [
+            c for c in cells 
+            if not (isinstance(c.get("metadata"), dict) and c.get("metadata", {}).get("notebook_env", {}).get("managed") is True)
+        ]
+        nb_data["cells"] = managed_cells + non_managed_cells
+    else:
+        stem = scan_res.path.stem
+        target_path = scan_res.path.parent / f"{stem}{suffix}.ipynb"
+        nb_data["cells"] = managed_cells + cells
+
+    with open(target_path, 'w', encoding='utf-8') as f:
+        json.dump(nb_data, f, indent=1)
+
+    return target_path
+
+
 # =====================================================================
 # MAIN EXECUTION ENTRYPOINT
 # =====================================================================
 
 def main():
     parser = argparse.ArgumentParser(description="Generate environment lockfiles for Jupyter Notebooks.")
-    parser.add_argument("notebook", nargs="?", help="Path to target .ipynb file (optional when running in live session).")
+    parser.add_argument("notebook", nargs="?", help="Path to target .ipynb file or directory (when using --batch).")
     parser.add_argument("--full-freeze", action="store_true", help="Append full environment pip freeze after targeted manifest.")
     
+    # Batch Flags
+    parser.add_argument("--batch", metavar="DIR", help="Run in batch mode across all notebooks in specified directory.")
+    parser.add_argument("--analyze", action="store_true", help="Run batch analysis mode (default when --batch is provided).")
+    parser.add_argument("--universal", action="store_true", help="Generate root requirements-all.txt universal manifest.")
+    parser.add_argument("--output", action="store_true", help="Generate per-notebook merged lockfiles.")
+    parser.add_argument("--suffix", default="_merged", help="File suffix for merged notebook outputs (default: '_merged').")
+    parser.add_argument("--in-place", action="store_true", help="Overwrite original notebooks in-place instead of creating companion files.")
+
     args, unknown = parser.parse_known_args()
 
+    # Memoized environment-level checks (Computed ONCE at entry)
+    frozen_env, raw_full_freeze = get_installed_environment()
+    pkg_dist_map = importlib.metadata.packages_distributions() if hasattr(importlib.metadata, "packages_distributions") else {}
+    batch_hw_cache = inspect_gpu_environment({"torch", "tensorflow", "jax"})
+
+    # --- BATCH DISPATCH ---
+    target_batch_dir = args.batch or (args.notebook if args.notebook and os.path.isdir(args.notebook) else None)
+
+    if target_batch_dir:
+        repo_map = walk_and_scan_directory(target_batch_dir)
+        report_text, is_clean = generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, batch_hw_cache)
+        print(report_text)
+
+        if not is_clean and (args.universal or args.output):
+            print("\n❌ Execution aborted: Resolve file/parse errors before running --universal or --output.")
+            sys.exit(1)
+
+        if args.universal:
+            uni_content = generate_universal_manifest(repo_map, frozen_env, pkg_dist_map)
+            out_file = Path(target_batch_dir) / "requirements-all.txt"
+            with open(out_file, 'w', encoding='utf-8') as f:
+                f.write(uni_content)
+            print(f"\n✅ Wrote universal repository manifest to '{out_file}'")
+
+        if args.output:
+            print(f"\n🚀 Writing per-notebook locked files ({'in-place' if args.in_place else 'suffix: ' + args.suffix})...")
+            for res in repo_map.scan_results:
+                written_path = apply_output_to_notebook(
+                    res, frozen_env, pkg_dist_map, batch_hw_cache, 
+                    suffix=args.suffix, in_place=args.in_place
+                )
+                print(f"  • Updated '{written_path.name}'")
+            print("✅ Batch output complete.")
+
+        sys.exit(0)
+
+    # --- SINGLE FILE / LIVE SESSION DISPATCH ---
     in_live_ipython = False
     try:
         from IPython import get_ipython
@@ -467,37 +819,23 @@ def main():
     except ImportError:
         pass
 
-    if args.notebook:
+    if args.notebook and os.path.isfile(args.notebook):
         print(f"🔍 [Path A] Analyzing saved notebook file '{args.notebook}' via AST...")
-        print(f"📌 Active Python Interpreter: {sys.executable}")
-        print("   (Verify this matches the environment/kernel used for your notebook)\n")
+        print(f"📌 Active Python Interpreter: {sys.executable}\n")
         
-        success, imports, submodules, code_sources, error_msg = extract_from_file(args.notebook)
+        success, imports, submodules, code_sources, error_msg, _ = extract_from_file(args.notebook)
         if not success:
             print(f"❌ Error: {error_msg}")
             sys.exit(1)
     elif in_live_ipython:
         print("🔍 [Path B] Analyzing live IPython session kernel history via AST...")
-        print("💡 Note: Always restart kernel & run all first to flush stale/deleted imports from session memory.\n")
         imports, submodules, code_sources = extract_from_active_session()
     else:
         parser.print_help()
         sys.exit(1)
 
     harvested_urls = harvest_index_urls_from_sources(code_sources)
-    
     gpu_info = inspect_gpu_environment(imports)
-    if gpu_info:
-        if gpu_info["has_gpu"]:
-            print(f"⚡ Active accelerator detected during snapshot: {gpu_info['device_name']}")
-            print("   Captured device name for end-user Cell 1 Markdown.\n")
-        else:
-            frameworks_str = ", ".join(gpu_info["frameworks"])
-            print(f"⚠️ Acceleration Framework ({frameworks_str}) imported, but NO active GPU/TPU accelerator was found!")
-            print("   Your notebook imported an accelerator library, but hardware acceleration was not active during this run.")
-            print("   If you intended to require a GPU/TPU, note that this test run executed on CPU.\n")
-
-    frozen_env, raw_full_freeze = get_installed_environment()
     
     pinned_manifest = []
     promotion_notices = []
@@ -505,10 +843,8 @@ def main():
     for imp in sorted(imports):
         if imp in STD_LIB:
             continue
-        
         submods = submodules.get(imp, set())
-        pin_entry, notice = resolve_pypi_package_and_extras(imp, submods, frozen_env)
-        
+        pin_entry, notice = resolve_pypi_package_and_extras(imp, submods, frozen_env, pkg_dist_map=pkg_dist_map)
         pinned_manifest.append(pin_entry)
         if notice:
             promotion_notices.append(notice)
@@ -519,21 +855,6 @@ def main():
         print()
 
     manifest_lines, local_tagged_info, warnings = process_package_requirements(pinned_manifest, harvested_urls)
-    
-    if harvested_urls:
-        print("ℹ️ Preserving download location(s) found in notebook cells:")
-        for url in sorted(harvested_urls):
-            print(f"   • {url}")
-        print()
-
-    for item in warnings:
-        print(f"⚠️ Specific hardware build detected: '{item}'")
-        print("   No download link was found in your notebook cells for this version.\n")
-        print("   If students or reviewers run this notebook on a different platform,")
-        print("   installation may fail unless you specify where to find this hardware build.\n")
-        print("   To fix this, include the full download command in your setup cell like this:")
-        print(f"   !pip install {item} --extra-index-url <YOUR_HARDWARE_INDEX_URL>\n")
-
     full_freeze_lines = raw_full_freeze if args.full_freeze else None
 
     blueprint = generate_production_blueprint(
