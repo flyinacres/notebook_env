@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-PROJECT ENVIRONMENT-LOCK: NOTEBOOK SNAPSHOT TOOL (v21)
+PROJECT ENVIRONMENT-LOCK: NOTEBOOK SNAPSHOT TOOL (v22)
 
 Headless Jupyter Notebook Dependency Scanner & Lockfile Generator.
-Scans notebook imports via AST, correlates against active environment,
-and generates self-contained setup blueprints.
+Scans notebook imports via AST, dynamically correlates against active environment metadata,
+promotes submodules to declared package extras, and generates self-contained setup blueprints.
 
 Supports dual-path execution:
   - Path A (CLI / Disk): Parses saved .ipynb file on disk.
@@ -18,6 +18,7 @@ import re
 import sys
 import argparse
 import subprocess
+import importlib.metadata
 from datetime import datetime
 
 # =====================================================================
@@ -122,6 +123,7 @@ def extract_from_active_session():
 # ENVIRONMENT CORRELATION & HARDWARE INSPECTION
 # =====================================================================
 
+# Fallback safety net map for packages NOT installed in current environment at snapshot time
 IMPORT_TO_PYPI_MAP = {
     "cv2": "opencv-python",
     "sklearn": "scikit-learn",
@@ -136,6 +138,60 @@ STD_LIB = set(sys.stdlib_module_names) if hasattr(sys, 'stdlib_module_names') el
     "os", "sys", "re", "json", "ast", "subprocess", "datetime", "math", "random", 
     "time", "pathlib", "typing", "collections", "itertools", "functools", "shutil"
 }
+
+
+def resolve_pypi_package_and_extras(imp, submodules_set, frozen_env):
+    """
+    Resolves top-level import to its canonical PyPI package name using live metadata first.
+    Promotes submodules to optional extras if declared in package metadata (e.g. umap.plot -> umap-learn[plot]).
+    Falls back to static map if the package is not installed in active environment.
+    
+    Returns: (pinned_manifest_entry, promotion_notice_str or None)
+    """
+    pypi_name = None
+    try:
+        if hasattr(importlib.metadata, "packages_distributions"):
+            pkg_dist_map = importlib.metadata.packages_distributions()
+            dists = pkg_dist_map.get(imp)
+            if dists:
+                pypi_name = dists[0]
+    except Exception:
+        pass
+
+    if imp == "cv2":
+        pypi_name = resolve_opencv_variant(submodules_set)
+
+    if not pypi_name:
+        pypi_name = IMPORT_TO_PYPI_MAP.get(imp, imp)
+
+    matched_pin = frozen_env.get(pypi_name.lower())
+
+    if not matched_pin:
+        return f"# {pypi_name} (imported as '{imp}', not currently found in active env)", None
+
+    pkg_part, ver_part = matched_pin.split("==", 1)
+
+    extra_tag = None
+    if submodules_set:
+        try:
+            dist = importlib.metadata.distribution(pkg_part)
+            provided_extras = dist.metadata.get_all("Provides-Extra") or []
+            provided_extras_lower = {e.lower(): e for e in provided_extras}
+
+            for sub in submodules_set:
+                sub_tail = sub.split('.')[-1].lower()
+                if sub_tail in provided_extras_lower:
+                    extra_tag = provided_extras_lower[sub_tail]
+                    break
+        except Exception:
+            pass
+
+    if extra_tag:
+        promoted_pin = f"{pkg_part}[{extra_tag}]=={ver_part}"
+        notice = f"💡 Extra Dependency Promotion: importing '{imp}.{extra_tag}' automatically promoted requirement to '{pkg_part}[{extra_tag}]=={ver_part}'"
+        return promoted_pin, notice
+
+    return matched_pin, None
 
 
 def inspect_gpu_environment(imported_packages):
@@ -444,19 +500,23 @@ def main():
     frozen_env, raw_full_freeze = get_installed_environment()
     
     pinned_manifest = []
+    promotion_notices = []
+
     for imp in sorted(imports):
         if imp in STD_LIB:
             continue
         
-        pypi_name = IMPORT_TO_PYPI_MAP.get(imp, imp)
-        if imp == "cv2":
-            pypi_name = resolve_opencv_variant(submodules.get("cv2"))
+        submods = submodules.get(imp, set())
+        pin_entry, notice = resolve_pypi_package_and_extras(imp, submods, frozen_env)
+        
+        pinned_manifest.append(pin_entry)
+        if notice:
+            promotion_notices.append(notice)
 
-        matched_pin = frozen_env.get(pypi_name.lower())
-        if matched_pin:
-            pinned_manifest.append(matched_pin)
-        else:
-            pinned_manifest.append(f"# {pypi_name} (imported as '{imp}', not currently found in active env)")
+    if promotion_notices:
+        for note in promotion_notices:
+            print(note)
+        print()
 
     manifest_lines, local_tagged_info, warnings = process_package_requirements(pinned_manifest, harvested_urls)
     

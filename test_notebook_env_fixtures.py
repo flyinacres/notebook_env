@@ -20,21 +20,23 @@ special treatment in the current AST visitor. They are extracted and
 correlated exactly like any unconditional import, and show up in the
 manifest as ordinary "not currently found in active env" placeholders.
 There is currently no way to tell, from the generated manifest alone,
-that these imports were originally guarded by the author. If that
-distinction becomes important later, it needs the try/except-awareness
-that existed in an earlier version of this tool and was not carried
-forward into v21.
+that these imports were originally guarded by the author. Still open
+as of v22.
 
-Separate known gap, not covered by this fixture: the earlier v16 design
-had Provides-Extra handling to promote e.g. `umap.plot` to `umap-learn[plot]`.
-That logic is not present in v21 -- `umap.plot` currently just resolves to
-a plain `umap` import with no extras awareness. Flagged here rather than
-silently worked around.
+Separate gap, also still open: bare relative imports (`from . import x`)
+are silently invisible -- node.module is None for that exact form, so
+they're never extracted, never flagged missing, nothing.
+
+RESOLVED in v22 (previously an open regression in this file): the earlier
+v16 design's Provides-Extra promotion (e.g. `umap.plot` -> `umap-learn[plot]`)
+and dynamic `packages_distributions()` name resolution are both back,
+confirmed working via test_umap_extras_promotion_now_works below.
 """
 
 import json
 import sys
 import types
+import importlib.metadata
 from pathlib import Path
 
 import pytest
@@ -64,6 +66,16 @@ def mock_environment(monkeypatch):
     'installed' (numpy, opencv, scikit-learn, pillow, beautifulsoup4,
     torch), others are not (yaml/PyYAML, cupy, umap, the fake package).
     This lets the same run exercise both the satisfied and missing paths.
+
+    Also mocks importlib.metadata directly (packages_distributions +
+    distribution), NOT just get_installed_environment(). v22's dynamic
+    resolution calls importlib.metadata for real -- without mocking it,
+    test results would depend on whatever happens to actually be
+    installed on whatever machine runs the suite. Confirmed via sandbox:
+    several of these names (scikit-learn, pillow, beautifulsoup4, PyYAML)
+    genuinely happen to be installed in a typical dev/CI Python
+    environment, which would make a test pass "by accident" rather than
+    by design. This fixture removes that dependency entirely.
     """
     frozen_env = {
         "numpy": "numpy==1.26.4",
@@ -76,6 +88,25 @@ def mock_environment(monkeypatch):
     raw_freeze = list(frozen_env.values())
     monkeypatch.setattr(ne, "get_installed_environment", lambda: (frozen_env, raw_freeze))
     monkeypatch.setattr(ne, "resolve_opencv_variant", lambda submodules=None: "opencv-python")
+
+    fake_packages_distributions = {
+        "numpy": ["numpy"],
+        "sklearn": ["scikit-learn"],
+        "PIL": ["pillow"],
+        "bs4": ["beautifulsoup4"],
+        "yaml": ["PyYAML"],
+        # torch, cupy, umap, this_package_does_not_exist_xyz: deliberately
+        # absent, same as a real environment where they're not installed
+    }
+    monkeypatch.setattr(
+        importlib.metadata, "packages_distributions",
+        lambda: fake_packages_distributions
+    )
+
+    def fake_distribution(pkg_name):
+        raise importlib.metadata.PackageNotFoundError(pkg_name)
+    monkeypatch.setattr(importlib.metadata, "distribution", fake_distribution)
+
     return frozen_env
 
 
@@ -175,29 +206,21 @@ class TestKitchenSinkNotebook:
         assert "helper_module" not in imports
         assert not any("helper" in name for name in imports)
 
-    def test_umap_extras_promotion_KNOWN_REGRESSION(self, kitchen_sink_notebook, monkeypatch, capsys):
+    def test_umap_extras_promotion_now_works(self, kitchen_sink_notebook, monkeypatch, capsys):
         """
-        THIS TEST IS EXPECTED TO FAIL against the current v21 code.
+        v22 fixes the regression documented in earlier versions of this test.
+        `resolve_pypi_package_and_extras` now uses live importlib.metadata
+        (packages_distributions + Provides-Extra) instead of a static map,
+        so `umap.plot` correctly promotes to `umap-learn[plot]`.
 
-        The earlier (v16) design promoted `import umap.plot` to the pip
-        extra `umap-learn[plot]`, and mapped the `umap` import name to the
-        `umap-learn` PyPI package via Provides-Extra metadata inspection.
-        Neither piece of that logic exists in v21:
-          1. IMPORT_TO_PYPI_MAP has no "umap" -> "umap-learn" entry at all,
-             so even a plain `import umap` (no extras) fails to correlate
-             against an installed `umap-learn` package.
-          2. There is no Provides-Extra handling, so `umap.plot` never gets
-             promoted to `umap-learn[plot]`.
-
-        Confirmed via sandbox: even with `umap-learn` genuinely present in
-        the mocked environment, the tool still reports `umap` as missing.
-
-        This test is left failing on purpose so the regression is visible
-        in CI rather than silently accepted. Once the mapping and/or
-        extras logic is restored, update this test's expected value to
-        match the corrected output.
+        This requires mocking importlib.metadata directly, not just
+        get_installed_environment() -- confirmed via sandbox: without
+        mocking packages_distributions()/distribution(), this test's
+        result depends on whether umap-learn happens to be installed on
+        whatever machine runs it, which is not a real test.
         """
         import subprocess
+
         mock_frozen_env = {
             "numpy": "numpy==1.26.4",
             "opencv-python": "opencv-python==4.9.0.80",
@@ -213,11 +236,32 @@ class TestKitchenSinkNotebook:
         monkeypatch.setattr(subprocess, "run", lambda *a, **k: types.SimpleNamespace(returncode=0))
         monkeypatch.setattr(sys, "argv", ["notebook_env.py", str(kitchen_sink_notebook)])
 
+        # Control resolution deterministically: umap resolves to umap-learn,
+        # and umap-learn declares a "plot" extra.
+        fake_packages_distributions = {
+            "numpy": ["numpy"],
+            "sklearn": ["scikit-learn"],
+            "PIL": ["pillow"],
+            "bs4": ["beautifulsoup4"],
+            "yaml": ["PyYAML"],
+            "umap": ["umap-learn"],
+        }
+        monkeypatch.setattr(importlib.metadata, "packages_distributions", lambda: fake_packages_distributions)
+
+        def fake_distribution(pkg_name):
+            if pkg_name == "umap-learn":
+                return types.SimpleNamespace(
+                    metadata=types.SimpleNamespace(
+                        get_all=lambda key: ["plot"] if key == "Provides-Extra" else []
+                    )
+                )
+            raise importlib.metadata.PackageNotFoundError(pkg_name)
+        monkeypatch.setattr(importlib.metadata, "distribution", fake_distribution)
+
         ne.main()
         out = capsys.readouterr().out
 
-        # Correct expected behavior, matching the earlier v16 design intent.
-        # Currently fails: actual output contains
-        #   "# umap (imported as 'umap', not currently found in active env)"
-        # instead.
+        # Correct, now-working behavior
         assert "umap-learn[plot]==0.5.5" in out
+        assert "Extra Dependency Promotion" in out
+        assert "umap.plot" in out

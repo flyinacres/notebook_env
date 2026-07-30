@@ -14,6 +14,7 @@ entrypoints==0.4
 executing==2.2.1
 fastjsonschema==2.21.2
 idna==3.18
+iniconfig==2.3.0
 ipykernel==7.3.0
 ipython==9.15.0
 ipython_pygments_lexers==1.1.1
@@ -36,10 +37,12 @@ pandocfilters==1.5.1
 papermill==2.7.0
 parso==0.8.7
 platformdirs==4.10.1
+pluggy==1.6.0
 prompt_toolkit==3.0.52
 psutil==7.2.2
 pure_eval==0.2.3
 Pygments==2.20.0
+pytest==9.1.1
 python-dateutil==2.9.0.post0
 PyYAML==6.0.3
 pyzmq==27.1.0
