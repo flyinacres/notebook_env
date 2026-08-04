@@ -1,5 +1,5 @@
 """
-Failure Modes and Edge Case Tests for Batch Mode (v24).
+Failure Modes and Edge Case Tests for Batch Mode (v25).
 Tests unparseable JSON, bad schema, non-Python kernel filtering, hidden dir skipping,
 and error-gated execution halts.
 """
@@ -48,7 +48,6 @@ class TestBatchFailureModes:
         repo_map = ne.walk_and_scan_directory(str(tmp_path))
         report, is_clean = ne.generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, None)
 
-        # Assert on structural state and error collections rather than printed UI phrasing
         assert is_clean is False
         assert len(repo_map.parse_errors) == 1
         assert "02_corrupted.ipynb" in str(repo_map.parse_errors[0].path)
@@ -60,34 +59,31 @@ class TestBatchFailureModes:
 
         repo_map = ne.walk_and_scan_directory(str(tmp_path))
         assert len(repo_map.parse_errors) == 1
-        # Contract assertion: verifies language/status classification and error presence
+        # Asserts structural classification and error string non-emptiness
         assert repo_map.parse_errors[0].lang_label in ("corrupted", "error")
-        assert len(repo_map.parse_errors[0].parse_error) > 0
+        err_msg = repo_map.parse_errors[0].parse_error.lower()
+        assert "cells" in err_msg or "unparseable" in err_msg
 
     def test_hidden_and_checkpoint_dirs_ignored(self, tmp_path, mock_batch_env):
         """Files inside .ipynb_checkpoints, .git, or venv should never be scanned."""
         frozen_env, pkg_dist_map = mock_batch_env
 
-        # Valid root notebook
         root_nb = {
             "metadata": {"kernelspec": {"language": "python"}},
             "cells": [{"cell_type": "code", "source": ["import math\n"]}]
         }
         (tmp_path / "root.ipynb").write_text(json.dumps(root_nb))
 
-        # Checkpoint notebook in hidden directory
         checkpoint_dir = tmp_path / ".ipynb_checkpoints"
         checkpoint_dir.mkdir()
         (checkpoint_dir / "root-checkpoint.ipynb").write_text("{ corrupted checkpoint json ")
 
-        # venv notebook
         venv_dir = tmp_path / "venv" / "lib"
         venv_dir.mkdir(parents=True)
         (venv_dir / "ignored.ipynb").write_text("{ corrupted venv json ")
 
         repo_map = ne.walk_and_scan_directory(str(tmp_path))
 
-        # Hidden dir files were skipped; no parse errors recorded
         assert len(repo_map.parse_errors) == 0
         assert len(repo_map.scan_results) == 1
         assert repo_map.scan_results[0].path.name == "root.ipynb"
@@ -113,7 +109,6 @@ class TestBatchFailureModes:
         repo_map = ne.walk_and_scan_directory(str(tmp_path))
         report, is_clean = ne.generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, None)
 
-        # Assert on structural counts rather than report text
         assert is_clean is True
         assert len(repo_map.scan_results) == 0
         assert len(repo_map.non_python_files) == 3
