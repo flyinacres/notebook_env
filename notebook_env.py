@@ -20,6 +20,14 @@ from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Set, Dict, List, Tuple, Optional, Any, TypedDict
 
+
+# Force UTF-8 encoding for stdout and stderr on Windows/redirected environments
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+    
 # Setup logging stream for diagnostic messages (directed to stderr)
 logger = logging.getLogger("notebook_env")
 logger.setLevel(logging.INFO)

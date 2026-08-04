@@ -1,0 +1,74 @@
+--- [ STEP 1: PASTE INTO CELL 1 (MARKDOWN) ] ---
+
+### 🛠️ Environment Setup & Dependency Verification
+This notebook includes a pinned environment manifest (`pinned_requirements.txt`) to ensure reproducible execution.
+
+- **Dependency Sync:** Cell 2 will verify your active Python version and apply the exact package manifest recorded by the author.
+- **Network Notice:** If required packages are not already cached in your current runtime environment, internet access may be needed to download missing wheels.
+
+================================================================================
+
+--- [ STEP 2: PASTE INTO CELL 2 (CODE) ] ---
+
+# =====================================================================
+# VERIFIED ENVIRONMENT DEPENDENCIES (2026-08-03 22:25:56)
+# =====================================================================
+
+import sys
+import subprocess
+
+REQUIRED_PYTHON = (3, 13)
+CURRENT_PYTHON = (sys.version_info.major, sys.version_info.minor)
+
+# Major version mismatch -> Clean hard stop
+if CURRENT_PYTHON[0] != REQUIRED_PYTHON[0]:
+    req_major = REQUIRED_PYTHON[0]
+    curr_major = CURRENT_PYTHON[0]
+    print(f"❌ Error: Major Python version mismatch!")
+    print(f"This notebook requires Python {req_major}.x, but your environment is running Python {curr_major}.x.\n")
+    sys.exit("Execution stopped due to Python major version incompatibility.")
+
+# Minor version mismatch -> Non-blocking warning
+if CURRENT_PYTHON[1] != REQUIRED_PYTHON[1]:
+    req_ver = f"{REQUIRED_PYTHON[0]}.{REQUIRED_PYTHON[1]}"
+    curr_ver = f"{CURRENT_PYTHON[0]}.{CURRENT_PYTHON[1]}"
+    print(f"⚠️ This code was created with Python {req_ver}. You are trying to run it with {curr_ver}.")
+    print(f"If installation fails, you may need to change your Python version back to {req_ver}.\n")
+
+# Write explicit library requirements to a local file
+requirements_content = """# Tested top-level packages for this notebook
+--extra-index-url https://download.pytorch.org/whl/cu121
+# Pillow (imported as 'PIL', not currently found in active env)
+beautifulsoup4==4.15.0
+# cupy (imported as 'cupy', not currently found in active env)
+# opencv-python (imported as 'cv2', not currently found in active env)
+# numpy (imported as 'numpy', not currently found in active env)
+# scikit-learn (imported as 'sklearn', not currently found in active env)
+# this_package_does_not_exist_xyz (imported as 'this_package_does_not_exist_xyz', not currently found in active env)
+# torch (imported as 'torch', not currently found in active env)
+# umap (imported as 'umap', not currently found in active env)
+PyYAML==6.0.3
+"""
+
+with open("pinned_requirements.txt", "w") as f:
+    f.write(requirements_content.strip())
+
+print(f"Applying pinned environment manifest [2026-08-03 22:25:56]...")
+print("💡 Note: If you see 'Retrying...' messages below while offline, enable Internet access and re-run this cell.\n")
+
+# Run single-pass installation natively via pip
+result = subprocess.run(
+    [sys.executable, "-m", "pip", "install", "-r", "pinned_requirements.txt"],
+    capture_output=False
+)
+
+if result.returncode == 0:
+    print("\n✅ Setup complete! Environment ready.")
+else:
+    print("\n❌ Setup failed while installing pinned dependencies.")
+    print("It looks like your environment could not locate a matching wheel for local tag builds (e.g. +cu121, +cpu).\n")
+    print("Possible solutions:")
+    print("1. Make sure your notebook runtime matches the required hardware (e.g. GPU vs CPU).")
+    print("2. Or try installing the standard version directly in a code cell (e.g. !pip install torch).")
+
+================================================================================
