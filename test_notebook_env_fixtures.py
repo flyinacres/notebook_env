@@ -116,7 +116,7 @@ class TestKitchenSinkNotebook:
         assert "helper_module" not in imports
         assert not any("helper" in name for name in imports)
 
-    def test_umap_extras_promotion_now_works(self, kitchen_sink_notebook, monkeypatch, capsys):
+    def test_umap_extras_promotion_now_works(self, kitchen_sink_notebook, monkeypatch, capsys, caplog):
         import subprocess
 
         mock_frozen_env = {
@@ -157,5 +157,7 @@ class TestKitchenSinkNotebook:
         ne.main()
         out = capsys.readouterr().out
 
+        # The pinned manifest payload remains pure on stdout
         assert "umap-learn[plot]==0.5.5" in out
-        assert "umap.plot" in out
+        # Promotion diagnostic notice is caught cleanly by caplog
+        assert "umap.plot" in caplog.text

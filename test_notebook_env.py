@@ -133,7 +133,7 @@ class TestDualPathIngestion:
         assert len(code_sources) == 1
         assert err is None
 
-    def test_path_a_prints_active_interpreter(self, tmp_path, monkeypatch, capsys):
+    def test_path_a_prints_active_interpreter(self, tmp_path, monkeypatch, capsys, caplog):
         nb = {"cells": [{"cell_type": "code", "source": ["import math\n"]}]}
         nb_path = tmp_path / "test_interpreter.ipynb"
         nb_path.write_text(json.dumps(nb))
@@ -141,8 +141,9 @@ class TestDualPathIngestion:
         monkeypatch.setattr(sys, "argv", ["notebook_env.py", str(nb_path)])
         
         ne.main()
-        captured = capsys.readouterr()
-        assert sys.executable in captured.out
+        
+        # Diagnostic messages via logger go to caplog
+        assert sys.executable in caplog.text
 
     def test_uninstalled_package_produces_fallback_comment_in_main(self, tmp_path, monkeypatch, capsys):
         nb = {"cells": [{"cell_type": "code", "source": ["import fake_uninstalled_pkg\n"]}]}
