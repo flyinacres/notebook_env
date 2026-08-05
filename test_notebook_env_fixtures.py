@@ -61,7 +61,6 @@ def mock_environment(monkeypatch):
 class TestKitchenSinkNotebook:
     def test_extraction_only(self, kitchen_sink_notebook):
         """Confirms raw AST extraction, independent of environment correlation."""
-        # Unpack 7-tuple
         success, imports, submodules, code_sources, error_msg, lang_label, guarded = ne.extract_from_file(str(kitchen_sink_notebook))
         assert success is True
 
@@ -82,15 +81,36 @@ class TestKitchenSinkNotebook:
         assert "this_package_does_not_exist_xyz" in guarded
 
     def test_stdlib_correctly_filtered(self, kitchen_sink_notebook):
-        # Unpack 7-tuple
         success, imports, submodules, code_sources, error_msg, lang_label, guarded = ne.extract_from_file(str(kitchen_sink_notebook))
         non_stdlib = {i for i in imports if i not in ne.STD_LIB}
 
         for stdlib_name in ("os", "collections", "xml", "json", "re", "itertools", "math", "importlib"):
             assert stdlib_name not in non_stdlib, f"'{stdlib_name}' should have been filtered as stdlib"
 
+    def test_full_pipeline_manifest_content(self, kitchen_sink_notebook, mock_environment, monkeypatch, capsys):
+        import subprocess
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: types.SimpleNamespace(returncode=0))
+        monkeypatch.setattr(sys, "argv", ["notebook_env.py", str(kitchen_sink_notebook)])
+
+        ne.main()
+        out = capsys.readouterr().out
+
+        assert "pillow==10.3.0" in out
+        assert "beautifulsoup4==4.12.3" in out
+        assert "opencv-python==4.9.0.80" in out
+        assert "numpy==1.26.4" in out
+        assert "scikit-learn==1.4.2" in out
+        assert "torch==2.3.1+cu121" in out
+
+        for uninstalled_pkg in ("cupy", "this_package_does_not_exist_xyz", "umap", "PyYAML"):
+            assert uninstalled_pkg in out
+
+        for absent in ("collections==", "xml==", "os==", "nonexistent_fake_package", "fake_package_in_a_string"):
+            assert absent not in out
+
+        assert "--extra-index-url https://download.pytorch.org/whl/cu121" in out
+
     def test_relative_import_is_silently_invisible(self, kitchen_sink_notebook):
-        # Unpack 7-tuple
         success, imports, submodules, code_sources, error_msg, lang_label, guarded = ne.extract_from_file(str(kitchen_sink_notebook))
         assert success is True
         assert "helper_module" not in imports
@@ -137,7 +157,5 @@ class TestKitchenSinkNotebook:
         ne.main()
         out = capsys.readouterr().out
 
-        # The pinned manifest payload remains pure on stdout
         assert "umap-learn[plot]==0.5.5" in out
-        # Promotion diagnostic notice is caught cleanly by caplog
         assert "umap.plot" in caplog.text
