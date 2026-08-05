@@ -1,10 +1,25 @@
 #!/usr/bin/env python3
 """
-PROJECT ENVIRONMENT-LOCK: NOTEBOOK SNAPSHOT TOOL (v28)
-
+notebook_env.py (v29)
 Headless Jupyter Notebook Dependency Scanner & Lockfile Generator.
-Supports single-file processing and repository-wide batch execution (--batch).
+
+Standalone, zero-dependency utility for analyzing notebook environments,
+detecting GPU/accelerator requirements, harvesting index URLs, and emitting
+reproducible lockfile manifests (`pinned_requirements.txt`).
+
+Execution Modes:
+  1. Single Notebook CLI:  python notebook_env.py notebook.ipynb
+  2. Batch Repo Directory: python notebook_env.py --batch ./repo --universal
+  3. Live IPython Kernel:   import notebook_env as ne; ne.main()
+
+For full usage, CLI flag documentation, and architectural details, see README.md.
 """
+
+# =====================================================================
+# CONSTANTS, LOGGING & TYPE DEFINITIONS
+# Core data structures (ScanResult, GpuInfo), logging setup directed to 
+# stderr, status labels, and static mapping dicts (IMPORT_TO_PYPI_MAP, STD_LIB).
+# =====================================================================
 
 import ast
 import json
@@ -34,10 +49,6 @@ console_handler = logging.StreamHandler(sys.stderr)
 console_handler.setFormatter(logging.Formatter("%(message)s"))
 logger.addHandler(console_handler)
 
-
-# =====================================================================
-# CONSTANTS & TYPE DEFINITIONS
-# =====================================================================
 
 class StatusLabel:
     PYTHON = "python"
@@ -96,7 +107,76 @@ STD_LIB: Set[str] = set(sys.stdlib_module_names) if hasattr(sys, 'stdlib_module_
 
 
 # =====================================================================
-# AST VISITOR & SOURCE PARSERS
+# CELL CLASSIFICATION & SOURCE PIPELINE
+# Ingestion entrypoints (extract_from_file for saved notebooks, 
+# extract_from_active_session for live kernels) and kernel language metadata checks.
+# =====================================================================
+
+def detect_notebook_language(nb_data: Dict[str, Any], strict: bool = False) -> Tuple[bool, str]:
+    """
+    Inspects kernelspec and language_info metadata.
+    If strict=True (batch mode), missing metadata is rejected as unknown.
+    If strict=False (single-file mode), missing metadata assumes Python.
+    """
+    metadata = nb_data.get("metadata", {})
+    ks_lang = metadata.get("kernelspec", {}).get("language", "").lower()
+    li_lang = metadata.get("language_info", {}).get("name", "").lower()
+
+    if ks_lang and li_lang:
+        if ks_lang == li_lang:
+            return (ks_lang == StatusLabel.PYTHON), ks_lang
+        else:
+            return False, f"conflict ({ks_lang}/{li_lang})"
+    
+    active_lang = ks_lang or li_lang
+    if active_lang:
+        return (active_lang == StatusLabel.PYTHON), active_lang
+        
+    if strict:
+        return False, StatusLabel.MISSING_METADATA
+    return True, "unspecified (assuming python)"
+
+
+def extract_from_file(
+    notebook_path: str, strict: bool = False
+) -> Tuple[bool, Set[str], Dict[str, Set[str]], List[str], Optional[str], str, Set[str], List[str]]:
+    """Reads a Jupyter Notebook JSON file and extracts code sources, imports, guarded state, and dynamic warnings."""
+    if not os.path.exists(notebook_path):
+        return False, set(), {}, [], f"File '{notebook_path}' not found.", StatusLabel.UNKNOWN, set(), []
+
+    try:
+        with open(notebook_path, 'r', encoding='utf-8') as f:
+            nb_data = json.load(f)
+    except json.JSONDecodeError as e:
+        return False, set(), {}, [], f"Invalid JSON structure ({e})", StatusLabel.CORRUPTED, set(), []
+    except Exception as e:
+        return False, set(), {}, [], f"File read failure ({e})", StatusLabel.ERROR, set(), []
+
+    if not isinstance(nb_data, dict) or "cells" not in nb_data or not isinstance(nb_data.get("cells"), list):
+        return False, set(), {}, [], "Unparseable notebook structure (Missing or invalid 'cells' array)", StatusLabel.CORRUPTED, set(), []
+
+    is_py, lang_label = detect_notebook_language(nb_data, strict=strict)
+    if not is_py:
+        return False, set(), {}, [], f"Skipped non-Python notebook (Language: {lang_label})", lang_label, set(), []
+
+    cells = nb_data.get("cells", [])
+    code_sources = ["".join(c.get("source", [])) for c in cells if c.get("cell_type") == "code"]
+    imports, submodules, guarded_imports, dyn_warnings = extract_imports_from_sources(code_sources)
+    return True, imports, submodules, code_sources, None, lang_label, guarded_imports, dyn_warnings
+
+
+def extract_from_active_session() -> Tuple[Set[str], Dict[str, Set[str]], List[str], Set[str], List[str]]:
+    """Path B (Live Kernel): Reads IPython execution history."""
+    import __main__
+    code_sources = [src for src in getattr(__main__, 'In', []) if src and isinstance(src, str)]
+    imports, submodules, guarded_imports, dyn_warnings = extract_imports_from_sources(code_sources)
+    return imports, submodules, code_sources, guarded_imports, dyn_warnings
+
+
+# =====================================================================
+# AST VISITOR & DYNAMIC IMPORT PARSER
+# Python AST traversal engine. Inspects import statements, submodules,
+# guarded try/except blocks, and importlib/literal dynamic import calls.
 # =====================================================================
 
 class NotebookImportVisitor(ast.NodeVisitor):
@@ -130,7 +210,7 @@ class NotebookImportVisitor(ast.NodeVisitor):
         for alias in node.names:
             base_pkg = alias.name.split('.')[0]
             self.imports.add(base_pkg)
-            
+
             # Track module alias: import importlib as il
             if alias.name == "importlib":
                 self._importlib_aliases.add(alias.asname or "importlib")
@@ -197,21 +277,6 @@ class NotebookImportVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def harvest_index_urls_from_sources(code_sources: List[str]) -> Set[str]:
-    """Scans code sources for --extra-index-url or -i flags."""
-    index_urls: Set[str] = set()
-    pattern = re.compile(r'(?:--extra-index-url|-i)\s+([^\s]+)')
-    for source in code_sources:
-        for line in source.splitlines():
-            clean_line = line.strip()
-            if clean_line.startswith('#'):
-                continue
-            matches = pattern.findall(clean_line)
-            for url in matches:
-                index_urls.add(url.strip("'\""))
-    return index_urls
-
-
 def extract_imports_from_sources(
     code_sources: List[str]
 ) -> Tuple[Set[str], Dict[str, Set[str]], Set[str], List[str]]:
@@ -231,65 +296,31 @@ def extract_imports_from_sources(
     return visitor.imports, visitor.submodules, visitor.guarded_imports, visitor.dynamic_import_warnings
 
 
-def detect_notebook_language(nb_data: Dict[str, Any], strict: bool = False) -> Tuple[bool, str]:
-    """Inspects kernelspec and language_info metadata."""
-    metadata = nb_data.get("metadata", {})
-    ks_lang = metadata.get("kernelspec", {}).get("language", "").lower()
-    li_lang = metadata.get("language_info", {}).get("name", "").lower()
+# =====================================================================
+# CELL MAGIC & SHELL COMMAND HARVESTER
+# Regex and line scanners for IPython cell magics (%pip, !pip, %conda),
+# base/extra PyPI index URLs (--index-url), and non-Python shell commands.
+# =====================================================================
 
-    if ks_lang and li_lang:
-        if ks_lang == li_lang:
-            return (ks_lang == StatusLabel.PYTHON), ks_lang
-        else:
-            return False, f"conflict ({ks_lang}/{li_lang})"
-    
-    active_lang = ks_lang or li_lang
-    if active_lang:
-        return (active_lang == StatusLabel.PYTHON), active_lang
-        
-    if strict:
-        return False, StatusLabel.MISSING_METADATA
-    return True, "unspecified (assuming python)"
-
-
-def extract_from_file(
-    notebook_path: str, strict: bool = False
-) -> Tuple[bool, Set[str], Dict[str, Set[str]], List[str], Optional[str], str, Set[str], List[str]]:
-    """Reads a Jupyter Notebook JSON file and extracts code sources and imports."""
-    if not os.path.exists(notebook_path):
-        return False, set(), {}, [], f"File '{notebook_path}' not found.", StatusLabel.UNKNOWN, set(), []
-
-    try:
-        with open(notebook_path, 'r', encoding='utf-8') as f:
-            nb_data = json.load(f)
-    except json.JSONDecodeError as e:
-        return False, set(), {}, [], f"Invalid JSON structure ({e})", StatusLabel.CORRUPTED, set(), []
-    except Exception as e:
-        return False, set(), {}, [], f"File read failure ({e})", StatusLabel.ERROR, set(), []
-
-    if not isinstance(nb_data, dict) or "cells" not in nb_data or not isinstance(nb_data.get("cells"), list):
-        return False, set(), {}, [], "Unparseable notebook structure (Missing or invalid 'cells' array)", StatusLabel.CORRUPTED, set(), []
-
-    is_py, lang_label = detect_notebook_language(nb_data, strict=strict)
-    if not is_py:
-        return False, set(), {}, [], f"Skipped non-Python notebook (Language: {lang_label})", lang_label, set(), []
-
-    cells = nb_data.get("cells", [])
-    code_sources = ["".join(c.get("source", [])) for c in cells if c.get("cell_type") == "code"]
-    imports, submodules, guarded_imports, dyn_warnings = extract_imports_from_sources(code_sources)
-    return True, imports, submodules, code_sources, None, lang_label, guarded_imports, dyn_warnings
-
-
-def extract_from_active_session() -> Tuple[Set[str], Dict[str, Set[str]], List[str], Set[str], List[str]]:
-    """Path B (Live Kernel): Reads IPython execution history."""
-    import __main__
-    code_sources = [src for src in getattr(__main__, 'In', []) if src and isinstance(src, str)]
-    imports, submodules, guarded_imports, dyn_warnings = extract_imports_from_sources(code_sources)
-    return imports, submodules, code_sources, guarded_imports, dyn_warnings
+def harvest_index_urls_from_sources(code_sources: List[str]) -> Set[str]:
+    """Scans code sources for --extra-index-url or -i flags."""
+    index_urls: Set[str] = set()
+    pattern = re.compile(r'(?:--extra-index-url|-i)\s+([^\s]+)')
+    for source in code_sources:
+        for line in source.splitlines():
+            clean_line = line.strip()
+            if clean_line.startswith('#'):
+                continue
+            matches = pattern.findall(clean_line)
+            for url in matches:
+                index_urls.add(url.strip("'\""))
+    return index_urls
 
 
 # =====================================================================
-# UNIFIED MANIFEST BUILDER & ENVIRONMENT CORRELATION
+# ENVIRONMENT CORRELATION & EXTRAS PROMOTION
+# Maps extracted import names to active runtime versions via `pip freeze` 
+# and importlib metadata. Handles optional extras promotion (e.g., umap.plot -> umap-learn[plot]).
 # =====================================================================
 
 def resolve_pypi_package_and_extras(
@@ -378,6 +409,64 @@ def build_manifest_entries(
     return pinned_manifest, promotion_notices
 
 
+def resolve_opencv_variant(submodules: Optional[Set[str]] = None) -> str:
+    """Determines the appropriate OpenCV package variant installed in the environment."""
+    has_contrib = any('contrib' in s.lower() or 'aruco' in s.lower() for s in submodules) if submodules else False
+    try:
+        res = subprocess.run([sys.executable, "-m", "pip", "list"], capture_output=True, text=True)
+        installed = res.stdout.lower()
+        if "opencv-contrib-python-headless" in installed:
+            return "opencv-contrib-python-headless"
+        elif "opencv-python-headless" in installed:
+            return "opencv-python-headless"
+        elif "opencv-contrib-python" in installed:
+            return "opencv-contrib-python"
+        elif "opencv-python" in installed:
+            return "opencv-python"
+    except Exception:
+        pass
+    return "opencv-contrib-python" if has_contrib else "opencv-python"
+
+
+def get_installed_environment() -> Tuple[Dict[str, str], List[str]]:
+    """Runs pip freeze to get precise version snapshots."""
+    res = subprocess.run([sys.executable, "-m", "pip", "freeze"], capture_output=True, text=True)
+    frozen: Dict[str, str] = {}
+    for line in res.stdout.splitlines():
+        if "==" in line:
+            pkg, ver = line.split("==", 1)
+            frozen[pkg.lower()] = line.strip()
+    return frozen, res.stdout.splitlines()
+
+
+def process_package_requirements(
+    pinned_list: List[str], harvested_urls: Set[str]
+) -> Tuple[List[str], List[Tuple[str, List[str]]], List[str]]:
+    """Correlates pinned packages with harvested index URLs."""
+    manifest_output: List[str] = []
+    local_tagged_info: List[Tuple[str, List[str]]] = []
+    warnings: List[str] = []
+    
+    if harvested_urls:
+        for url in sorted(harvested_urls):
+            manifest_output.append(f"--extra-index-url {url}")
+
+    for item in pinned_list:
+        manifest_output.append(item)
+        if '+' in item:
+            local_tagged_info.append((item, list(harvested_urls)))
+            if not harvested_urls:
+                warnings.append(item)
+            
+    return manifest_output, local_tagged_info, warnings
+
+
+# =====================================================================
+# HARDWARE ACCELERATION INSPECTION
+# Probes runtime framework state for GPU/accelerator availability across 
+# PyTorch (CUDA/MPS), TensorFlow (GPU), and JAX (GPU/TPU).
+# =====================================================================
+
 def inspect_gpu_environment(imported_packages: Set[str]) -> Optional[GpuInfo]:
     """Per-framework GPU/accelerator inspection logic."""
     gpu_frameworks = {"torch", "tensorflow", "jax"}
@@ -457,60 +546,10 @@ def inspect_gpu_environment(imported_packages: Set[str]) -> Optional[GpuInfo]:
     }
 
 
-def resolve_opencv_variant(submodules: Optional[Set[str]] = None) -> str:
-    """Determines the appropriate OpenCV package variant installed in the environment."""
-    has_contrib = any('contrib' in s.lower() or 'aruco' in s.lower() for s in submodules) if submodules else False
-    try:
-        res = subprocess.run([sys.executable, "-m", "pip", "list"], capture_output=True, text=True)
-        installed = res.stdout.lower()
-        if "opencv-contrib-python-headless" in installed:
-            return "opencv-contrib-python-headless"
-        elif "opencv-python-headless" in installed:
-            return "opencv-python-headless"
-        elif "opencv-contrib-python" in installed:
-            return "opencv-contrib-python"
-        elif "opencv-python" in installed:
-            return "opencv-python"
-    except Exception:
-        pass
-    return "opencv-contrib-python" if has_contrib else "opencv-python"
-
-
-def get_installed_environment() -> Tuple[Dict[str, str], List[str]]:
-    """Runs pip freeze to get precise version snapshots."""
-    res = subprocess.run([sys.executable, "-m", "pip", "freeze"], capture_output=True, text=True)
-    frozen: Dict[str, str] = {}
-    for line in res.stdout.splitlines():
-        if "==" in line:
-            pkg, ver = line.split("==", 1)
-            frozen[pkg.lower()] = line.strip()
-    return frozen, res.stdout.splitlines()
-
-
-def process_package_requirements(
-    pinned_list: List[str], harvested_urls: Set[str]
-) -> Tuple[List[str], List[Tuple[str, List[str]]], List[str]]:
-    """Correlates pinned packages with harvested index URLs."""
-    manifest_output: List[str] = []
-    local_tagged_info: List[Tuple[str, List[str]]] = []
-    warnings: List[str] = []
-    
-    if harvested_urls:
-        for url in sorted(harvested_urls):
-            manifest_output.append(f"--extra-index-url {url}")
-
-    for item in pinned_list:
-        manifest_output.append(item)
-        if '+' in item:
-            local_tagged_info.append((item, list(harvested_urls)))
-            if not harvested_urls:
-                warnings.append(item)
-            
-    return manifest_output, local_tagged_info, warnings
-
-
 # =====================================================================
-# BLUEPRINT & CELL METADATA GENERATOR
+# BLUEPRINT & MANAGED SETUP CELL GENERATOR
+# Constructs the self-contained Cell 1 (Markdown setup guide) and 
+# Cell 2 (Python verification script that writes pinned_requirements.txt and runs pip install).
 # =====================================================================
 
 def generate_production_blueprint(
@@ -647,7 +686,9 @@ def create_managed_cells(blueprint: BlueprintResult) -> List[Dict[str, Any]]:
 
 
 # =====================================================================
-# BATCH ORCHESTRATION ENGINE
+# BATCH ORCHESTRATION & CLI DISPATCH
+# Directory walking engine for multi-notebook repo analysis, universal 
+# manifest generation (requirements-all.txt), argument parsing, and main() execution.
 # =====================================================================
 
 class RepoEnvironmentMap:
@@ -927,10 +968,6 @@ def apply_output_to_notebook(
 
     return target_path
 
-
-# =====================================================================
-# MAIN EXECUTION ENTRYPOINT
-# =====================================================================
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate environment lockfiles for Jupyter Notebooks.")
