@@ -1,4 +1,4 @@
-# Notebook Environment-Lock Tool (v23)
+# Notebook Environment-Lock Tool (v29)
 
 A dependency and hardware-requirement scanner for Jupyter/Kaggle notebooks. It scans a notebook's imports, correlates them against the environment you actually ran it in, and generates two paste-in cells (a Markdown explainer and a setup/install cell) so the notebook is reproducible when shared.
 
@@ -8,11 +8,13 @@ This tool does not guarantee bit-for-bit reproducibility. It gives actionable, h
 
 - **Imports**: parses your notebook's code via Python's `ast` module to find every top-level import.
 - **Installed packages**: correlates each import against your live environment (`pip freeze` plus `importlib.metadata`) to find matching package names and versions. Package name resolution is dynamic — it queries what's actually installed rather than relying solely on a hardcoded map, so it correctly handles cases where the import name differs from the PyPI package name (e.g. `sklearn` → `scikit-learn`) even for packages not explicitly listed in this tool.
+- **Guarded / optional imports**: imports found inside `try/except` or `if/else` blocks are tracked separately from unconditional ones. If a package is only ever imported conditionally, its manifest entry is commented out and labeled as an optional dependency rather than pinned as a hard requirement — regardless of whether that package happens to be installed in your own environment. If the same package is _also_ imported unconditionally somewhere else in the notebook, it's treated as required.
+- **Dynamic imports (literal form)**: `importlib.import_module("pkg")`, `from importlib import import_module; import_module("pkg")`, aliased forms of both, and bare `__import__("pkg")` are resolved when the argument is a string literal, and treated the same as a normal import. When the argument isn't a literal (e.g. a variable or config value), the tool can't know what's being imported — it emits a diagnostic warning instead of guessing.
 - **Optional extras promotion**: if a submodule import matches a package's declared `Provides-Extra` metadata (e.g. `import umap.plot`), the manifest entry is promoted to include that extra (`umap-learn[plot]==...`), with a visible notice printed when this happens.
 - **Hardware-tagged builds**: flags packages with build-specific version tags (e.g. `torch==2.3.1+cu121`) and checks whether your notebook already specifies a download index for them.
 - **GPU/accelerator usage**: if your notebook imports `torch`, `tensorflow`, or `jax`, checks whether an active GPU/MPS/TPU accelerator was available in your session for that specific framework.
 
-This tool also supports a **batch mode** for scanning many notebooks at once (a course, a team's repo). See Batch Mode below — it's newer and less battle-tested than single-notebook mode; read the Known Issues section before relying on it.
+This tool also supports a **batch mode** for scanning many notebooks at once (a course, a team's repo). See Batch Mode below — it's newer and less battle-tested than single-notebook mode; read the Known limitations section before relying on it.
 
 ## Required workflow
 
@@ -21,7 +23,7 @@ This tool must be run **by the notebook's author, in the same environment used t
 1. Start from a fresh environment/kernel.
 2. Run your notebook top to bottom, fixing any errors as they appear.
 3. **Restart the kernel** after each fix before rerunning — don't just rerun the failing cell. Previously executed cells stay in memory otherwise, which can hide problems that would break a true cold start.
-4. Exercise all code paths, including any GPU-only branches, so the GPU check reflects actual usage rather than partial coverage.
+4. Exercise all code paths, including any GPU-only branches and any guarded (`try/except`) branches, so both the GPU check and the guarded-import detection reflect actual usage rather than partial coverage.
 5. Save the notebook.
 6. Run this tool (see Usage below).
 
@@ -32,12 +34,14 @@ There are two ways to run this tool. Neither is strictly "recommended" over the 
 **Path A — CLI, against a saved `.ipynb` file:**
 
 ```bash
-python env_lock.py your_notebook.ipynb
+python notebook_env.py your_notebook.ipynb
 ```
 
 Reads the notebook's source directly from the saved `.ipynb` file on disk and runs AST parsing over it. This is the natural fit for local development (VS Code, JupyterLab, PyCharm, a terminal in your project directory) — you save the notebook, then run the script from your shell, without adding any extra code to the notebook itself.
 
 A `.ipynb` file never stores live memory or execution state, on any platform — it only stores whatever cell source was last saved. So Path A reflects exactly what's on disk as of your last save, nothing more and nothing less. If you tested interactively and made further changes without saving, Path A won't see them.
+
+In single-notebook mode, a notebook with no `kernelspec`/`language_info` metadata at all is assumed to be Python rather than rejected — this is a common, valid case for minimal or hand-built notebooks. Metadata is only enforced strictly in batch mode, where it's needed to filter out non-Python kernels (R, Julia) across a whole directory; see Batch Mode below.
 
 **Path B — pasted into a live notebook cell:**
 
@@ -52,7 +56,7 @@ Do **not** invoke this tool via `import your_module; your_module.main()` inside 
 **Optional flag:**
 
 ```bash
-python env_lock.py your_notebook.ipynb --full-freeze
+python notebook_env.py your_notebook.ipynb --full-freeze
 ```
 
 Appends a complete `pip freeze` snapshot after the targeted manifest, for cases where you want a full bit-for-bit fallback available. Off by default — a full freeze is generally too much noise for a data scientist audience, and top-level pins are good guidance most of the time.
@@ -65,6 +69,8 @@ The tool prints two blocks to paste into new cells at the top of your notebook:
 2. **Code cell** — checks the Python version, writes a `pinned_requirements.txt`, and installs it via pip.
 
 Before the blueprint, Path A also prints the active Python interpreter path (`sys.executable`). This exists specifically so you can visually confirm it matches the environment your notebook's kernel actually used — see the desktop caveat above.
+
+Any packages that were only ever imported inside a `try/except` or conditional block appear in the manifest as a commented-out, labeled optional entry rather than a hard pin — even if that package happens to be installed in your own environment. Any dynamic import calls the tool couldn't statically resolve (a variable or expression rather than a string literal) are surfaced as a diagnostic warning rather than silently dropped or guessed at.
 
 ## Reading the GPU/accelerator messages
 
@@ -80,7 +86,9 @@ Scans a directory of notebooks at once, producing an audit-style report rather t
 python notebook_env.py --batch ./course_materials
 ```
 
-This always runs analysis first — it scans every `.ipynb` in the directory, skips non-Python kernels (R, Julia), reports parse errors, and summarizes the dependency footprint across the batch (matched packages, missing packages with which notebooks need them, extras promotions, hardware/index-URL audit). No files are written in this mode.
+This always runs analysis first — it scans every `.ipynb` in the directory, skips non-Python kernels (R, Julia) and notebooks with no language metadata at all, reports parse errors, and summarizes the dependency footprint across the batch (matched packages, missing packages with which notebooks need them, extras promotions, dynamic-import warnings, hardware/index-URL audit). No files are written in this mode.
+
+Unlike single-notebook mode, batch mode enforces strict language metadata: a notebook with no `kernelspec`/`language_info` at all is treated as unknown and skipped rather than assumed to be Python, since silently assuming Python across an entire directory scan risks misclassifying non-Python or malformed files at scale.
 
 ```bash
 python notebook_env.py --batch ./course_materials --universal
@@ -94,17 +102,14 @@ python notebook_env.py --batch ./course_materials --output
 
 Writes a companion `<name>_merged.ipynb` next to each source notebook, containing the setup cells. The original file is never touched by default. `--in-place` will overwrite the original directly instead (replacing any previously-generated setup cells rather than duplicating them) — use with care, and back up first; this tool does not currently create a backup automatically before an in-place write.
 
-## Known Issues (v23)
-
-The following were found while porting the existing test suite to v23 and confirmed against real runs, not yet fixed:
-
-- **Missing-file error is currently unreachable in single-notebook mode.** `main()`'s dispatch now gates single-file processing on `os.path.isfile(path)`, which is `False` for a nonexistent path — so a typo'd filename silently falls through to the generic help text instead of the specific "File not found" error `extract_from_file` was designed to produce.
-- **Notebooks with no `kernelspec`/`language_info` metadata are incorrectly rejected, even in single-notebook mode.** The language-detection gate added for batch mode's R/Julia filtering is also applied to single-notebook runs. A notebook with no language metadata at all (a common, valid case for minimal or hand-built notebooks) is labeled "missing metadata" and refused outright, even though it may be perfectly good Python. This gate should likely only apply during batch scanning, not single-file mode.
-- **Hardware-tag and GPU status warnings are computed but no longer printed anywhere.** `process_package_requirements` still returns its `warnings` list (hardware-tagged packages with no index URL), and GPU detection still runs, but as of v23 neither is surfaced to the user in single-file mode, and the GPU "imported but not active" case isn't shown in batch mode's report either. This information used to print directly during a scan; it's currently silently dropped in both modes.
+**Known caveat (`--output` mode):** GPU/accelerator status is checked once against the host machine for `torch`, `tensorflow`, and `jax` together, then filtered per notebook by which of those frameworks it imports. If more than one of the three frameworks is present on the host but only one of them is actually confirmed to have GPU access, a notebook that imports only one of the _other_ frameworks can still inherit that device's name and "verified via" label in its generated blueprint. Treat the per-notebook GPU note in `--output` mode as a hint to check, not a confirmed per-framework result, until this is tightened to check each framework independently per notebook.
 
 ## Known limitations
 
-- **Dynamic imports** (e.g. `importlib.import_module("some_pkg")`) are not detected by AST scanning, since the module name isn't a literal in the source.
+- **Dynamic imports with non-literal arguments** (e.g. `importlib.import_module(pkg_name)` where `pkg_name` is a variable) can't be resolved by static AST scanning, since there's no literal module name in the source to read. The tool emits a diagnostic warning in this case rather than guessing. Literal-string dynamic imports (`importlib.import_module("torch")`, including aliased and `from`-imported forms) _are_ detected.
+- **Bare relative imports** (`from . import helper`) are silently invisible — `node.module` is `None` for this form, so nothing is extracted, filtered, or flagged. Not currently planned; revisit if this turns out to be common in real notebooks scanned during batch testing.
+- **`exec()`/`eval()`-based code execution** is not inspected — imports embedded in a string passed to `exec()` won't be seen, and no warning is currently emitted for this case either.
+- **Package installs and hardware/toolchain requirements introduced via cell magics** — `%pip`/`%conda` package installs not backed by a matching Python import (e.g. `!pip install gdown`), `%%bash`/`%%sh` shell cells, `%run` external scripts, and `%%writefile`-generated files — are not currently harvested into the manifest. Only `--extra-index-url`/`-i` flags are harvested from magic/shell lines today.
 - **Transitive dependencies are not pinned**, only top-level imports. Sub-dependencies can still drift between installs.
 - **GPU checks confirm availability, not actual usage** — a GPU can be available and imported without every tensor operation running on it.
 - **No Kaggle Docker image tag detection** — no documented environment variable exposes this from inside a running kernel.
@@ -114,6 +119,8 @@ The following were found while porting the existing test suite to v23 and confir
 
 ## Roadmap
 
-- Package as an installable library rather than a standalone script.
+- Package as an installable library rather than a standalone script. Note: Path B depends on the tool being paste-able as a single self-contained file into a notebook cell with no install step, which matters specifically on ephemeral, sometimes internet-off runtimes like Kaggle competition rerun mode — any packaging change needs to preserve a single-file distribution form alongside whatever installable form is added, not replace it.
 - A separate static-only scanner for notebooks you don't own (no live execution, no environment correlation — file-based AST scan only). Deferred in favor of the current single-notebook and batch-mode work; revisit later.
-- Two still-open, undecided items from single-notebook mode also apply at batch scale and are worth resolving before batch mode sees heavier use: imports wrapped in try/except get no special treatment (missing = missing, no "was optional" signal), and bare relative imports (`from . import x`) are silently invisible rather than flagged.
+- Harvest dependencies and tools currently thrown away from cell magics: `%pip`/`%conda` installs without a matching import, `--index-url` (not just `--extra-index-url`), `%%bash`/`%%sh` shell cells, `%run`, and `%%writefile`. These need their own output category rather than folding into the existing import-correlated manifest, since there's no import statement to correlate against for a CLI tool like `gdown`, and conda packages don't reliably map to PyPI names. Sequencing under consideration: index-URL handling first (cheap), then `%pip`/`%conda` package harvesting, then `%%bash` cell classification and `%run`/`%%writefile` only if real notebooks in testing show meaningful use of them.
+- Fix the `--output` mode per-notebook GPU misattribution noted above (check each framework's accelerator status independently rather than sharing one host-level result across all three).
+- Bare relative imports (`from . import x`) remain silently invisible rather than flagged; low priority unless testing against real notebooks shows this is common.
