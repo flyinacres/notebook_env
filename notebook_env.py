@@ -169,6 +169,11 @@ def extract_from_active_session() -> Tuple[Set[str], Dict[str, Set[str]], List[s
     """Path B (Live Kernel): Reads IPython execution history."""
     import __main__
     code_sources = [src for src in getattr(__main__, 'In', []) if src and isinstance(src, str)]
+    imports, submodules, guarded_imports, dyn_warnings = extract_from_active_session_internal(code_sources)
+    return imports, submodules, code_sources, guarded_imports, dyn_warnings
+
+
+def extract_from_active_session_internal(code_sources: List[str]) -> Tuple[Set[str], Dict[str, Set[str]], List[str], Set[str], List[str]]:
     imports, submodules, guarded_imports, dyn_warnings = extract_imports_from_sources(code_sources)
     return imports, submodules, code_sources, guarded_imports, dyn_warnings
 
@@ -211,7 +216,6 @@ class NotebookImportVisitor(ast.NodeVisitor):
             base_pkg = alias.name.split('.')[0]
             self.imports.add(base_pkg)
 
-            # Track module alias: import importlib as il
             if alias.name == "importlib":
                 self._importlib_aliases.add(alias.asname or "importlib")
 
@@ -228,7 +232,6 @@ class NotebookImportVisitor(ast.NodeVisitor):
             base_pkg = node.module.split('.')[0]
             self.imports.add(base_pkg)
 
-            # Track function binding: from importlib import import_module [as custom_name]
             if node.module == "importlib":
                 for alias in node.names:
                     if alias.name == "import_module":
@@ -244,13 +247,11 @@ class NotebookImportVisitor(ast.NodeVisitor):
     def visit_Call(self, node: ast.Call) -> None:
         is_dynamic_import = False
 
-        # Match importlib.import_module(...) or il.import_module(...)
         if isinstance(node.func, ast.Attribute):
             if isinstance(node.func.value, ast.Name) and node.func.value.id in self._importlib_aliases:
                 if node.func.attr == "import_module":
                     is_dynamic_import = True
 
-        # Match __import__(...) or direct import_module(...) binding
         elif isinstance(node.func, ast.Name):
             if node.func.id == "__import__" or node.func.id in self._import_module_bindings:
                 is_dynamic_import = True
@@ -283,8 +284,14 @@ def extract_imports_from_sources(
     """Extracts top-level imports, submodules, guarded imports, and dynamic warnings via AST."""
     visitor = NotebookImportVisitor()
     for source in code_sources:
+        cell_type, clean_body = classify_cell_source(source)
+
+        # Bypass AST parsing completely for shell scripts to avoid intentional SyntaxError drops
+        if cell_type == "SHELL_SCRIPT":
+            continue
+
         clean_source = "\n".join([
-            line for line in source.splitlines() 
+            line for line in clean_body.splitlines() 
             if not line.strip().startswith('%') and not line.strip().startswith('!')
         ])
         try:
@@ -302,19 +309,135 @@ def extract_imports_from_sources(
 # base/extra PyPI index URLs (--index-url), and non-Python shell commands.
 # =====================================================================
 
+PIP_IGNORE_FLAGS: Set[str] = {
+    "-u", "--upgrade", "-q", "--quiet", "--user", "--no-cache-dir",
+    "--force-reinstall", "-e", "--editable", "--no-deps", "--pre",
+    "--break-system-packages"
+}
+
+SHELL_CELL_MAGICS: Set[str] = {
+    "%%bash", "%%sh", "%%zsh", "%%script", "%%cmd", "%%powershell"
+}
+
+
+def classify_cell_source(source: str) -> Tuple[str, str]:
+    """
+    Classifies cell source into (cell_type, clean_source).
+    Types: 'PYTHON', 'SHELL_SCRIPT', 'WRITEFILE'
+    """
+    lines = source.splitlines()
+    if not lines:
+        return "PYTHON", ""
+
+    first_line = lines[0].strip()
+    first_token = first_line.split()[0] if first_line.split() else ""
+
+    if first_token in SHELL_CELL_MAGICS:
+        return "SHELL_SCRIPT", "\n".join(lines[1:])
+
+    if first_token == "%%writefile":
+        return "WRITEFILE", "\n".join(lines[1:])
+
+    return "PYTHON", source
+
+
 def harvest_index_urls_from_sources(code_sources: List[str]) -> Set[str]:
     """Scans code sources for --extra-index-url or -i flags."""
-    index_urls: Set[str] = set()
-    pattern = re.compile(r'(?:--extra-index-url|-i)\s+([^\s]+)')
-    for source in code_sources:
+    _, _, extra_urls, _, _ = harvest_cell_magics_and_commands(code_sources)
+    if not extra_urls:
+        index_urls: Set[str] = set()
+        pattern = re.compile(r'(?:--extra-index-url|-i)\s+([^\s]+)')
+        for source in code_sources:
+            for line in source.splitlines():
+                clean_line = line.strip()
+                if clean_line.startswith('#'):
+                    continue
+                matches = pattern.findall(clean_line)
+                for url in matches:
+                    index_urls.add(url.strip("'\""))
+        return index_urls
+    return extra_urls
+
+
+def harvest_cell_magics_and_commands(
+    code_sources: List[str]
+) -> Tuple[Set[str], Set[str], Set[str], List[str], List[str]]:
+    """
+    Scans code sources for cell magics, index URLs, auxiliary tools, and shell commands.
+
+    Returns:
+        - harvested_packages: Set[str] (auxiliary tools installed via %pip / !pip)
+        - base_index_urls: Set[str] (--index-url / -i base index overrides)
+        - extra_index_urls: Set[str] (--extra-index-url supplemental indexes)
+        - magic_warnings: List[str] (warnings for -r requirements.txt or unresolvable scripts)
+        - magic_notices: List[str] (informational notices for conda / apt-get calls)
+    """
+    harvested_packages: Set[str] = set()
+    base_index_urls: Set[str] = set()
+    extra_index_urls: Set[str] = set()
+    magic_warnings: List[str] = []
+    magic_notices: List[str] = []
+
+    extra_pattern = re.compile(r'--extra-index-url\s+([^\s]+)')
+    base_pattern = re.compile(r'(?:--index-url|-i)\s+([^\s]+)')
+    pip_install_pattern = re.compile(r'^\s*(?:%pip|%conda|!pip|!conda)\s+install\s+(.+)$')
+    apt_pattern = re.compile(r'^\s*(?:!|%%bash\n|%%sh\n)?.*?(?:apt-get|brew|yum)\s+install\s+(.+)$', re.MULTILINE)
+
+    for cell_idx, source in enumerate(code_sources, start=1):
+        cell_type, clean_source = classify_cell_source(source)
+
         for line in source.splitlines():
             clean_line = line.strip()
             if clean_line.startswith('#'):
                 continue
-            matches = pattern.findall(clean_line)
-            for url in matches:
-                index_urls.add(url.strip("'\""))
-    return index_urls
+
+            for url in extra_pattern.findall(clean_line):
+                extra_index_urls.add(url.strip("'\""))
+            for url in base_pattern.findall(clean_line):
+                if "--extra-index-url" not in clean_line:
+                    base_index_urls.add(url.strip("'\""))
+
+            if clean_line.startswith("%conda") or clean_line.startswith("!conda"):
+                magic_notices.append(
+                    f"ℹ️ Conda installation detected in cell {cell_idx} ('{clean_line}'); "
+                    f"conda packages are outside pip freeze correlation."
+                )
+                continue
+
+            pip_match = pip_install_pattern.match(clean_line)
+            if pip_match:
+                args_str = pip_match.group(1)
+
+                if "-r " in args_str or "--requirement" in args_str:
+                    magic_warnings.append(
+                        f"⚠️ Cell {cell_idx} magic '{clean_line}' references an external requirements file; "
+                        f"contents cannot be verified statically."
+                    )
+                    continue
+
+                tokens = args_str.split()
+                i = 0
+                while i < len(tokens):
+                    token = tokens[i]
+                    if token in ("--extra-index-url", "--index-url", "-i", "-f", "--find-links", "-t", "--target"):
+                        i += 2
+                        continue
+                    if token.startswith('-') or token.lower() in PIP_IGNORE_FLAGS:
+                        i += 1
+                        continue
+
+                    pkg_name = re.split(r'[<>=!~;\[#]', token)[0].strip("'\"")
+                    if pkg_name:
+                        harvested_packages.add(pkg_name)
+                    i += 1
+
+        for match in apt_pattern.findall(source):
+            magic_notices.append(
+                f"ℹ️ System package manager call detected in cell {cell_idx} ('{match.strip()}'); "
+                f"system-level dependencies are outside Python package manifests."
+            )
+
+    return harvested_packages, base_index_urls, extra_index_urls, magic_warnings, magic_notices
 
 
 # =====================================================================
@@ -864,7 +987,7 @@ def generate_batch_analysis_report(
         out.append("")
 
     # Hardware & Index Audit
-    out.append("⚡ HARDWARE & INDEX URL AUDIT:")
+    out.append("⚡ HARDWARE & INDEX AUDIT:")
     if batch_hw_cache and batch_hw_cache.get("has_gpu"):
         out.append(f"  • Active Hardware Accelerator: {batch_hw_cache['device_name']}")
     else:
@@ -1051,9 +1174,13 @@ def main() -> None:
         parser.print_help()
         sys.exit(1)
 
-    harvested_urls = harvest_index_urls_from_sources(code_sources)
+    harvested_pkgs, base_urls, extra_urls, magic_warns, magic_notices = harvest_cell_magics_and_commands(code_sources)
+    harvested_urls = extra_urls.union(base_urls)
     gpu_info = inspect_gpu_environment(imports)
     
+    # Combined warnings
+    all_warnings = dyn_warnings + magic_warns
+
     # Unified manifest building
     pinned_manifest, promotion_notices = build_manifest_entries(
         imports, submodules, frozen_env, pkg_dist_map, guarded_imports=guarded_imports
@@ -1068,10 +1195,15 @@ def main() -> None:
             logger.warning(f"  • Specific hardware build detected: `{pkg}`")
             logger.warning("    No matching download URL was found in code cells. If installation fails on target machines, ensure runtime matches or supply an --extra-index-url.\n")
 
-    if dyn_warnings:
-        for warn in dyn_warnings:
+    if all_warnings:
+        for warn in all_warnings:
             logger.warning(f"{warn}")
         logger.warning("")
+
+    if magic_notices:
+        for notice in magic_notices:
+            logger.info(f"{notice}")
+        logger.info("")
 
     if gpu_info:
         if gpu_info.get("has_gpu"):
