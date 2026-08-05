@@ -1,9 +1,10 @@
 """
-Tests for notebook_env.py (v27).
+Tests for notebook_env.py (v28).
 
 Unit and integration test suite exercising AST parsing, index URL harvesting,
-guarded import tracking (try/except, if/else), dynamic package/extras resolution,
-dual-path ingestion, GPU inspection, blueprint generation, and runtime sandbox execution.
+guarded import tracking (try/except, if/else), dynamic import parsing,
+dynamic package/extras resolution, dual-path ingestion, GPU inspection,
+blueprint generation, and runtime sandbox execution.
 """
 
 import json
@@ -34,7 +35,7 @@ class TestImportExtraction:
         sources: List[str] = [
             "import numpy as np\nimport os, sys\nfrom sklearn.model_selection import train_test_split"
         ]
-        imports, _, _ = ne.extract_imports_from_sources(sources)
+        imports, _, _, _ = ne.extract_imports_from_sources(sources)
         assert "numpy" in imports
         assert "os" in imports
         assert "sys" in imports
@@ -42,7 +43,7 @@ class TestImportExtraction:
 
     def test_deep_submodule_import_resolves_top_level(self) -> None:
         sources: List[str] = ["import torch.nn.functional as F"]
-        imports, submodules, _ = ne.extract_imports_from_sources(sources)
+        imports, submodules, _, _ = ne.extract_imports_from_sources(sources)
         assert "torch" in imports
         assert "torch.nn.functional" in submodules.get("torch", set())
 
@@ -50,7 +51,7 @@ class TestImportExtraction:
         sources: List[str] = [
             "%matplotlib inline\n%%writefile foo.py\n!pip install foo\nimport pandas as pd"
         ]
-        imports, _, _ = ne.extract_imports_from_sources(sources)
+        imports, _, _, _ = ne.extract_imports_from_sources(sources)
         assert "pandas" in imports
 
     def test_syntax_error_in_one_cell_does_not_block_others(self) -> None:
@@ -59,19 +60,20 @@ class TestImportExtraction:
             "def foo(",
             "import requests",
         ]
-        imports, _, _ = ne.extract_imports_from_sources(sources)
+        imports, _, _, _ = ne.extract_imports_from_sources(sources)
         assert "pandas" in imports
         assert "requests" in imports
 
     def test_empty_and_non_code_sources_return_empty(self) -> None:
-        imports, submodules, guarded = ne.extract_imports_from_sources([])
+        imports, submodules, guarded, dyn_warns = ne.extract_imports_from_sources([])
         assert imports == set()
         assert submodules == {}
         assert guarded == set()
+        assert dyn_warns == []
 
     def test_commented_import_not_extracted(self) -> None:
         sources: List[str] = ["# import tensorflow as tf\nimport json"]
-        imports, _, _ = ne.extract_imports_from_sources(sources)
+        imports, _, _, _ = ne.extract_imports_from_sources(sources)
         assert "tensorflow" not in imports
         assert "json" in imports
 
@@ -87,7 +89,7 @@ class TestGuardedImports:
             "except ImportError:\n"
             "    pass"
         ]
-        imports, submodules, guarded_imports = ne.extract_imports_from_sources(sources)
+        imports, submodules, guarded_imports, _ = ne.extract_imports_from_sources(sources)
         assert "numpy" in imports
         assert "numpy" not in guarded_imports
         assert "cupy" in guarded_imports
@@ -98,7 +100,7 @@ class TestGuardedImports:
             "if sys.platform == 'win32':\n"
             "    import pywin32\n"
         ]
-        imports, submodules, guarded_imports = ne.extract_imports_from_sources(sources)
+        imports, submodules, guarded_imports, _ = ne.extract_imports_from_sources(sources)
         assert "os" in imports
         assert "os" not in guarded_imports
         assert "pywin32" in guarded_imports
@@ -117,7 +119,65 @@ class TestGuardedImports:
 
         cupy_pin = next((p for p in pinned_entries if "cupy" in p), "")
         assert cupy_pin.startswith("#")
-        assert "try/except" in cupy_pin.lower() or "optional" in cupy_pin.lower()
+        assert "guarded" in cupy_pin.lower() or "optional" in cupy_pin.lower()
+
+    def test_installed_guarded_package_emitted_as_optional_comment(self) -> None:
+        """Installed packages inside try/except must NOT become hard pins in the manifest."""
+        frozen_env = {"cupy": "cupy==13.0.0", "numpy": "numpy==1.26.4"}
+        submodules = {}
+        imports = {"numpy", "cupy"}
+        guarded_imports = {"cupy"}
+
+        pinned_entries, notices = ne.build_manifest_entries(
+            imports, submodules, frozen_env, guarded_imports=guarded_imports
+        )
+
+        cupy_pin = next((p for p in pinned_entries if "cupy" in p), "")
+        assert cupy_pin.startswith("#")
+        assert "cupy==13.0.0" in cupy_pin
+        assert "guarded" in cupy_pin.lower() or "optional" in cupy_pin.lower()
+
+    def test_unconditional_import_overrides_guarded_import(self) -> None:
+        """If a package is imported unconditionally in one cell and guarded in another, it is mandatory."""
+        sources = [
+            "import numpy as np\n",
+            "if sys.platform == 'win32':\n    import numpy as np2\n"
+        ]
+
+        imports, submodules, guarded_imports, _ = ne.extract_imports_from_sources(sources)
+
+        assert "numpy" in imports
+        assert "numpy" not in guarded_imports
+
+
+class TestDynamicImportHandling:
+    """Tests importlib.import_module and __import__ parsing behavior."""
+
+    def test_literal_string_dynamic_import_extracted(self) -> None:
+        """importlib.import_module('torch') with a string literal is extracted."""
+        sources = [
+            "import importlib\n"
+            "torch = importlib.import_module('torch')\n"
+        ]
+
+        imports, submodules, guarded_imports, warnings = ne.extract_imports_from_sources(sources)
+
+        assert "torch" in imports
+        assert "importlib" in imports
+        assert warnings == []
+
+    def test_variable_dynamic_import_emits_warning(self) -> None:
+        """importlib.import_module(var_name) emits a diagnostic warning instead of guessing."""
+        sources = [
+            "import importlib\n"
+            "pkg_name = 'tensorflow'\n"
+            "mod = importlib.import_module(pkg_name)\n"
+        ]
+
+        imports, submodules, guarded_imports, warnings = ne.extract_imports_from_sources(sources)
+
+        assert "tensorflow" not in imports
+        assert any("pkg_name" in w for w in warnings)
 
 
 # =====================================================================
@@ -207,7 +267,7 @@ class TestDualPathIngestion:
         nb_path: Path = tmp_path / "test.ipynb"
         nb_path.write_text(json.dumps(nb), encoding="utf-8")
 
-        success, imports, submodules, code_sources, err, lang_label, guarded = ne.extract_from_file(str(nb_path))
+        success, imports, submodules, code_sources, err, lang_label, guarded, dyn_warns = ne.extract_from_file(str(nb_path))
         assert success is True
         assert "numpy" in imports
         assert len(code_sources) == 1
@@ -243,7 +303,7 @@ class TestDualPathIngestion:
         assert "fake_uninstalled_pkg" in captured_stdout
 
     def test_path_a_missing_file_returns_error(self) -> None:
-        success, imports, submodules, code_sources, err, lang_label, guarded = ne.extract_from_file("does_not_exist.ipynb")
+        success, imports, submodules, code_sources, err, lang_label, guarded, dyn_warns = ne.extract_from_file("does_not_exist.ipynb")
         assert success is False
         assert err is not None and len(err) > 0
         assert lang_label == StatusLabel.UNKNOWN
@@ -252,7 +312,7 @@ class TestDualPathIngestion:
         bad_path: Path = tmp_path / "bad.ipynb"
         bad_path.write_text("{not valid json", encoding="utf-8")
 
-        success, imports, submodules, code_sources, err, lang_label, guarded = ne.extract_from_file(str(bad_path))
+        success, imports, submodules, code_sources, err, lang_label, guarded, dyn_warns = ne.extract_from_file(str(bad_path))
         assert success is False
         assert lang_label == StatusLabel.CORRUPTED
 
@@ -261,7 +321,7 @@ class TestDualPathIngestion:
         fake_main.In = ["", "import requests", "import pandas as pd"]
         monkeypatch.setitem(sys.modules, "__main__", fake_main)
 
-        imports, submodules, code_sources, guarded = ne.extract_from_active_session()
+        imports, submodules, code_sources, guarded, dyn_warns = ne.extract_from_active_session()
         assert "requests" in imports
         assert "pandas" in imports
 
@@ -270,7 +330,7 @@ class TestDualPathIngestion:
         fake_main.In = []
         monkeypatch.setitem(sys.modules, "__main__", fake_main)
 
-        imports, submodules, code_sources, guarded = ne.extract_from_active_session()
+        imports, submodules, code_sources, guarded, dyn_warns = ne.extract_from_active_session()
         assert imports == set()
         assert code_sources == []
 
@@ -453,40 +513,3 @@ class TestRuntimeExecution:
         content: str = req_file.read_text(encoding="utf-8")
         assert "numpy==1.26.4" in content
         assert "pandas==2.2.1" in content
-
-class TestGuardedImportCorrectness:
-    """Tests edge cases and correctness fixes for guarded import resolution."""
-
-    def test_installed_guarded_package_emitted_as_optional_comment(self) -> None:
-        """Installed packages inside try/except must NOT become hard pins in the manifest."""
-        # Arrange: cupy IS installed in the scanning environment
-        frozen_env = {"cupy": "cupy==13.0.0", "numpy": "numpy==1.26.4"}
-        submodules = {}
-        imports = {"numpy", "cupy"}
-        guarded_imports = {"cupy"}
-
-        # Act
-        pinned_entries, notices = ne.build_manifest_entries(
-            imports, submodules, frozen_env, guarded_imports=guarded_imports
-        )
-
-        # Assert: cupy must be commented out, preserving optionality despite being installed
-        cupy_pin = next((p for p in pinned_entries if "cupy" in p), "")
-        assert cupy_pin.startswith("#")
-        assert "cupy==13.0.0" in cupy_pin
-        assert "guarded" in cupy_pin.lower() or "optional" in cupy_pin.lower()
-
-    def test_unconditional_import_overrides_guarded_import(self) -> None:
-        """If a package is imported unconditionally in one cell and guarded in another, it is mandatory."""
-        # Arrange: numpy imported at top-level AND later inside an if block
-        sources = [
-            "import numpy as np\n",
-            "if sys.platform == 'win32':\n    import numpy as np2\n"
-        ]
-
-        # Act
-        imports, submodules, guarded_imports = ne.extract_imports_from_sources(sources)
-
-        # Assert: numpy should NOT be in the net guarded_imports set
-        assert "numpy" in imports
-        assert "numpy" not in guarded_imports

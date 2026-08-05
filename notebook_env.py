@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PROJECT ENVIRONMENT-LOCK: NOTEBOOK SNAPSHOT TOOL (v27)
+PROJECT ENVIRONMENT-LOCK: NOTEBOOK SNAPSHOT TOOL (v28)
 
 Headless Jupyter Notebook Dependency Scanner & Lockfile Generator.
 Supports single-file processing and repository-wide batch execution (--batch).
@@ -69,6 +69,7 @@ class NotebookScanResult:
     imports: Set[str] = field(default_factory=set)
     submodules: Dict[str, Set[str]] = field(default_factory=dict)
     guarded_imports: Set[str] = field(default_factory=set)
+    dynamic_warnings: List[str] = field(default_factory=list)
     code_sources: List[str] = field(default_factory=list)
     harvested_urls: Set[str] = field(default_factory=set)
 
@@ -104,11 +105,11 @@ class NotebookImportVisitor(ast.NodeVisitor):
         self.submodules: Dict[str, Set[str]] = {}
         self.unconditional_imports: Set[str] = set()
         self.raw_guarded_imports: Set[str] = set()
+        self.dynamic_import_warnings: List[str] = []
         self._guarded_depth: int = 0
 
     @property
     def guarded_imports(self) -> Set[str]:
-        # Only treat as guarded if it was NEVER imported unconditionally anywhere
         return self.raw_guarded_imports - self.unconditional_imports
 
     def visit_Try(self, node: ast.Try) -> None:
@@ -144,6 +145,37 @@ class NotebookImportVisitor(ast.NodeVisitor):
             self.submodules.setdefault(base_pkg, set()).add(node.module)
         self.generic_visit(node)
 
+    def visit_Call(self, node: ast.Call) -> None:
+        is_dynamic_import = False
+
+        if isinstance(node.func, ast.Attribute):
+            if isinstance(node.func.value, ast.Name) and node.func.value.id == "importlib":
+                if node.func.attr == "import_module":
+                    is_dynamic_import = True
+        elif isinstance(node.func, ast.Name) and node.func.id == "__import__":
+            is_dynamic_import = True
+
+        if is_dynamic_import and node.args:
+            first_arg = node.args[0]
+
+            if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str):
+                imported_pkg = first_arg.value
+                base_pkg = imported_pkg.split('.')[0]
+                self.imports.add(base_pkg)
+                if self._guarded_depth > 0:
+                    self.raw_guarded_imports.add(base_pkg)
+                else:
+                    self.unconditional_imports.add(base_pkg)
+                if '.' in imported_pkg:
+                    self.submodules.setdefault(base_pkg, set()).add(imported_pkg)
+            else:
+                expr_repr = ast.unparse(first_arg) if hasattr(ast, "unparse") else "expression"
+                self.dynamic_import_warnings.append(
+                    f"⚠️ Dynamic import detected via non-literal argument '{expr_repr}'; statically unresolvable."
+                )
+
+        self.generic_visit(node)
+
 
 def harvest_index_urls_from_sources(code_sources: List[str]) -> Set[str]:
     """Scans code sources for --extra-index-url or -i flags."""
@@ -162,8 +194,8 @@ def harvest_index_urls_from_sources(code_sources: List[str]) -> Set[str]:
 
 def extract_imports_from_sources(
     code_sources: List[str]
-) -> Tuple[Set[str], Dict[str, Set[str]], Set[str]]:
-    """Extracts top-level imports, submodules, and guarded imports via AST, stripping magics and shell commands."""
+) -> Tuple[Set[str], Dict[str, Set[str]], Set[str], List[str]]:
+    """Extracts top-level imports, submodules, guarded imports, and dynamic warnings via AST."""
     visitor = NotebookImportVisitor()
     for source in code_sources:
         clean_source = "\n".join([
@@ -176,15 +208,11 @@ def extract_imports_from_sources(
         except SyntaxError:
             continue
 
-    return visitor.imports, visitor.submodules, visitor.guarded_imports
+    return visitor.imports, visitor.submodules, visitor.guarded_imports, visitor.dynamic_import_warnings
 
 
 def detect_notebook_language(nb_data: Dict[str, Any], strict: bool = False) -> Tuple[bool, str]:
-    """
-    Inspects kernelspec and language_info metadata.
-    If strict=True (batch mode), missing metadata is rejected as unknown.
-    If strict=False (single-file mode), missing metadata assumes Python.
-    """
+    """Inspects kernelspec and language_info metadata."""
     metadata = nb_data.get("metadata", {})
     ks_lang = metadata.get("kernelspec", {}).get("language", "").lower()
     li_lang = metadata.get("language_info", {}).get("name", "").lower()
@@ -206,56 +234,38 @@ def detect_notebook_language(nb_data: Dict[str, Any], strict: bool = False) -> T
 
 def extract_from_file(
     notebook_path: str, strict: bool = False
-) -> Tuple[bool, Set[str], Dict[str, Set[str]], List[str], Optional[str], str, Set[str]]:
-    """
-    Reads a Jupyter Notebook JSON file and extracts code sources, top-level imports, submodules, and guarded imports.
-
-    Args:
-        notebook_path: Local filesystem path to the target .ipynb file.
-        strict: When True (batch mode), strict language metadata validation is enforced.
-
-    Returns:
-        A 7-tuple containing:
-            - success (bool): True if notebook parsed cleanly and contains Python code.
-            - imports (set): Extracted top-level package names.
-            - submodules (dict): Map of top-level package names to accessed submodule strings.
-            - code_sources (list): Raw source strings extracted from code cells.
-            - error_msg (str or None): Error message if parsing/extraction failed.
-            - lang_label (str): Detected language label (e.g., 'python', 'r', 'corrupted', 'error').
-            - guarded_imports (set): Top-level imports found inside try/except or if/else blocks.
-    """
+) -> Tuple[bool, Set[str], Dict[str, Set[str]], List[str], Optional[str], str, Set[str], List[str]]:
+    """Reads a Jupyter Notebook JSON file and extracts code sources and imports."""
     if not os.path.exists(notebook_path):
-        return False, set(), {}, [], f"File '{notebook_path}' not found.", StatusLabel.UNKNOWN, set()
+        return False, set(), {}, [], f"File '{notebook_path}' not found.", StatusLabel.UNKNOWN, set(), []
 
     try:
         with open(notebook_path, 'r', encoding='utf-8') as f:
             nb_data = json.load(f)
     except json.JSONDecodeError as e:
-        return False, set(), {}, [], f"Invalid JSON structure ({e})", StatusLabel.CORRUPTED, set()
+        return False, set(), {}, [], f"Invalid JSON structure ({e})", StatusLabel.CORRUPTED, set(), []
     except Exception as e:
-        return False, set(), {}, [], f"File read failure ({e})", StatusLabel.ERROR, set()
+        return False, set(), {}, [], f"File read failure ({e})", StatusLabel.ERROR, set(), []
 
-    # 1. STRUCTURAL SCHEMA CHECK
     if not isinstance(nb_data, dict) or "cells" not in nb_data or not isinstance(nb_data.get("cells"), list):
-        return False, set(), {}, [], "Unparseable notebook structure (Missing or invalid 'cells' array)", StatusLabel.CORRUPTED, set()
+        return False, set(), {}, [], "Unparseable notebook structure (Missing or invalid 'cells' array)", StatusLabel.CORRUPTED, set(), []
 
-    # 2. LANGUAGE CHECK
     is_py, lang_label = detect_notebook_language(nb_data, strict=strict)
     if not is_py:
-        return False, set(), {}, [], f"Skipped non-Python notebook (Language: {lang_label})", lang_label, set()
+        return False, set(), {}, [], f"Skipped non-Python notebook (Language: {lang_label})", lang_label, set(), []
 
     cells = nb_data.get("cells", [])
     code_sources = ["".join(c.get("source", [])) for c in cells if c.get("cell_type") == "code"]
-    imports, submodules, guarded_imports = extract_imports_from_sources(code_sources)
-    return True, imports, submodules, code_sources, None, lang_label, guarded_imports
+    imports, submodules, guarded_imports, dyn_warnings = extract_imports_from_sources(code_sources)
+    return True, imports, submodules, code_sources, None, lang_label, guarded_imports, dyn_warnings
 
 
-def extract_from_active_session() -> Tuple[Set[str], Dict[str, Set[str]], List[str], Set[str]]:
+def extract_from_active_session() -> Tuple[Set[str], Dict[str, Set[str]], List[str], Set[str], List[str]]:
     """Path B (Live Kernel): Reads IPython execution history."""
     import __main__
     code_sources = [src for src in getattr(__main__, 'In', []) if src and isinstance(src, str)]
-    imports, submodules, guarded_imports = extract_imports_from_sources(code_sources)
-    return imports, submodules, code_sources, guarded_imports
+    imports, submodules, guarded_imports, dyn_warnings = extract_imports_from_sources(code_sources)
+    return imports, submodules, code_sources, guarded_imports, dyn_warnings
 
 
 # =====================================================================
@@ -269,6 +279,7 @@ def resolve_pypi_package_and_extras(
     pkg_dist_map: Optional[Dict[str, List[str]]] = None,
     is_guarded: bool = False
 ) -> Tuple[str, Optional[str]]:
+    """Resolves top-level import to PyPI package name using memoized metadata first."""
     pypi_name = None
     if pkg_dist_map is None and hasattr(importlib.metadata, "packages_distributions"):
         try:
@@ -287,7 +298,6 @@ def resolve_pypi_package_and_extras(
 
     matched_pin = frozen_env.get(pypi_name.lower())
 
-    # --- GUARDED IMPORT HANDLING ---
     if is_guarded:
         if matched_pin:
             return f"# {matched_pin} (guarded import in try/except or conditional block - optional dependency)", None
@@ -328,10 +338,7 @@ def build_manifest_entries(
     pkg_dist_map: Optional[Dict[str, List[str]]] = None,
     guarded_imports: Optional[Set[str]] = None
 ) -> Tuple[List[str], List[str]]:
-    """
-    Single shared helper for generating correlated pinned manifest entries.
-    Iterates sorted imports, skips stdlib, resolves PyPI names/extras, and collects promotions.
-    """
+    """Single shared helper for generating correlated pinned manifest entries."""
     pinned_manifest: List[str] = []
     promotion_notices: List[str] = []
     guarded_set = guarded_imports or set()
@@ -652,12 +659,7 @@ class RepoEnvironmentMap:
 
 
 def select_primary_index_url(url_to_notebooks: Dict[str, List[Path]]) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Deterministically selects primary index URL:
-    1. Majority notebook frequency rule
-    2. Alphabetical filename tie-break
-    3. Alphabetical URL string tie-break
-    """
+    """Deterministically selects primary index URL."""
     if not url_to_notebooks:
         return None, None
 
@@ -691,7 +693,7 @@ def walk_and_scan_directory(target_dir: str) -> RepoEnvironmentMap:
         for file in sorted(files):
             if file.endswith('.ipynb'):
                 full_path = Path(root) / file
-                success, imports, submodules, code_sources, err, lang_label, guarded_imports = extract_from_file(str(full_path), strict=True)
+                success, imports, submodules, code_sources, err, lang_label, guarded_imports, dyn_warnings = extract_from_file(str(full_path), strict=True)
                 
                 parse_err = err if (not success and "Skipped non-Python notebook" not in (err or "")) else None                
                 res = NotebookScanResult(
@@ -702,6 +704,7 @@ def walk_and_scan_directory(target_dir: str) -> RepoEnvironmentMap:
                     imports=imports,
                     submodules=submodules,
                     guarded_imports=guarded_imports,
+                    dynamic_warnings=dyn_warnings,
                     code_sources=code_sources
                 )
                 repo_map.add_result(res)
@@ -752,6 +755,7 @@ def generate_batch_analysis_report(
     matched_packages: Set[str] = set()
     missing_packages: Dict[str, List[str]] = {}
     promotions: List[str] = []
+    dynamic_warnings: List[str] = []
 
     for res in repo_map.scan_results:
         pinned_entries, notes = build_manifest_entries(
@@ -760,6 +764,10 @@ def generate_batch_analysis_report(
         for note in notes:
             if note not in promotions:
                 promotions.append(note)
+
+        for warn in res.dynamic_warnings:
+            if warn not in dynamic_warnings:
+                dynamic_warnings.append(warn)
 
         for pin_entry in pinned_entries:
             if pin_entry.startswith("#"):
@@ -781,6 +789,12 @@ def generate_batch_analysis_report(
     else:
         out.append("  • Uninstalled in active env: 0 packages")
     out.append("")
+
+    if dynamic_warnings:
+        out.append("⚠️ DYNAMIC IMPORTS DETECTED:")
+        for warn in dynamic_warnings:
+            out.append(f"  • {warn}")
+        out.append("")
 
     if promotions:
         out.append("💡 DYNAMIC PROMOTIONS DETECTED:")
@@ -861,7 +875,6 @@ def apply_output_to_notebook(
     )
     manifest_lines, local_tagged, _ = process_package_requirements(pinned_manifest, scan_res.harvested_urls)
     
-    # Filter GPU info for this specific notebook
     gpu_info: Optional[GpuInfo] = None
     if batch_hw_cache:
         nb_fw = set(batch_hw_cache.get("frameworks", [])).intersection(scan_res.imports)
@@ -932,7 +945,7 @@ def main() -> None:
     if target_batch_dir:
         repo_map = walk_and_scan_directory(target_batch_dir)
         report_text, is_clean = generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, batch_hw_cache)
-        print(report_text)  # Plain print: report text is deliverable
+        print(report_text)
 
         if not is_clean and (args.universal or args.output):
             logger.error("\n❌ Execution aborted: Resolve file/parse errors before running --universal or --output.")
@@ -970,13 +983,13 @@ def main() -> None:
         logger.info(f"🔍 [Path A] Analyzing saved notebook file '{args.notebook}' via AST...")
         logger.info(f"📌 Active Python Interpreter: {sys.executable}\n")
         
-        success, imports, submodules, code_sources, error_msg, _, guarded_imports = extract_from_file(args.notebook, strict=False)
+        success, imports, submodules, code_sources, error_msg, _, guarded_imports, dyn_warnings = extract_from_file(args.notebook, strict=False)
         if not success:
             logger.error(f"❌ Error: {error_msg}")
             sys.exit(1)
     elif in_live_ipython:
         logger.info("🔍 [Path B] Analyzing live IPython session kernel history via AST...")
-        imports, submodules, code_sources, guarded_imports = extract_from_active_session()
+        imports, submodules, code_sources, guarded_imports, dyn_warnings = extract_from_active_session()
     else:
         parser.print_help()
         sys.exit(1)
@@ -997,6 +1010,11 @@ def main() -> None:
         for pkg in warnings:
             logger.warning(f"  • Specific hardware build detected: `{pkg}`")
             logger.warning("    No matching download URL was found in code cells. If installation fails on target machines, ensure runtime matches or supply an --extra-index-url.\n")
+
+    if dyn_warnings:
+        for warn in dyn_warnings:
+            logger.warning(f"{warn}")
+        logger.warning("")
 
     if gpu_info:
         if gpu_info.get("has_gpu"):

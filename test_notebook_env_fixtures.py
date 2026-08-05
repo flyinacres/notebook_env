@@ -61,7 +61,7 @@ def mock_environment(monkeypatch):
 class TestKitchenSinkNotebook:
     def test_extraction_only(self, kitchen_sink_notebook):
         """Confirms raw AST extraction, independent of environment correlation."""
-        success, imports, submodules, code_sources, error_msg, lang_label, guarded = ne.extract_from_file(str(kitchen_sink_notebook))
+        success, imports, submodules, code_sources, error_msg, lang_label, guarded, dyn_warns = ne.extract_from_file(str(kitchen_sink_notebook))
         assert success is True
 
         for expected in ("numpy", "cv2", "sklearn", "yaml", "PIL", "bs4", "torch", "cupy", "umap", "this_package_does_not_exist_xyz"):
@@ -81,7 +81,7 @@ class TestKitchenSinkNotebook:
         assert "this_package_does_not_exist_xyz" in guarded
 
     def test_stdlib_correctly_filtered(self, kitchen_sink_notebook):
-        success, imports, submodules, code_sources, error_msg, lang_label, guarded = ne.extract_from_file(str(kitchen_sink_notebook))
+        success, imports, submodules, code_sources, error_msg, lang_label, guarded, dyn_warns = ne.extract_from_file(str(kitchen_sink_notebook))
         non_stdlib = {i for i in imports if i not in ne.STD_LIB}
 
         for stdlib_name in ("os", "collections", "xml", "json", "re", "itertools", "math", "importlib"):
@@ -111,7 +111,7 @@ class TestKitchenSinkNotebook:
         assert "--extra-index-url https://download.pytorch.org/whl/cu121" in out
 
     def test_relative_import_is_silently_invisible(self, kitchen_sink_notebook):
-        success, imports, submodules, code_sources, error_msg, lang_label, guarded = ne.extract_from_file(str(kitchen_sink_notebook))
+        success, imports, submodules, code_sources, error_msg, lang_label, guarded, dyn_warns = ne.extract_from_file(str(kitchen_sink_notebook))
         assert success is True
         assert "helper_module" not in imports
         assert not any("helper" in name for name in imports)
