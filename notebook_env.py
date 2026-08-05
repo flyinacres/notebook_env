@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PROJECT ENVIRONMENT-LOCK: NOTEBOOK SNAPSHOT TOOL (v26)
+PROJECT ENVIRONMENT-LOCK: NOTEBOOK SNAPSHOT TOOL (v27)
 
 Headless Jupyter Notebook Dependency Scanner & Lockfile Generator.
 Supports single-file processing and repository-wide batch execution (--batch).
@@ -27,7 +27,6 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-    
 # Setup logging stream for diagnostic messages (directed to stderr)
 logger = logging.getLogger("notebook_env")
 logger.setLevel(logging.INFO)
@@ -69,6 +68,7 @@ class NotebookScanResult:
     parse_error: Optional[str] = None
     imports: Set[str] = field(default_factory=set)
     submodules: Dict[str, Set[str]] = field(default_factory=dict)
+    guarded_imports: Set[str] = field(default_factory=set)
     code_sources: List[str] = field(default_factory=list)
     harvested_urls: Set[str] = field(default_factory=set)
 
@@ -102,11 +102,25 @@ class NotebookImportVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.imports: Set[str] = set()
         self.submodules: Dict[str, Set[str]] = {}
+        self.guarded_imports: Set[str] = set()
+        self._guarded_depth: int = 0
+
+    def visit_Try(self, node: ast.Try) -> None:
+        self._guarded_depth += 1
+        self.generic_visit(node)
+        self._guarded_depth -= 1
+
+    def visit_If(self, node: ast.If) -> None:
+        self._guarded_depth += 1
+        self.generic_visit(node)
+        self._guarded_depth -= 1
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
             base_pkg = alias.name.split('.')[0]
             self.imports.add(base_pkg)
+            if self._guarded_depth > 0:
+                self.guarded_imports.add(base_pkg)
             if '.' in alias.name:
                 self.submodules.setdefault(base_pkg, set()).add(alias.name)
         self.generic_visit(node)
@@ -115,6 +129,8 @@ class NotebookImportVisitor(ast.NodeVisitor):
         if node.module:
             base_pkg = node.module.split('.')[0]
             self.imports.add(base_pkg)
+            if self._guarded_depth > 0:
+                self.guarded_imports.add(base_pkg)
             self.submodules.setdefault(base_pkg, set()).add(node.module)
         self.generic_visit(node)
 
@@ -134,8 +150,10 @@ def harvest_index_urls_from_sources(code_sources: List[str]) -> Set[str]:
     return index_urls
 
 
-def extract_imports_from_sources(code_sources: List[str]) -> Tuple[Set[str], Dict[str, Set[str]]]:
-    """Extracts top-level imports and submodules via AST, stripping magics and shell commands."""
+def extract_imports_from_sources(
+    code_sources: List[str]
+) -> Tuple[Set[str], Dict[str, Set[str]], Set[str]]:
+    """Extracts top-level imports, submodules, and guarded imports via AST, stripping magics and shell commands."""
     visitor = NotebookImportVisitor()
     for source in code_sources:
         clean_source = "\n".join([
@@ -148,7 +166,7 @@ def extract_imports_from_sources(code_sources: List[str]) -> Tuple[Set[str], Dic
         except SyntaxError:
             continue
 
-    return visitor.imports, visitor.submodules
+    return visitor.imports, visitor.submodules, visitor.guarded_imports
 
 
 def detect_notebook_language(nb_data: Dict[str, Any], strict: bool = False) -> Tuple[bool, str]:
@@ -178,55 +196,56 @@ def detect_notebook_language(nb_data: Dict[str, Any], strict: bool = False) -> T
 
 def extract_from_file(
     notebook_path: str, strict: bool = False
-) -> Tuple[bool, Set[str], Dict[str, Set[str]], List[str], Optional[str], str]:
+) -> Tuple[bool, Set[str], Dict[str, Set[str]], List[str], Optional[str], str, Set[str]]:
     """
-    Reads a Jupyter Notebook JSON file and extracts code sources, top-level imports, and submodules.
+    Reads a Jupyter Notebook JSON file and extracts code sources, top-level imports, submodules, and guarded imports.
 
     Args:
         notebook_path: Local filesystem path to the target .ipynb file.
         strict: When True (batch mode), strict language metadata validation is enforced.
 
     Returns:
-        A 6-tuple containing:
+        A 7-tuple containing:
             - success (bool): True if notebook parsed cleanly and contains Python code.
             - imports (set): Extracted top-level package names.
             - submodules (dict): Map of top-level package names to accessed submodule strings.
             - code_sources (list): Raw source strings extracted from code cells.
             - error_msg (str or None): Error message if parsing/extraction failed.
             - lang_label (str): Detected language label (e.g., 'python', 'r', 'corrupted', 'error').
+            - guarded_imports (set): Top-level imports found inside try/except or if/else blocks.
     """
     if not os.path.exists(notebook_path):
-        return False, set(), {}, [], f"File '{notebook_path}' not found.", StatusLabel.UNKNOWN
+        return False, set(), {}, [], f"File '{notebook_path}' not found.", StatusLabel.UNKNOWN, set()
 
     try:
         with open(notebook_path, 'r', encoding='utf-8') as f:
             nb_data = json.load(f)
     except json.JSONDecodeError as e:
-        return False, set(), {}, [], f"Invalid JSON structure ({e})", StatusLabel.CORRUPTED
+        return False, set(), {}, [], f"Invalid JSON structure ({e})", StatusLabel.CORRUPTED, set()
     except Exception as e:
-        return False, set(), {}, [], f"File read failure ({e})", StatusLabel.ERROR
+        return False, set(), {}, [], f"File read failure ({e})", StatusLabel.ERROR, set()
 
     # 1. STRUCTURAL SCHEMA CHECK
     if not isinstance(nb_data, dict) or "cells" not in nb_data or not isinstance(nb_data.get("cells"), list):
-        return False, set(), {}, [], "Unparseable notebook structure (Missing or invalid 'cells' array)", StatusLabel.CORRUPTED
+        return False, set(), {}, [], "Unparseable notebook structure (Missing or invalid 'cells' array)", StatusLabel.CORRUPTED, set()
 
     # 2. LANGUAGE CHECK
     is_py, lang_label = detect_notebook_language(nb_data, strict=strict)
     if not is_py:
-        return False, set(), {}, [], f"Skipped non-Python notebook (Language: {lang_label})", lang_label
+        return False, set(), {}, [], f"Skipped non-Python notebook (Language: {lang_label})", lang_label, set()
 
     cells = nb_data.get("cells", [])
     code_sources = ["".join(c.get("source", [])) for c in cells if c.get("cell_type") == "code"]
-    imports, submodules = extract_imports_from_sources(code_sources)
-    return True, imports, submodules, code_sources, None, lang_label
+    imports, submodules, guarded_imports = extract_imports_from_sources(code_sources)
+    return True, imports, submodules, code_sources, None, lang_label, guarded_imports
 
 
-def extract_from_active_session() -> Tuple[Set[str], Dict[str, Set[str]], List[str]]:
+def extract_from_active_session() -> Tuple[Set[str], Dict[str, Set[str]], List[str], Set[str]]:
     """Path B (Live Kernel): Reads IPython execution history."""
     import __main__
     code_sources = [src for src in getattr(__main__, 'In', []) if src and isinstance(src, str)]
-    imports, submodules = extract_imports_from_sources(code_sources)
-    return imports, submodules, code_sources
+    imports, submodules, guarded_imports = extract_imports_from_sources(code_sources)
+    return imports, submodules, code_sources, guarded_imports
 
 
 # =====================================================================
@@ -237,7 +256,8 @@ def resolve_pypi_package_and_extras(
     imp: str, 
     submodules_set: Set[str], 
     frozen_env: Dict[str, str], 
-    pkg_dist_map: Optional[Dict[str, List[str]]] = None
+    pkg_dist_map: Optional[Dict[str, List[str]]] = None,
+    is_guarded: bool = False
 ) -> Tuple[str, Optional[str]]:
     """
     Resolves top-level import to PyPI package name using memoized metadata first.
@@ -262,6 +282,8 @@ def resolve_pypi_package_and_extras(
     matched_pin = frozen_env.get(pypi_name.lower())
 
     if not matched_pin:
+        if is_guarded:
+            return f"# {pypi_name} (imported as '{imp}' in try/except or conditional guard - optional fallback)", None
         return f"# {pypi_name} (imported as '{imp}', not currently found in active env)", None
 
     pkg_part, ver_part = matched_pin.split("==", 1)
@@ -293,23 +315,25 @@ def build_manifest_entries(
     imports: Set[str], 
     submodules: Dict[str, Set[str]], 
     frozen_env: Dict[str, str], 
-    pkg_dist_map: Optional[Dict[str, List[str]]] = None
+    pkg_dist_map: Optional[Dict[str, List[str]]] = None,
+    guarded_imports: Optional[Set[str]] = None
 ) -> Tuple[List[str], List[str]]:
     """
     Single shared helper for generating correlated pinned manifest entries.
     Iterates sorted imports, skips stdlib, resolves PyPI names/extras, and collects promotions.
-
-    Returns:
-        Tuple of (pinned_manifest_lines, promotion_notices)
     """
     pinned_manifest: List[str] = []
     promotion_notices: List[str] = []
+    guarded_set = guarded_imports or set()
 
     for imp in sorted(imports):
         if imp in STD_LIB:
             continue
         submods = submodules.get(imp, set())
-        pin_entry, notice = resolve_pypi_package_and_extras(imp, submods, frozen_env, pkg_dist_map=pkg_dist_map)
+        is_guarded = imp in guarded_set
+        pin_entry, notice = resolve_pypi_package_and_extras(
+            imp, submods, frozen_env, pkg_dist_map=pkg_dist_map, is_guarded=is_guarded
+        )
         pinned_manifest.append(pin_entry)
         if notice and notice not in promotion_notices:
             promotion_notices.append(notice)
@@ -657,7 +681,7 @@ def walk_and_scan_directory(target_dir: str) -> RepoEnvironmentMap:
         for file in sorted(files):
             if file.endswith('.ipynb'):
                 full_path = Path(root) / file
-                success, imports, submodules, code_sources, err, lang_label = extract_from_file(str(full_path), strict=True)
+                success, imports, submodules, code_sources, err, lang_label, guarded_imports = extract_from_file(str(full_path), strict=True)
                 
                 parse_err = err if (not success and "Skipped non-Python notebook" not in (err or "")) else None                
                 res = NotebookScanResult(
@@ -667,6 +691,7 @@ def walk_and_scan_directory(target_dir: str) -> RepoEnvironmentMap:
                     parse_error=parse_err,
                     imports=imports,
                     submodules=submodules,
+                    guarded_imports=guarded_imports,
                     code_sources=code_sources
                 )
                 repo_map.add_result(res)
@@ -714,13 +739,14 @@ def generate_batch_analysis_report(
             out.append(f"    └─ Cause: {err_res.parse_error}")
         out.append("")
 
-    # Refactored Dependency correlation using shared build_manifest_entries
     matched_packages: Set[str] = set()
     missing_packages: Dict[str, List[str]] = {}
     promotions: List[str] = []
 
     for res in repo_map.scan_results:
-        pinned_entries, notes = build_manifest_entries(res.imports, res.submodules, frozen_env, pkg_dist_map)
+        pinned_entries, notes = build_manifest_entries(
+            res.imports, res.submodules, frozen_env, pkg_dist_map, guarded_imports=res.guarded_imports
+        )
         for note in notes:
             if note not in promotions:
                 promotions.append(note)
@@ -800,7 +826,9 @@ def generate_universal_manifest(
 
     pinned_entries_set: Set[str] = set()
     for res in repo_map.scan_results:
-        entries, _ = build_manifest_entries(res.imports, res.submodules, frozen_env, pkg_dist_map)
+        entries, _ = build_manifest_entries(
+            res.imports, res.submodules, frozen_env, pkg_dist_map, guarded_imports=res.guarded_imports
+        )
         pinned_entries_set.update(entries)
 
     for entry in sorted(pinned_entries_set):
@@ -818,7 +846,9 @@ def apply_output_to_notebook(
     in_place: bool = False
 ) -> Path:
     """Writes per-notebook locked file or replaces cells in-place."""
-    pinned_manifest, _ = build_manifest_entries(scan_res.imports, scan_res.submodules, frozen_env, pkg_dist_map)
+    pinned_manifest, _ = build_manifest_entries(
+        scan_res.imports, scan_res.submodules, frozen_env, pkg_dist_map, guarded_imports=scan_res.guarded_imports
+    )
     manifest_lines, local_tagged, _ = process_package_requirements(pinned_manifest, scan_res.harvested_urls)
     
     # Filter GPU info for this specific notebook
@@ -930,13 +960,13 @@ def main() -> None:
         logger.info(f"🔍 [Path A] Analyzing saved notebook file '{args.notebook}' via AST...")
         logger.info(f"📌 Active Python Interpreter: {sys.executable}\n")
         
-        success, imports, submodules, code_sources, error_msg, _ = extract_from_file(args.notebook, strict=False)
+        success, imports, submodules, code_sources, error_msg, _, guarded_imports = extract_from_file(args.notebook, strict=False)
         if not success:
             logger.error(f"❌ Error: {error_msg}")
             sys.exit(1)
     elif in_live_ipython:
         logger.info("🔍 [Path B] Analyzing live IPython session kernel history via AST...")
-        imports, submodules, code_sources = extract_from_active_session()
+        imports, submodules, code_sources, guarded_imports = extract_from_active_session()
     else:
         parser.print_help()
         sys.exit(1)
@@ -945,7 +975,9 @@ def main() -> None:
     gpu_info = inspect_gpu_environment(imports)
     
     # Unified manifest building
-    pinned_manifest, promotion_notices = build_manifest_entries(imports, submodules, frozen_env, pkg_dist_map)
+    pinned_manifest, promotion_notices = build_manifest_entries(
+        imports, submodules, frozen_env, pkg_dist_map, guarded_imports=guarded_imports
+    )
     manifest_lines, local_tagged_info, warnings = process_package_requirements(pinned_manifest, harvested_urls)
     full_freeze_lines = raw_full_freeze if args.full_freeze else None
 

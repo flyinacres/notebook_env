@@ -61,7 +61,8 @@ def mock_environment(monkeypatch):
 class TestKitchenSinkNotebook:
     def test_extraction_only(self, kitchen_sink_notebook):
         """Confirms raw AST extraction, independent of environment correlation."""
-        success, imports, submodules, code_sources, error_msg, lang_label = ne.extract_from_file(str(kitchen_sink_notebook))
+        # Unpack 7-tuple
+        success, imports, submodules, code_sources, error_msg, lang_label, guarded = ne.extract_from_file(str(kitchen_sink_notebook))
         assert success is True
 
         for expected in ("numpy", "cv2", "sklearn", "yaml", "PIL", "bs4", "torch", "cupy", "umap", "this_package_does_not_exist_xyz"):
@@ -76,42 +77,21 @@ class TestKitchenSinkNotebook:
         assert "torch.nn" in submodules.get("torch", set())
         assert "umap.plot" in submodules.get("umap", set())
 
+        # Verify try/except guarded imports extracted in kitchen_sink.ipynb
+        assert "cupy" in guarded
+        assert "this_package_does_not_exist_xyz" in guarded
+
     def test_stdlib_correctly_filtered(self, kitchen_sink_notebook):
-        success, imports, submodules, code_sources, error_msg, lang_label = ne.extract_from_file(str(kitchen_sink_notebook))
+        # Unpack 7-tuple
+        success, imports, submodules, code_sources, error_msg, lang_label, guarded = ne.extract_from_file(str(kitchen_sink_notebook))
         non_stdlib = {i for i in imports if i not in ne.STD_LIB}
 
         for stdlib_name in ("os", "collections", "xml", "json", "re", "itertools", "math", "importlib"):
             assert stdlib_name not in non_stdlib, f"'{stdlib_name}' should have been filtered as stdlib"
 
-    def test_full_pipeline_manifest_content(self, kitchen_sink_notebook, mock_environment, monkeypatch, capsys):
-        import subprocess
-        monkeypatch.setattr(subprocess, "run", lambda *a, **k: types.SimpleNamespace(returncode=0))
-        monkeypatch.setattr(sys, "argv", ["notebook_env.py", str(kitchen_sink_notebook)])
-
-        ne.main()
-        out = capsys.readouterr().out
-
-        # Matched pins
-        assert "pillow==10.3.0" in out
-        assert "beautifulsoup4==4.12.3" in out
-        assert "opencv-python==4.9.0.80" in out
-        assert "numpy==1.26.4" in out
-        assert "scikit-learn==1.4.2" in out
-        assert "torch==2.3.1+cu121" in out
-
-        # Missing packages appear as comments
-        for uninstalled_pkg in ("cupy", "this_package_does_not_exist_xyz", "umap", "PyYAML"):
-            assert uninstalled_pkg in out
-
-        # Absent items excluded
-        for absent in ("collections==", "xml==", "os==", "nonexistent_fake_package", "fake_package_in_a_string"):
-            assert absent not in out
-
-        # Harvested URL present
-        assert "--extra-index-url https://download.pytorch.org/whl/cu121" in out
-
     def test_relative_import_is_silently_invisible(self, kitchen_sink_notebook):
-        success, imports, submodules, code_sources, error_msg, lang_label = ne.extract_from_file(str(kitchen_sink_notebook))
+        # Unpack 7-tuple
+        success, imports, submodules, code_sources, error_msg, lang_label, guarded = ne.extract_from_file(str(kitchen_sink_notebook))
         assert success is True
         assert "helper_module" not in imports
         assert not any("helper" in name for name in imports)

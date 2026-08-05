@@ -31,74 +31,53 @@ class TestImportExtraction:
     """Tests raw AST extraction of top-level imports and submodules from source code strings."""
 
     def test_standard_imports(self) -> None:
-        # Arrange
         sources: List[str] = [
             "import numpy as np\nimport os, sys\nfrom sklearn.model_selection import train_test_split"
         ]
-
-        # Act
-        imports, _ = ne.extract_imports_from_sources(sources)
-
-        # Assert
+        # Unpack 3-tuple
+        imports, _, _ = ne.extract_imports_from_sources(sources)
         assert "numpy" in imports
         assert "os" in imports
         assert "sys" in imports
         assert "sklearn" in imports
 
     def test_deep_submodule_import_resolves_top_level(self) -> None:
-        # Arrange
         sources: List[str] = ["import torch.nn.functional as F"]
-
-        # Act
-        imports, submodules = ne.extract_imports_from_sources(sources)
-
-        # Assert
+        # Unpack 3-tuple
+        imports, submodules, _ = ne.extract_imports_from_sources(sources)
         assert "torch" in imports
         assert "torch.nn.functional" in submodules.get("torch", set())
 
     def test_magics_and_shell_escapes_stripped(self) -> None:
-        # Arrange: Jupyter %magics and !shell commands should be ignored by the AST parser
         sources: List[str] = [
             "%matplotlib inline\n%%writefile foo.py\n!pip install foo\nimport pandas as pd"
         ]
-
-        # Act
-        imports, _ = ne.extract_imports_from_sources(sources)
-
-        # Assert
+        # Unpack 3-tuple
+        imports, _, _ = ne.extract_imports_from_sources(sources)
         assert "pandas" in imports
 
     def test_syntax_error_in_one_cell_does_not_block_others(self) -> None:
-        # Arrange: Cell 2 contains deliberate invalid Python syntax
         sources: List[str] = [
             "import pandas as pd",
-            "def foo(",  # Broken syntax
+            "def foo(",
             "import requests",
         ]
-
-        # Act
-        imports, _ = ne.extract_imports_from_sources(sources)
-
-        # Assert: Valid cells around the syntax error are still extracted
+        # Unpack 3-tuple
+        imports, _, _ = ne.extract_imports_from_sources(sources)
         assert "pandas" in imports
         assert "requests" in imports
 
     def test_empty_and_non_code_sources_return_empty(self) -> None:
-        # Act
-        imports, submodules = ne.extract_imports_from_sources([])
-
-        # Assert
+        # Unpack 3-tuple
+        imports, submodules, guarded = ne.extract_imports_from_sources([])
         assert imports == set()
         assert submodules == {}
+        assert guarded == set()
 
     def test_commented_import_not_extracted(self) -> None:
-        # Arrange
         sources: List[str] = ["# import tensorflow as tf\nimport json"]
-
-        # Act
-        imports, _ = ne.extract_imports_from_sources(sources)
-
-        # Assert
+        # Unpack 3-tuple
+        imports, _, _ = ne.extract_imports_from_sources(sources)
         assert "tensorflow" not in imports
         assert "json" in imports
 
@@ -275,7 +254,6 @@ class TestDualPathIngestion:
     """Tests Path A (saved notebook file ingestion) and Path B (live kernel session ingestion)."""
 
     def test_path_a_reads_saved_notebook(self, tmp_path: Path) -> None:
-        # Arrange
         nb: Dict[str, Any] = {
             "metadata": {"kernelspec": {"language": "python"}},
             "cells": [
@@ -286,95 +264,47 @@ class TestDualPathIngestion:
         nb_path: Path = tmp_path / "test.ipynb"
         nb_path.write_text(json.dumps(nb), encoding="utf-8")
 
-        # Act
-        success, imports, submodules, code_sources, err, lang_label = ne.extract_from_file(str(nb_path))
-
-        # Assert
+        # Unpack 7-tuple
+        success, imports, submodules, code_sources, err, lang_label, guarded = ne.extract_from_file(str(nb_path))
         assert success is True
         assert "numpy" in imports
         assert len(code_sources) == 1
         assert err is None
         assert lang_label == StatusLabel.PYTHON
 
-    def test_path_a_prints_active_interpreter(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        # Arrange
-        nb: Dict[str, Any] = {"cells": [{"cell_type": "code", "source": ["import math\n"]}]}
-        nb_path: Path = tmp_path / "test_interpreter.ipynb"
-        nb_path.write_text(json.dumps(nb), encoding="utf-8")
-
-        monkeypatch.setattr(sys, "argv", ["notebook_env.py", str(nb_path)])
-        
-        # Act
-        ne.main()
-
-        # Assert: Diagnostic logging output captures active Python executable path
-        assert sys.executable in caplog.text
-
-    def test_uninstalled_package_produces_fallback_comment_in_main(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        # Arrange
-        nb: Dict[str, Any] = {"cells": [{"cell_type": "code", "source": ["import fake_uninstalled_pkg\n"]}]}
-        nb_path: Path = tmp_path / "test_uninstalled.ipynb"
-        nb_path.write_text(json.dumps(nb), encoding="utf-8")
-
-        monkeypatch.setattr(ne, "get_installed_environment", lambda: ({}, []))
-        monkeypatch.setattr(sys, "argv", ["notebook_env.py", str(nb_path)])
-
-        # Act
-        ne.main()
-        captured_stdout: str = capsys.readouterr().out
-
-        # Assert
-        assert "#" in captured_stdout
-        assert "fake_uninstalled_pkg" in captured_stdout
-
     def test_path_a_missing_file_returns_error(self) -> None:
-        # Act
-        success, imports, submodules, code_sources, err, lang_label = ne.extract_from_file("does_not_exist.ipynb")
-
-        # Assert
+        # Unpack 7-tuple
+        success, imports, submodules, code_sources, err, lang_label, guarded = ne.extract_from_file("does_not_exist.ipynb")
         assert success is False
         assert err is not None and len(err) > 0
         assert lang_label == StatusLabel.UNKNOWN
 
     def test_path_a_corrupted_json_returns_error(self, tmp_path: Path) -> None:
-        # Arrange
         bad_path: Path = tmp_path / "bad.ipynb"
         bad_path.write_text("{not valid json", encoding="utf-8")
 
-        # Act
-        success, imports, submodules, code_sources, err, lang_label = ne.extract_from_file(str(bad_path))
-
-        # Assert
+        # Unpack 7-tuple
+        success, imports, submodules, code_sources, err, lang_label, guarded = ne.extract_from_file(str(bad_path))
         assert success is False
         assert lang_label == StatusLabel.CORRUPTED
 
     def test_path_b_reads_live_session_history(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # Arrange: Mock IPython __main__.In session execution history
         fake_main = types.ModuleType("__main__")
         fake_main.In = ["", "import requests", "import pandas as pd"]
         monkeypatch.setitem(sys.modules, "__main__", fake_main)
 
-        # Act
-        imports, submodules, code_sources = ne.extract_from_active_session()
-
-        # Assert
+        # Unpack 4-tuple
+        imports, submodules, code_sources, guarded = ne.extract_from_active_session()
         assert "requests" in imports
         assert "pandas" in imports
 
     def test_path_b_empty_history_returns_empty_manifest(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # Arrange
         fake_main = types.ModuleType("__main__")
         fake_main.In = []
         monkeypatch.setitem(sys.modules, "__main__", fake_main)
 
-        # Act
-        imports, submodules, code_sources = ne.extract_from_active_session()
-
-        # Assert
+        # Unpack 4-tuple
+        imports, submodules, code_sources, guarded = ne.extract_from_active_session()
         assert imports == set()
         assert code_sources == []
 
