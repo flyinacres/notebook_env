@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-notebook_env.py (v29)
+notebook_env.py (v30)
 Headless Jupyter Notebook Dependency Scanner & Lockfile Generator.
 
 Standalone, zero-dependency utility for analyzing notebook environments,
@@ -319,6 +319,22 @@ SHELL_CELL_MAGICS: Set[str] = {
     "%%bash", "%%sh", "%%zsh", "%%script", "%%cmd", "%%powershell"
 }
 
+# --- COMPILED REGEX PATTERNS (Section-Level Constants) ---
+EXTRA_INDEX_PATTERN = re.compile(r'--extra-index-url\s+([^\s]+)')
+BASE_INDEX_PATTERN = re.compile(r'(?:--index-url|-i)\s+([^\s]+)')
+
+SHELL_SPLIT_PATTERN = re.compile(r'\s*(?:&&|;|\||\|\|)\s*')
+
+PIP_INSTALL_PATTERN = re.compile(
+    r'^\s*(?:%pip|!pip|%conda|!conda|pip3?)\s+install\s+(.+)$'
+)
+SYSTEM_PKG_PATTERN = re.compile(
+    r'^\s*(?:!|%%bash|%%sh)?\s*(?:apt-get|brew|yum)\s+install\s+(.+)$'
+)
+CONDA_INSTALL_PATTERN = re.compile(
+    r'^\s*(?:%conda|!conda|conda)\s+install\s+(.+)$'
+)
+
 
 def classify_cell_source(source: str) -> Tuple[str, str]:
     """
@@ -359,7 +375,7 @@ def harvest_index_urls_from_sources(code_sources: List[str]) -> Set[str]:
     return extra_urls
 
 
-def harvest_cell_magics_and_commands(def harvest_cell_magics_and_commands(
+def harvest_cell_magics_and_commands(
     code_sources: List[str]
 ) -> Tuple[Set[str], Set[str], Set[str], List[str], List[str]]:
     """
@@ -378,11 +394,6 @@ def harvest_cell_magics_and_commands(def harvest_cell_magics_and_commands(
     magic_warnings: List[str] = []
     magic_notices: List[str] = []
 
-    extra_pattern = re.compile(r'--extra-index-url\s+([^\s]+)')
-    base_pattern = re.compile(r'(?:--index-url|-i)\s+([^\s]+)')
-    pip_install_pattern = re.compile(r'(?:^|\s|;|&&)(?:%pip|%conda|!pip|!conda|pip3?|conda)\s+install\s+(.+)$')
-    sys_pkg_pattern = re.compile(r'(?:apt-get|brew|yum)\s+install\s+')
-
     for cell_idx, source in enumerate(code_sources, start=1):
         cell_type, _ = classify_cell_source(source)
 
@@ -391,56 +402,67 @@ def harvest_cell_magics_and_commands(def harvest_cell_magics_and_commands(
             if not clean_line or clean_line.startswith('#') or clean_line in SHELL_CELL_MAGICS:
                 continue
 
-            # 1. Base vs Extra Index URLs
-            for url in extra_pattern.findall(clean_line):
+            # Index URLs operate across the full raw line
+            for url in EXTRA_INDEX_PATTERN.findall(clean_line):
                 extra_index_urls.add(url.strip("'\""))
-            for url in base_pattern.findall(clean_line):
+            for url in BASE_INDEX_PATTERN.findall(clean_line):
                 if "--extra-index-url" not in clean_line:
                     base_index_urls.add(url.strip("'\""))
 
-            # 2. System Package Manager Notices (apt-get / brew / yum)
-            if sys_pkg_pattern.search(clean_line):
-                magic_notices.append(
-                    f"ℹ️ System package manager call detected in cell {cell_idx} ('{clean_line}'); "
-                    f"system-level dependencies are outside Python package manifests."
-                )
+            # Split chained command lines (e.g. "apt-get update && apt-get install -y graphviz")
+            command_segments = SHELL_SPLIT_PATTERN.split(clean_line)
 
-            # 3. Conda Notices
-            if clean_line.startswith("%conda") or clean_line.startswith("!conda") or (cell_type == "SHELL_SCRIPT" and "conda install" in clean_line):
-                magic_notices.append(
-                    f"ℹ️ Conda installation detected in cell {cell_idx} ('{clean_line}'); "
-                    f"conda packages are outside pip freeze correlation."
-                )
+            for segment in command_segments:
+                seg = segment.strip()
+                if not seg:
+                    continue
 
-            # 4. Pip Install Packages (matches %pip, !pip, and bare pip inside %%bash)
-            pip_match = pip_install_pattern.search(clean_line)
-            if pip_match:
-                args_str = pip_match.group(1)
-
-                if "-r " in args_str or "--requirement" in args_str:
-                    magic_warnings.append(
-                        f"⚠️ Cell {cell_idx} magic '{clean_line}' references an external requirements file; "
-                        f"contents cannot be verified statically."
+                # 1. System Package Manager Calls (apt-get / brew / yum)
+                if SYSTEM_PKG_PATTERN.match(seg):
+                    magic_notices.append(
+                        f"ℹ️ System package manager call detected in cell {cell_idx} ('{seg}'); "
+                        f"system-level dependencies are outside Python package manifests."
                     )
                     continue
 
-                tokens = args_str.split()
-                i = 0
-                while i < len(tokens):
-                    token = tokens[i]
-                    if token in ("--extra-index-url", "--index-url", "-i", "-f", "--find-links", "-t", "--target"):
-                        i += 2
-                        continue
-                    if token.startswith('-') or token.lower() in PIP_IGNORE_FLAGS:
-                        i += 1
+                # 2. Conda Installs
+                if CONDA_INSTALL_PATTERN.match(seg):
+                    magic_notices.append(
+                        f"ℹ️ Conda installation detected in cell {cell_idx} ('{seg}'); "
+                        f"conda packages are outside pip freeze correlation."
+                    )
+                    continue
+
+                # 3. Pip Installs (%pip, !pip, or bare pip inside %%bash)
+                pip_match = PIP_INSTALL_PATTERN.match(seg)
+                if pip_match:
+                    args_str = pip_match.group(1)
+
+                    if "-r " in args_str or "--requirement" in args_str:
+                        magic_warnings.append(
+                            f"⚠️ Cell {cell_idx} magic '{seg}' references an external requirements file; "
+                            f"contents cannot be verified statically."
+                        )
                         continue
 
-                    pkg_name = re.split(r'[<>=!~;\[#]', token)[0].strip("'\"")
-                    if pkg_name:
-                        harvested_packages.add(pkg_name)
-                    i += 1
+                    tokens = args_str.split()
+                    i = 0
+                    while i < len(tokens):
+                        token = tokens[i]
+                        if token in ("--extra-index-url", "--index-url", "-i", "-f", "--find-links", "-t", "--target"):
+                            i += 2
+                            continue
+                        if token.startswith('-') or token.lower() in PIP_IGNORE_FLAGS:
+                            i += 1
+                            continue
+
+                        pkg_name = re.split(r'[<>=!~;\[#]', token)[0].strip("'\"")
+                        if pkg_name:
+                            harvested_packages.add(pkg_name)
+                        i += 1
 
     return harvested_packages, base_index_urls, extra_index_urls, magic_warnings, magic_notices
+
 
 # =====================================================================
 # ENVIRONMENT CORRELATION & EXTRAS PROMOTION
