@@ -169,7 +169,7 @@ def extract_from_active_session() -> Tuple[Set[str], Dict[str, Set[str]], List[s
     """Path B (Live Kernel): Reads IPython execution history."""
     import __main__
     code_sources = [src for src in getattr(__main__, 'In', []) if src and isinstance(src, str)]
-    imports, submodules, guarded_imports, dyn_warnings = extract_from_active_session_internal(code_sources)
+    imports, submodules, _, guarded_imports, dyn_warnings = extract_from_active_session_internal(code_sources)
     return imports, submodules, code_sources, guarded_imports, dyn_warnings
 
 
@@ -359,14 +359,14 @@ def harvest_index_urls_from_sources(code_sources: List[str]) -> Set[str]:
     return extra_urls
 
 
-def harvest_cell_magics_and_commands(
+def harvest_cell_magics_and_commands(def harvest_cell_magics_and_commands(
     code_sources: List[str]
 ) -> Tuple[Set[str], Set[str], Set[str], List[str], List[str]]:
     """
     Scans code sources for cell magics, index URLs, auxiliary tools, and shell commands.
 
     Returns:
-        - harvested_packages: Set[str] (auxiliary tools installed via %pip / !pip)
+        - harvested_packages: Set[str] (auxiliary tools installed via %pip / !pip / shell pip)
         - base_index_urls: Set[str] (--index-url / -i base index overrides)
         - extra_index_urls: Set[str] (--extra-index-url supplemental indexes)
         - magic_warnings: List[str] (warnings for -r requirements.txt or unresolvable scripts)
@@ -380,31 +380,40 @@ def harvest_cell_magics_and_commands(
 
     extra_pattern = re.compile(r'--extra-index-url\s+([^\s]+)')
     base_pattern = re.compile(r'(?:--index-url|-i)\s+([^\s]+)')
-    pip_install_pattern = re.compile(r'^\s*(?:%pip|%conda|!pip|!conda)\s+install\s+(.+)$')
-    apt_pattern = re.compile(r'^\s*(?:!|%%bash\n|%%sh\n)?.*?(?:apt-get|brew|yum)\s+install\s+(.+)$', re.MULTILINE)
+    pip_install_pattern = re.compile(r'(?:^|\s|;|&&)(?:%pip|%conda|!pip|!conda|pip3?|conda)\s+install\s+(.+)$')
+    sys_pkg_pattern = re.compile(r'(?:apt-get|brew|yum)\s+install\s+')
 
     for cell_idx, source in enumerate(code_sources, start=1):
-        cell_type, clean_source = classify_cell_source(source)
+        cell_type, _ = classify_cell_source(source)
 
         for line in source.splitlines():
             clean_line = line.strip()
-            if clean_line.startswith('#'):
+            if not clean_line or clean_line.startswith('#') or clean_line in SHELL_CELL_MAGICS:
                 continue
 
+            # 1. Base vs Extra Index URLs
             for url in extra_pattern.findall(clean_line):
                 extra_index_urls.add(url.strip("'\""))
             for url in base_pattern.findall(clean_line):
                 if "--extra-index-url" not in clean_line:
                     base_index_urls.add(url.strip("'\""))
 
-            if clean_line.startswith("%conda") or clean_line.startswith("!conda"):
+            # 2. System Package Manager Notices (apt-get / brew / yum)
+            if sys_pkg_pattern.search(clean_line):
+                magic_notices.append(
+                    f"ℹ️ System package manager call detected in cell {cell_idx} ('{clean_line}'); "
+                    f"system-level dependencies are outside Python package manifests."
+                )
+
+            # 3. Conda Notices
+            if clean_line.startswith("%conda") or clean_line.startswith("!conda") or (cell_type == "SHELL_SCRIPT" and "conda install" in clean_line):
                 magic_notices.append(
                     f"ℹ️ Conda installation detected in cell {cell_idx} ('{clean_line}'); "
                     f"conda packages are outside pip freeze correlation."
                 )
-                continue
 
-            pip_match = pip_install_pattern.match(clean_line)
+            # 4. Pip Install Packages (matches %pip, !pip, and bare pip inside %%bash)
+            pip_match = pip_install_pattern.search(clean_line)
             if pip_match:
                 args_str = pip_match.group(1)
 
@@ -431,14 +440,7 @@ def harvest_cell_magics_and_commands(
                         harvested_packages.add(pkg_name)
                     i += 1
 
-        for match in apt_pattern.findall(source):
-            magic_notices.append(
-                f"ℹ️ System package manager call detected in cell {cell_idx} ('{match.strip()}'); "
-                f"system-level dependencies are outside Python package manifests."
-            )
-
     return harvested_packages, base_index_urls, extra_index_urls, magic_warnings, magic_notices
-
 
 # =====================================================================
 # ENVIRONMENT CORRELATION & EXTRAS PROMOTION

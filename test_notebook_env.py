@@ -550,3 +550,47 @@ class TestRuntimeExecution:
         content: str = req_file.read_text(encoding="utf-8")
         assert "numpy==1.26.4" in content
         assert "pandas==2.2.1" in content
+
+class TestCellClassificationAndMagicHarvesting:
+    """Tests Phase 2 cell classification and magic/shell command harvesting."""
+
+    def test_bash_cell_bypasses_ast_parse_without_syntax_error(self) -> None:
+        """%%bash cells bypass ast.parse so invalid Python syntax doesn't crash or get silently dropped."""
+        sources = [
+            "%%bash\n"
+            "apt-get update && apt-get install -y graphviz\n"
+            "pip install gdown\n"
+        ]
+
+        harvested_pkgs, base_urls, extra_urls, warnings, notices = ne.harvest_cell_magics_and_commands(sources)
+
+        assert "gdown" in harvested_pkgs
+        assert any("apt-get" in n.lower() or "system" in n.lower() for n in notices)
+
+    def test_distinguishes_index_url_from_extra_index_url(self) -> None:
+        """Base --index-url and supplemental --extra-index-url are categorized separately."""
+        sources = [
+            "%pip install torch --index-url https://custom.base.index/simple\n",
+            "!pip install torchvision --extra-index-url https://download.pytorch.org/whl/cu121\n"
+        ]
+
+        harvested_pkgs, base_urls, extra_urls, warnings, notices = ne.harvest_cell_magics_and_commands(sources)
+
+        assert "https://custom.base.index/simple" in base_urls
+        assert "https://download.pytorch.org/whl/cu121" in extra_urls
+
+    def test_conda_install_logs_informational_notice(self) -> None:
+        """%conda or !conda installs generate an informational notice rather than pip freeze correlation."""
+        sources = ["%conda install -c conda-forge graphviz\n"]
+
+        harvested_pkgs, base_urls, extra_urls, warnings, notices = ne.harvest_cell_magics_and_commands(sources)
+
+        assert any("conda" in n.lower() for n in notices)
+
+    def test_requirements_file_reference_logs_warning(self) -> None:
+        """%pip install -r requirements.txt emits a diagnostic warning."""
+        sources = ["!pip install -r requirements.txt\n"]
+
+        harvested_pkgs, base_urls, extra_urls, warnings, notices = ne.harvest_cell_magics_and_commands(sources)
+
+        assert any("requirements" in w.lower() for w in warnings)
