@@ -108,6 +108,10 @@ class NotebookImportVisitor(ast.NodeVisitor):
         self.dynamic_import_warnings: List[str] = []
         self._guarded_depth: int = 0
 
+        # Track bound aliases for importlib and import_module
+        self._importlib_aliases: Set[str] = {"importlib"}
+        self._import_module_bindings: Set[str] = set()
+
     @property
     def guarded_imports(self) -> Set[str]:
         return self.raw_guarded_imports - self.unconditional_imports
@@ -126,6 +130,11 @@ class NotebookImportVisitor(ast.NodeVisitor):
         for alias in node.names:
             base_pkg = alias.name.split('.')[0]
             self.imports.add(base_pkg)
+            
+            # Track module alias: import importlib as il
+            if alias.name == "importlib":
+                self._importlib_aliases.add(alias.asname or "importlib")
+
             if self._guarded_depth > 0:
                 self.raw_guarded_imports.add(base_pkg)
             else:
@@ -138,6 +147,13 @@ class NotebookImportVisitor(ast.NodeVisitor):
         if node.module:
             base_pkg = node.module.split('.')[0]
             self.imports.add(base_pkg)
+
+            # Track function binding: from importlib import import_module [as custom_name]
+            if node.module == "importlib":
+                for alias in node.names:
+                    if alias.name == "import_module":
+                        self._import_module_bindings.add(alias.asname or "import_module")
+
             if self._guarded_depth > 0:
                 self.raw_guarded_imports.add(base_pkg)
             else:
@@ -148,12 +164,16 @@ class NotebookImportVisitor(ast.NodeVisitor):
     def visit_Call(self, node: ast.Call) -> None:
         is_dynamic_import = False
 
+        # Match importlib.import_module(...) or il.import_module(...)
         if isinstance(node.func, ast.Attribute):
-            if isinstance(node.func.value, ast.Name) and node.func.value.id == "importlib":
+            if isinstance(node.func.value, ast.Name) and node.func.value.id in self._importlib_aliases:
                 if node.func.attr == "import_module":
                     is_dynamic_import = True
-        elif isinstance(node.func, ast.Name) and node.func.id == "__import__":
-            is_dynamic_import = True
+
+        # Match __import__(...) or direct import_module(...) binding
+        elif isinstance(node.func, ast.Name):
+            if node.func.id == "__import__" or node.func.id in self._import_module_bindings:
+                is_dynamic_import = True
 
         if is_dynamic_import and node.args:
             first_arg = node.args[0]

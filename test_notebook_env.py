@@ -179,7 +179,44 @@ class TestDynamicImportHandling:
         assert "tensorflow" not in imports
         assert any("pkg_name" in w for w in warnings)
 
+    def test_from_importlib_import_module_extracted(self) -> None:
+        """from importlib import import_module; import_module('torch') is extracted."""
+        sources = [
+            "from importlib import import_module\n"
+            "torch = import_module('torch')\n"
+        ]
 
+        imports, submodules, guarded_imports, warnings = ne.extract_imports_from_sources(sources)
+
+        assert "torch" in imports
+        assert "importlib" in imports
+        assert warnings == []
+
+    def test_aliased_importlib_module_extracted(self) -> None:
+        """import importlib as il; il.import_module('torch') is extracted."""
+        sources = [
+            "import importlib as il\n"
+            "torch = il.import_module('torch')\n"
+        ]
+
+        imports, submodules, guarded_imports, warnings = ne.extract_imports_from_sources(sources)
+
+        assert "torch" in imports
+        assert "importlib" in imports
+        assert warnings == []
+
+    def test_from_importlib_with_variable_emits_warning(self) -> None:
+        """from importlib import import_module; import_module(var) emits warning."""
+        sources = [
+            "from importlib import import_module\n"
+            "pkg = 'tensorflow'\n"
+            "mod = import_module(pkg)\n"
+        ]
+
+        imports, submodules, guarded_imports, warnings = ne.extract_imports_from_sources(sources)
+
+        assert "tensorflow" not in imports
+        assert any("pkg" in w for w in warnings)
 # =====================================================================
 # 2. INDEX URL HARVESTING
 # =====================================================================
