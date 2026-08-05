@@ -102,8 +102,14 @@ class NotebookImportVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.imports: Set[str] = set()
         self.submodules: Dict[str, Set[str]] = {}
-        self.guarded_imports: Set[str] = set()
+        self.unconditional_imports: Set[str] = set()
+        self.raw_guarded_imports: Set[str] = set()
         self._guarded_depth: int = 0
+
+    @property
+    def guarded_imports(self) -> Set[str]:
+        # Only treat as guarded if it was NEVER imported unconditionally anywhere
+        return self.raw_guarded_imports - self.unconditional_imports
 
     def visit_Try(self, node: ast.Try) -> None:
         self._guarded_depth += 1
@@ -120,7 +126,9 @@ class NotebookImportVisitor(ast.NodeVisitor):
             base_pkg = alias.name.split('.')[0]
             self.imports.add(base_pkg)
             if self._guarded_depth > 0:
-                self.guarded_imports.add(base_pkg)
+                self.raw_guarded_imports.add(base_pkg)
+            else:
+                self.unconditional_imports.add(base_pkg)
             if '.' in alias.name:
                 self.submodules.setdefault(base_pkg, set()).add(alias.name)
         self.generic_visit(node)
@@ -130,7 +138,9 @@ class NotebookImportVisitor(ast.NodeVisitor):
             base_pkg = node.module.split('.')[0]
             self.imports.add(base_pkg)
             if self._guarded_depth > 0:
-                self.guarded_imports.add(base_pkg)
+                self.raw_guarded_imports.add(base_pkg)
+            else:
+                self.unconditional_imports.add(base_pkg)
             self.submodules.setdefault(base_pkg, set()).add(node.module)
         self.generic_visit(node)
 
@@ -259,10 +269,6 @@ def resolve_pypi_package_and_extras(
     pkg_dist_map: Optional[Dict[str, List[str]]] = None,
     is_guarded: bool = False
 ) -> Tuple[str, Optional[str]]:
-    """
-    Resolves top-level import to PyPI package name using memoized metadata first.
-    Promotes submodules to optional extras if declared in package metadata.
-    """
     pypi_name = None
     if pkg_dist_map is None and hasattr(importlib.metadata, "packages_distributions"):
         try:
@@ -281,9 +287,13 @@ def resolve_pypi_package_and_extras(
 
     matched_pin = frozen_env.get(pypi_name.lower())
 
+    # --- GUARDED IMPORT HANDLING ---
+    if is_guarded:
+        if matched_pin:
+            return f"# {matched_pin} (guarded import in try/except or conditional block - optional dependency)", None
+        return f"# {pypi_name} (imported as '{imp}' in try/except or conditional block - optional fallback)", None
+
     if not matched_pin:
-        if is_guarded:
-            return f"# {pypi_name} (imported as '{imp}' in try/except or conditional guard - optional fallback)", None
         return f"# {pypi_name} (imported as '{imp}', not currently found in active env)", None
 
     pkg_part, ver_part = matched_pin.split("==", 1)

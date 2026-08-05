@@ -453,3 +453,40 @@ class TestRuntimeExecution:
         content: str = req_file.read_text(encoding="utf-8")
         assert "numpy==1.26.4" in content
         assert "pandas==2.2.1" in content
+
+class TestGuardedImportCorrectness:
+    """Tests edge cases and correctness fixes for guarded import resolution."""
+
+    def test_installed_guarded_package_emitted_as_optional_comment(self) -> None:
+        """Installed packages inside try/except must NOT become hard pins in the manifest."""
+        # Arrange: cupy IS installed in the scanning environment
+        frozen_env = {"cupy": "cupy==13.0.0", "numpy": "numpy==1.26.4"}
+        submodules = {}
+        imports = {"numpy", "cupy"}
+        guarded_imports = {"cupy"}
+
+        # Act
+        pinned_entries, notices = ne.build_manifest_entries(
+            imports, submodules, frozen_env, guarded_imports=guarded_imports
+        )
+
+        # Assert: cupy must be commented out, preserving optionality despite being installed
+        cupy_pin = next((p for p in pinned_entries if "cupy" in p), "")
+        assert cupy_pin.startswith("#")
+        assert "cupy==13.0.0" in cupy_pin
+        assert "guarded" in cupy_pin.lower() or "optional" in cupy_pin.lower()
+
+    def test_unconditional_import_overrides_guarded_import(self) -> None:
+        """If a package is imported unconditionally in one cell and guarded in another, it is mandatory."""
+        # Arrange: numpy imported at top-level AND later inside an if block
+        sources = [
+            "import numpy as np\n",
+            "if sys.platform == 'win32':\n    import numpy as np2\n"
+        ]
+
+        # Act
+        imports, submodules, guarded_imports = ne.extract_imports_from_sources(sources)
+
+        # Assert: numpy should NOT be in the net guarded_imports set
+        assert "numpy" in imports
+        assert "numpy" not in guarded_imports
