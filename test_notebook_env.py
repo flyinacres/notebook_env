@@ -102,6 +102,64 @@ class TestImportExtraction:
         assert "tensorflow" not in imports
         assert "json" in imports
 
+class TestGuardedImports:
+    """Tests detection of guarded imports inside try/except and if/else blocks."""
+
+    def test_try_except_import_marked_as_guarded(self) -> None:
+        """Imports inside try/except blocks must be marked as guarded."""
+        # Arrange
+        sources = [
+            "import numpy as np\n"
+            "try:\n"
+            "    import cupy as cp\n"
+            "except ImportError:\n"
+            "    pass"
+        ]
+
+        # Act
+        imports, submodules, guarded_imports = ne.extract_imports_from_sources(sources)
+
+        # Assert: numpy is unconditional; cupy is extracted as guarded
+        assert "numpy" in imports
+        assert "numpy" not in guarded_imports
+        assert "cupy" in guarded_imports
+
+    def test_if_statement_import_marked_as_guarded(self) -> None:
+        """Imports inside if/elif/else conditionals must be marked as guarded."""
+        # Arrange
+        sources = [
+            "import os\n"
+            "if sys.platform == 'win32':\n"
+            "    import pywin32\n"
+        ]
+
+        # Act
+        imports, submodules, guarded_imports = ne.extract_imports_from_sources(sources)
+
+        # Assert: os is unconditional; pywin32 is extracted as guarded
+        assert "os" in imports
+        assert "os" not in guarded_imports
+        assert "pywin32" in guarded_imports
+
+    def test_uninstalled_guarded_import_formatted_as_optional_in_manifest(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Uninstalled guarded imports should be formatted as optional comments in the manifest."""
+        # Arrange
+        frozen_env = {"numpy": "numpy==1.26.4"}
+        submodules = {}
+        imports = {"numpy", "cupy"}
+        guarded_imports = {"cupy"}
+
+        # Act: Request manifest entries passing guarded_imports
+        pinned_entries, notices = ne.build_manifest_entries(
+            imports, submodules, frozen_env, guarded_imports=guarded_imports
+        )
+
+        # Assert: cupy should be annotated as an optional/guarded fallback comment
+        cupy_pin = next((p for p in pinned_entries if "cupy" in p), "")
+        assert cupy_pin.startswith("#")
+        assert "guarded" in cupy_pin.lower() or "optional" in cupy_pin.lower()
 
 # =====================================================================
 # 2. INDEX URL HARVESTING
