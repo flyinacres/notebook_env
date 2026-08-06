@@ -8,10 +8,13 @@ about a different concern, regex/line-level scanning of %pip/!pip/%conda/apt-get
 index-url lines, and uses its own fixture (magic_sink.ipynb) so a change to one
 concern doesn't risk breaking assertions that belong to the other.
 
-Several tests below encode CORRECT/INTENDED behavior for known, not-yet-fixed bugs
-(see DEVELOPMENT.md) and are marked xfail with a reason rather than written to match
-current buggy output. If one of these starts passing, pytest will report XPASS,
-which is the signal to remove the xfail marker, the bug's been fixed.
+As of notebook_env.py v30, all tests here assert correct/intended behavior directly.
+The five cases that were previously marked xfail (editable/VCS install leaking into
+harvested_packages; base vs. extra index URL conflation, both in the harvester itself
+and in the harvest_index_urls_from_sources compatibility wrapper) are now fixed and
+verified passing: PIP_VALUE_FLAGS + VCS_OR_PATH_PREFIXES close the editable/VCS leak,
+and matching against the specific matched substring (rather than scanning the whole
+line) fixed the base/extra conflation.
 """
 
 from pathlib import Path
@@ -91,21 +94,12 @@ class TestPackageHarvesting:
         assert pkgs == set()
         assert any("some-system-lib" in n for n in notices)
 
-    @pytest.mark.xfail(
-        reason="Known bug: '-e'/'--editable' is not in the value-consuming flag list, "
-               "so the local path argument leaks into harvested_packages as a fake 'package'.",
-        strict=True,
-    )
     def test_editable_local_path_install_not_treated_as_a_package(self) -> None:
         pkgs, _, _, _, _ = ne.harvest_cell_magics_and_commands(
             ["!pip install -e ./local_package"]
         )
         assert "./local_package" not in pkgs
 
-    @pytest.mark.xfail(
-        reason="Known bug: same '-e' gap as above, applies to VCS install targets too.",
-        strict=True,
-    )
     def test_editable_vcs_install_not_treated_as_a_package(self) -> None:
         pkgs, _, _, _, _ = ne.harvest_cell_magics_and_commands(
             ["!pip install -e git+https://github.com/fake-org/fake-repo.git#egg=fakerepo"]
@@ -134,12 +128,6 @@ class TestIndexUrlSeparation:
         )
         assert base == {"https://custom.internal/simple"}
 
-    @pytest.mark.xfail(
-        reason="Known bug: harvest_cell_magics_and_commands drops a --index-url match "
-               "whenever --extra-index-url ALSO appears anywhere in the same line, "
-               "even though they're two distinct flags with distinct URLs.",
-        strict=True,
-    )
     def test_base_and_extra_index_url_on_same_line_both_captured(self) -> None:
         _, base, extra, _, _ = ne.harvest_cell_magics_and_commands(
             ["!pip install onnxruntime --index-url https://custom.internal/simple "
@@ -163,24 +151,12 @@ class TestIndexUrlWrapperCompatibility:
         )
         assert urls == {"https://download.pytorch.org/whl/cu121"}
 
-    @pytest.mark.xfail(
-        reason="Known bug: when only --index-url (long form) is present and no "
-               "--extra-index-url exists anywhere in the sources, the wrapper's fallback "
-               "regex doesn't recognize the long form, so the URL is silently dropped "
-               "entirely rather than surfaced (even mislabeled).",
-        strict=True,
-    )
     def test_base_index_url_alone_is_not_silently_dropped(self) -> None:
         urls = ne.harvest_index_urls_from_sources(
             ["!pip install foo --index-url https://custom.internal/simple"]
         )
         assert urls == {"https://custom.internal/simple"}
 
-    @pytest.mark.xfail(
-        reason="Known bug: when both --index-url and --extra-index-url are present, "
-               "the wrapper returns only the extra one; the base override is dropped.",
-        strict=True,
-    )
     def test_both_present_wrapper_should_not_drop_base(self) -> None:
         urls = ne.harvest_index_urls_from_sources(
             ["!pip install onnxruntime --index-url https://custom.internal/simple "
