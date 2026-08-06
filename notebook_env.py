@@ -309,10 +309,14 @@ def extract_imports_from_sources(
 # base/extra PyPI index URLs (--index-url), and non-Python shell commands.
 # =====================================================================
 
-PIP_IGNORE_FLAGS: Set[str] = {
+PIP_SINGLE_FLAGS: Set[str] = {
     "-u", "--upgrade", "-q", "--quiet", "--user", "--no-cache-dir",
-    "--force-reinstall", "-e", "--editable", "--no-deps", "--pre",
-    "--break-system-packages"
+    "--force-reinstall", "--no-deps", "--pre", "--break-system-packages"
+}
+
+PIP_VALUE_FLAGS: Set[str] = {
+    "--extra-index-url", "--index-url", "-i", "-f", "--find-links", 
+    "-t", "--target", "-e", "--editable", "-r", "--requirement"
 }
 
 SHELL_CELL_MAGICS: Set[str] = {
@@ -322,25 +326,19 @@ SHELL_CELL_MAGICS: Set[str] = {
 # --- COMPILED REGEX PATTERNS (Section-Level Constants) ---
 EXTRA_INDEX_PATTERN = re.compile(r'--extra-index-url\s+([^\s]+)')
 BASE_INDEX_PATTERN = re.compile(r'(?:--index-url|-i)\s+([^\s]+)')
-
 SHELL_SPLIT_PATTERN = re.compile(r'\s*(?:&&|;|\||\|\|)\s*')
 
-PIP_INSTALL_PATTERN = re.compile(
-    r'^\s*(?:%pip|!pip|%conda|!conda|pip3?)\s+install\s+(.+)$'
-)
-SYSTEM_PKG_PATTERN = re.compile(
-    r'^\s*(?:!|%%bash|%%sh)?\s*(?:apt-get|brew|yum)\s+install\s+(.+)$'
-)
-CONDA_INSTALL_PATTERN = re.compile(
-    r'^\s*(?:%conda|!conda|conda)\s+install\s+(.+)$'
+PIP_INSTALL_PATTERN = re.compile(r'^\s*(?:%pip|!pip|pip3?)\s+install\s+(.+)$')
+SYSTEM_PKG_PATTERN = re.compile(r'^\s*(?:!|%%bash|%%sh)?\s*(?:apt-get|brew|yum)\s+install\s+(.+)$')
+CONDA_INSTALL_PATTERN = re.compile(r'^\s*(?:%conda|!conda|conda)\s+install\s+(.+)$')
+
+VCS_OR_PATH_PREFIXES: Tuple[str, ...] = (
+    ".", "/", "\\", "git+", "hg+", "svn+", "bzr+", "http://", "https://"
 )
 
 
 def classify_cell_source(source: str) -> Tuple[str, str]:
-    """
-    Classifies cell source into (cell_type, clean_source).
-    Types: 'PYTHON', 'SHELL_SCRIPT', 'WRITEFILE'
-    """
+    """Classifies cell source into (cell_type, clean_source)."""
     lines = source.splitlines()
     if not lines:
         return "PYTHON", ""
@@ -358,21 +356,12 @@ def classify_cell_source(source: str) -> Tuple[str, str]:
 
 
 def harvest_index_urls_from_sources(code_sources: List[str]) -> Set[str]:
-    """Scans code sources for --extra-index-url or -i flags."""
-    _, _, extra_urls, _, _ = harvest_cell_magics_and_commands(code_sources)
-    if not extra_urls:
-        index_urls: Set[str] = set()
-        pattern = re.compile(r'(?:--extra-index-url|-i)\s+([^\s]+)')
-        for source in code_sources:
-            for line in source.splitlines():
-                clean_line = line.strip()
-                if clean_line.startswith('#'):
-                    continue
-                matches = pattern.findall(clean_line)
-                for url in matches:
-                    index_urls.add(url.strip("'\""))
-        return index_urls
-    return extra_urls
+    """
+    Scans code sources for index URLs and returns a combined set of all harvested URLs.
+    Preserves signature compatibility for batch runners and existing test suites.
+    """
+    _, base_urls, extra_urls, _, _ = harvest_cell_magics_and_commands(code_sources)
+    return base_urls.union(extra_urls)
 
 
 def harvest_cell_magics_and_commands(
@@ -382,7 +371,7 @@ def harvest_cell_magics_and_commands(
     Scans code sources for cell magics, index URLs, auxiliary tools, and shell commands.
 
     Returns:
-        - harvested_packages: Set[str] (auxiliary tools installed via %pip / !pip / shell pip)
+        - harvested_packages: Set[str] (auxiliary tools installed via %pip / !pip)
         - base_index_urls: Set[str] (--index-url / -i base index overrides)
         - extra_index_urls: Set[str] (--extra-index-url supplemental indexes)
         - magic_warnings: List[str] (warnings for -r requirements.txt or unresolvable scripts)
@@ -395,21 +384,21 @@ def harvest_cell_magics_and_commands(
     magic_notices: List[str] = []
 
     for cell_idx, source in enumerate(code_sources, start=1):
-        cell_type, _ = classify_cell_source(source)
-
         for line in source.splitlines():
             clean_line = line.strip()
             if not clean_line or clean_line.startswith('#') or clean_line in SHELL_CELL_MAGICS:
                 continue
 
-            # Index URLs operate across the full raw line
-            for url in EXTRA_INDEX_PATTERN.findall(clean_line):
-                extra_index_urls.add(url.strip("'\""))
-            for url in BASE_INDEX_PATTERN.findall(clean_line):
-                if "--extra-index-url" not in clean_line:
-                    base_index_urls.add(url.strip("'\""))
+            # 1. Harvest Index URLs (Token-aware to prevent cross-flag pollution)
+            for match in EXTRA_INDEX_PATTERN.finditer(clean_line):
+                extra_index_urls.add(match.group(1).strip("'\""))
+            
+            for match in BASE_INDEX_PATTERN.finditer(clean_line):
+                full_match_str = match.group(0)
+                if not full_match_str.startswith("--extra-index-url"):
+                    base_index_urls.add(match.group(1).strip("'\""))
 
-            # Split chained command lines (e.g. "apt-get update && apt-get install -y graphviz")
+            # 2. Split chained commands (&&, ;) and evaluate segments
             command_segments = SHELL_SPLIT_PATTERN.split(clean_line)
 
             for segment in command_segments:
@@ -417,7 +406,6 @@ def harvest_cell_magics_and_commands(
                 if not seg:
                     continue
 
-                # 1. System Package Manager Calls (apt-get / brew / yum)
                 if SYSTEM_PKG_PATTERN.match(seg):
                     magic_notices.append(
                         f"ℹ️ System package manager call detected in cell {cell_idx} ('{seg}'); "
@@ -425,7 +413,6 @@ def harvest_cell_magics_and_commands(
                     )
                     continue
 
-                # 2. Conda Installs
                 if CONDA_INSTALL_PATTERN.match(seg):
                     magic_notices.append(
                         f"ℹ️ Conda installation detected in cell {cell_idx} ('{seg}'); "
@@ -433,7 +420,6 @@ def harvest_cell_magics_and_commands(
                     )
                     continue
 
-                # 3. Pip Installs (%pip, !pip, or bare pip inside %%bash)
                 pip_match = PIP_INSTALL_PATTERN.match(seg)
                 if pip_match:
                     args_str = pip_match.group(1)
@@ -449,10 +435,16 @@ def harvest_cell_magics_and_commands(
                     i = 0
                     while i < len(tokens):
                         token = tokens[i]
-                        if token in ("--extra-index-url", "--index-url", "-i", "-f", "--find-links", "-t", "--target"):
+                        
+                        if token in PIP_VALUE_FLAGS:
                             i += 2
                             continue
-                        if token.startswith('-') or token.lower() in PIP_IGNORE_FLAGS:
+                        
+                        if token.startswith('-') or token.lower() in PIP_SINGLE_FLAGS:
+                            i += 1
+                            continue
+
+                        if any(token.lower().startswith(prefix) for prefix in VCS_OR_PATH_PREFIXES):
                             i += 1
                             continue
 
@@ -469,6 +461,35 @@ def harvest_cell_magics_and_commands(
 # Maps extracted import names to active runtime versions via `pip freeze` 
 # and importlib metadata. Handles optional extras promotion (e.g., umap.plot -> umap-learn[plot]).
 # =====================================================================
+
+def build_auxiliary_tool_entries(
+    harvested_packages: Set[str],
+    imported_packages: Set[str],
+    frozen_env: Dict[str, str]
+) -> List[str]:
+    """
+    Builds commented-out manifest lines for CLI tools installed via cell magics
+    that are not directly imported in Python code.
+    """
+    aux_entries: List[str] = []
+    unimported_tools = sorted([
+        pkg for pkg in harvested_packages 
+        if pkg.lower() not in {imp.lower() for imp in imported_packages} and pkg.lower() not in STD_LIB
+    ])
+
+    if not unimported_tools:
+        return aux_entries
+
+    aux_entries.append("\n# --- AUXILIARY TOOL INSTALLS (harvested from cell magics) ---")
+    for tool in unimported_tools:
+        matched_pin = frozen_env.get(tool.lower())
+        if matched_pin:
+            aux_entries.append(f"# {matched_pin}  (installed via cell magic; not directly imported in Python code)")
+        else:
+            aux_entries.append(f"# {tool}  (installed via cell magic; not found in active env)")
+
+    return aux_entries
+
 
 def resolve_pypi_package_and_extras(
     imp: str, 
@@ -587,23 +608,39 @@ def get_installed_environment() -> Tuple[Dict[str, str], List[str]]:
 
 
 def process_package_requirements(
-    pinned_list: List[str], harvested_urls: Set[str]
+    pinned_list: List[str], 
+    harvested_urls: Set[str],
+    base_urls: Optional[Set[str]] = None,
+    auxiliary_entries: Optional[List[str]] = None
 ) -> Tuple[List[str], List[Tuple[str, List[str]]], List[str]]:
-    """Correlates pinned packages with harvested index URLs."""
+    """Correlates pinned packages with harvested base/extra index URLs and auxiliary tool entries."""
     manifest_output: List[str] = []
     local_tagged_info: List[Tuple[str, List[str]]] = []
     warnings: List[str] = []
     
-    if harvested_urls:
-        for url in sorted(harvested_urls):
+    # 1. Base index URL overrides (--index-url)
+    if base_urls:
+        for url in sorted(base_urls):
+            manifest_output.append(f"--index-url {url}")
+
+    # 2. Extra index URLs (--extra-index-url)
+    extra_urls = harvested_urls - (base_urls or set())
+    if extra_urls:
+        for url in sorted(extra_urls):
             manifest_output.append(f"--extra-index-url {url}")
 
+    # 3. Primary imported dependencies
     for item in pinned_list:
         manifest_output.append(item)
         if '+' in item:
-            local_tagged_info.append((item, list(harvested_urls)))
-            if not harvested_urls:
+            all_urls = sorted(harvested_urls.union(base_urls or set()))
+            local_tagged_info.append((item, all_urls))
+            if not all_urls:
                 warnings.append(item)
+
+    # 4. Auxiliary tool section
+    if auxiliary_entries:
+        manifest_output.extend(auxiliary_entries)
             
     return manifest_output, local_tagged_info, warnings
 
@@ -1081,7 +1118,12 @@ def apply_output_to_notebook(
     pinned_manifest, _ = build_manifest_entries(
         scan_res.imports, scan_res.submodules, frozen_env, pkg_dist_map, guarded_imports=scan_res.guarded_imports
     )
-    manifest_lines, local_tagged, _ = process_package_requirements(pinned_manifest, scan_res.harvested_urls)
+    harvested_pkgs, base_urls, extra_urls, _, _ = harvest_cell_magics_and_commands(scan_res.code_sources)
+    aux_entries = build_auxiliary_tool_entries(harvested_pkgs, scan_res.imports, frozen_env)
+    
+    manifest_lines, local_tagged, _ = process_package_requirements(
+        pinned_manifest, scan_res.harvested_urls, base_urls=base_urls, auxiliary_entries=aux_entries
+    )
     
     gpu_info: Optional[GpuInfo] = None
     if batch_hw_cache:
@@ -1209,7 +1251,13 @@ def main() -> None:
     pinned_manifest, promotion_notices = build_manifest_entries(
         imports, submodules, frozen_env, pkg_dist_map, guarded_imports=guarded_imports
     )
-    manifest_lines, local_tagged_info, warnings = process_package_requirements(pinned_manifest, harvested_urls)
+    
+    # Build auxiliary tool section
+    aux_entries = build_auxiliary_tool_entries(harvested_pkgs, imports, frozen_env)
+
+    manifest_lines, local_tagged_info, warnings = process_package_requirements(
+        pinned_manifest, harvested_urls, base_urls=base_urls, auxiliary_entries=aux_entries
+    )
     full_freeze_lines = raw_full_freeze if args.full_freeze else None
 
     # DIAGNOSTIC LOGGING (To stderr via logger)
