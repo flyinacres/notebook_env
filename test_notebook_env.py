@@ -594,3 +594,43 @@ class TestCellClassificationAndMagicHarvesting:
         harvested_pkgs, base_urls, extra_urls, warnings, notices = ne.harvest_cell_magics_and_commands(sources)
 
         assert any("requirements" in w.lower() for w in warnings)
+
+class TestIntegrationAndFormatting:
+    """Tests Phase 3 manifest section ordering, auxiliary package correlation, and index placement."""
+
+    def test_base_index_placed_at_top_of_manifest(self) -> None:
+        """--index-url appears at the very top of the generated manifest lines before dependencies."""
+        pinned = ["pandas==2.2.0", "torch==2.2.0"]
+        harvested_urls = {"https://download.pytorch.org/whl/cu121"}
+        base_urls = {"https://custom.pypi.org/simple"}
+
+        manifest_lines, _, _ = ne.process_package_requirements(
+            pinned, harvested_urls, base_urls=base_urls
+        )
+
+        assert manifest_lines[0] == "--index-url https://custom.pypi.org/simple"
+        assert manifest_lines[1] == "--extra-index-url https://download.pytorch.org/whl/cu121"
+
+    def test_auxiliary_tools_rendered_in_separate_commented_block(self) -> None:
+        """Unimported auxiliary packages harvested from magics are rendered in a dedicated commented block."""
+        imports = {"pandas"}
+        harvested_pkgs = {"gdown", "pandas"}  # pandas is already imported, gdown is aux-only
+        frozen_env = {"pandas": "pandas==2.2.0", "gdown": "gdown==5.1.0"}
+
+        aux_entries = ne.build_auxiliary_tool_entries(harvested_pkgs, imports, frozen_env)
+
+        assert len(aux_entries) == 2
+        assert aux_entries[0] == "\n# --- AUXILIARY TOOL INSTALLS (harvested from cell magics) ---"
+        assert "# gdown==5.1.0" in aux_entries[1]
+        assert "installed via cell magic" in aux_entries[1]
+
+    def test_uninstalled_auxiliary_tools_rendered_as_unpinned_comment(self) -> None:
+        """Auxiliary tools not found in the active environment render as unpinned commented entries."""
+        imports = set()
+        harvested_pkgs = {"awscli"}
+        frozen_env = {}
+
+        aux_entries = ne.build_auxiliary_tool_entries(harvested_pkgs, imports, frozen_env)
+
+        assert len(aux_entries) == 2
+        assert "# awscli  (installed via cell magic; not found in active env)" in aux_entries[1]
