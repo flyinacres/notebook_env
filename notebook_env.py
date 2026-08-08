@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-notebook_env.py (v30)
+notebook_env.py (v31)
 Headless Jupyter Notebook Dependency Scanner & Lockfile Generator.
 
 Standalone, zero-dependency utility for analyzing notebook environments,
@@ -83,6 +83,7 @@ class NotebookScanResult:
     dynamic_warnings: List[str] = field(default_factory=list)
     code_sources: List[str] = field(default_factory=list)
     harvested_urls: Set[str] = field(default_factory=set)
+    writefile_imports: Set[str] = field(default_factory=set)
 
     def __post_init__(self):
         if self.code_sources and not self.harvested_urls:
@@ -169,7 +170,7 @@ def extract_from_active_session() -> Tuple[Set[str], Dict[str, Set[str]], List[s
     """Path B (Live Kernel): Reads IPython execution history."""
     import __main__
     code_sources = [src for src in getattr(__main__, 'In', []) if src and isinstance(src, str)]
-    imports, submodules, _, guarded_imports, dyn_warnings = extract_from_active_session_internal(code_sources)
+    imports, submodules, code_sources, guarded_imports, dyn_warnings = extract_from_active_session_internal(code_sources)
     return imports, submodules, code_sources, guarded_imports, dyn_warnings
 
 
@@ -187,11 +188,13 @@ def extract_from_active_session_internal(code_sources: List[str]) -> Tuple[Set[s
 class NotebookImportVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.imports: Set[str] = set()
+        self.writefile_imports: Set[str] = set()
         self.submodules: Dict[str, Set[str]] = {}
         self.unconditional_imports: Set[str] = set()
         self.raw_guarded_imports: Set[str] = set()
         self.dynamic_import_warnings: List[str] = []
         self._guarded_depth: int = 0
+        self._in_writefile: bool = False
 
         # Track bound aliases for importlib and import_module
         self._importlib_aliases: Set[str] = {"importlib"}
@@ -200,6 +203,20 @@ class NotebookImportVisitor(ast.NodeVisitor):
     @property
     def guarded_imports(self) -> Set[str]:
         return self.raw_guarded_imports - self.unconditional_imports
+
+    def _record_import(self, base_pkg: str, full_name: Optional[str] = None) -> None:
+        if self._in_writefile:
+            self.writefile_imports.add(base_pkg)
+            return
+
+        self.imports.add(base_pkg)
+        if self._guarded_depth > 0:
+            self.raw_guarded_imports.add(base_pkg)
+        else:
+            self.unconditional_imports.add(base_pkg)
+
+        if full_name and '.' in full_name:
+            self.submodules.setdefault(base_pkg, set()).add(full_name)
 
     def visit_Try(self, node: ast.Try) -> None:
         self._guarded_depth += 1
@@ -214,34 +231,19 @@ class NotebookImportVisitor(ast.NodeVisitor):
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
             base_pkg = alias.name.split('.')[0]
-            self.imports.add(base_pkg)
-
             if alias.name == "importlib":
                 self._importlib_aliases.add(alias.asname or "importlib")
-
-            if self._guarded_depth > 0:
-                self.raw_guarded_imports.add(base_pkg)
-            else:
-                self.unconditional_imports.add(base_pkg)
-            if '.' in alias.name:
-                self.submodules.setdefault(base_pkg, set()).add(alias.name)
+            self._record_import(base_pkg, full_name=alias.name)
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         if node.module:
             base_pkg = node.module.split('.')[0]
-            self.imports.add(base_pkg)
-
             if node.module == "importlib":
                 for alias in node.names:
                     if alias.name == "import_module":
                         self._import_module_bindings.add(alias.asname or "import_module")
-
-            if self._guarded_depth > 0:
-                self.raw_guarded_imports.add(base_pkg)
-            else:
-                self.unconditional_imports.add(base_pkg)
-            self.submodules.setdefault(base_pkg, set()).add(node.module)
+            self._record_import(base_pkg, full_name=node.module)
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
@@ -262,13 +264,7 @@ class NotebookImportVisitor(ast.NodeVisitor):
             if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str):
                 imported_pkg = first_arg.value
                 base_pkg = imported_pkg.split('.')[0]
-                self.imports.add(base_pkg)
-                if self._guarded_depth > 0:
-                    self.raw_guarded_imports.add(base_pkg)
-                else:
-                    self.unconditional_imports.add(base_pkg)
-                if '.' in imported_pkg:
-                    self.submodules.setdefault(base_pkg, set()).add(imported_pkg)
+                self._record_import(base_pkg, full_name=imported_pkg)
             else:
                 expr_repr = ast.unparse(first_arg) if hasattr(ast, "unparse") else "expression"
                 self.dynamic_import_warnings.append(
@@ -281,7 +277,9 @@ class NotebookImportVisitor(ast.NodeVisitor):
 def extract_imports_from_sources(
     code_sources: List[str]
 ) -> Tuple[Set[str], Dict[str, Set[str]], Set[str], List[str]]:
-    """Extracts top-level imports, submodules, guarded imports, and dynamic warnings via AST."""
+    """
+    Extracts top-level imports, submodules, guarded imports, and dynamic warnings via AST.
+    """
     visitor = NotebookImportVisitor()
     for source in code_sources:
         cell_type, clean_body = classify_cell_source(source)
@@ -289,6 +287,8 @@ def extract_imports_from_sources(
         # Bypass AST parsing completely for shell scripts to avoid intentional SyntaxError drops
         if cell_type == "SHELL_SCRIPT":
             continue
+
+        visitor._in_writefile = (cell_type == "WRITEFILE")
 
         clean_source = "\n".join([
             line for line in clean_body.splitlines() 
@@ -300,7 +300,31 @@ def extract_imports_from_sources(
         except SyntaxError:
             continue
 
-    return visitor.imports, visitor.submodules, visitor.guarded_imports, visitor.dynamic_import_warnings
+    return (
+        visitor.imports, 
+        visitor.submodules, 
+        visitor.guarded_imports, 
+        visitor.dynamic_import_warnings
+    )
+
+
+def extract_writefile_imports_from_sources(code_sources: List[str]) -> Set[str]:
+    """Dedicated helper to extract writefile imports without altering extract_imports_from_sources signature."""
+    visitor = NotebookImportVisitor()
+    for source in code_sources:
+        cell_type, clean_body = classify_cell_source(source)
+        if cell_type == "WRITEFILE":
+            visitor._in_writefile = True
+            clean_source = "\n".join([
+                line for line in clean_body.splitlines() 
+                if not line.strip().startswith('%') and not line.strip().startswith('!')
+            ])
+            try:
+                tree = ast.parse(clean_source)
+                visitor.visit(tree)
+            except SyntaxError:
+                continue
+    return visitor.writefile_imports
 
 
 # =====================================================================
@@ -491,6 +515,36 @@ def build_auxiliary_tool_entries(
     return aux_entries
 
 
+def build_writefile_tool_entries(
+    writefile_imports: Set[str],
+    primary_imports: Set[str],
+    frozen_env: Dict[str, str]
+) -> List[str]:
+    """
+    Builds commented-out manifest lines for dependencies imported exclusively
+    inside %%writefile generated scripts.
+    """
+    entries: List[str] = []
+    script_only = sorted([
+        pkg for pkg in writefile_imports 
+        if pkg.lower() not in {imp.lower() for imp in primary_imports} and pkg.lower() not in STD_LIB
+    ])
+
+    if not script_only:
+        return entries
+
+    entries.append("\n# --- WRITEFILE SCRIPT DEPENDENCIES ---")
+    for pkg in script_only:
+        pypi_name = IMPORT_TO_PYPI_MAP.get(pkg, pkg)
+        matched_pin = frozen_env.get(pypi_name.lower())
+        if matched_pin:
+            entries.append(f"# {matched_pin}  (imported inside script generated via %%writefile)")
+        else:
+            entries.append(f"# {pypi_name}  (imported inside script generated via %%writefile; not found in active env)")
+
+    return entries
+
+
 def resolve_pypi_package_and_extras(
     imp: str, 
     submodules_set: Set[str], 
@@ -611,9 +665,10 @@ def process_package_requirements(
     pinned_list: List[str], 
     harvested_urls: Set[str],
     base_urls: Optional[Set[str]] = None,
-    auxiliary_entries: Optional[List[str]] = None
+    auxiliary_entries: Optional[List[str]] = None,
+    writefile_entries: Optional[List[str]] = None
 ) -> Tuple[List[str], List[Tuple[str, List[str]]], List[str]]:
-    """Correlates pinned packages with harvested base/extra index URLs and auxiliary tool entries."""
+    """Correlates pinned packages with harvested base/extra index URLs, auxiliary tool entries, and writefile script dependencies."""
     manifest_output: List[str] = []
     local_tagged_info: List[Tuple[str, List[str]]] = []
     warnings: List[str] = []
@@ -641,6 +696,10 @@ def process_package_requirements(
     # 4. Auxiliary tool section
     if auxiliary_entries:
         manifest_output.extend(auxiliary_entries)
+
+    # 5. Writefile script dependency section
+    if writefile_entries:
+        manifest_output.extend(writefile_entries)
             
     return manifest_output, local_tagged_info, warnings
 
@@ -939,7 +998,8 @@ def walk_and_scan_directory(target_dir: str) -> RepoEnvironmentMap:
             if file.endswith('.ipynb'):
                 full_path = Path(root) / file
                 success, imports, submodules, code_sources, err, lang_label, guarded_imports, dyn_warnings = extract_from_file(str(full_path), strict=True)
-                
+                writefile_imports = extract_writefile_imports_from_sources(code_sources)
+
                 parse_err = err if (not success and "Skipped non-Python notebook" not in (err or "")) else None                
                 res = NotebookScanResult(
                     path=full_path,
@@ -950,7 +1010,8 @@ def walk_and_scan_directory(target_dir: str) -> RepoEnvironmentMap:
                     submodules=submodules,
                     guarded_imports=guarded_imports,
                     dynamic_warnings=dyn_warnings,
-                    code_sources=code_sources
+                    code_sources=code_sources,
+                    writefile_imports=writefile_imports
                 )
                 repo_map.add_result(res)
 
@@ -1120,9 +1181,10 @@ def apply_output_to_notebook(
     )
     harvested_pkgs, base_urls, extra_urls, _, _ = harvest_cell_magics_and_commands(scan_res.code_sources)
     aux_entries = build_auxiliary_tool_entries(harvested_pkgs, scan_res.imports, frozen_env)
+    writefile_entries = build_writefile_tool_entries(scan_res.writefile_imports, scan_res.imports, frozen_env)
     
     manifest_lines, local_tagged, _ = process_package_requirements(
-        pinned_manifest, scan_res.harvested_urls, base_urls=base_urls, auxiliary_entries=aux_entries
+        pinned_manifest, scan_res.harvested_urls, base_urls=base_urls, auxiliary_entries=aux_entries, writefile_entries=writefile_entries
     )
     
     gpu_info: Optional[GpuInfo] = None
@@ -1233,9 +1295,12 @@ def main() -> None:
         if not success:
             logger.error(f"❌ Error: {error_msg}")
             sys.exit(1)
+            
+        writefile_imports = extract_writefile_imports_from_sources(code_sources)
     elif in_live_ipython:
         logger.info("🔍 [Path B] Analyzing live IPython session kernel history via AST...")
         imports, submodules, code_sources, guarded_imports, dyn_warnings = extract_from_active_session()
+        writefile_imports = extract_writefile_imports_from_sources(code_sources)
     else:
         parser.print_help()
         sys.exit(1)
@@ -1252,11 +1317,12 @@ def main() -> None:
         imports, submodules, frozen_env, pkg_dist_map, guarded_imports=guarded_imports
     )
     
-    # Build auxiliary tool section
+    # Build auxiliary tool and writefile dependency sections
     aux_entries = build_auxiliary_tool_entries(harvested_pkgs, imports, frozen_env)
+    writefile_entries = build_writefile_tool_entries(writefile_imports, imports, frozen_env)
 
     manifest_lines, local_tagged_info, warnings = process_package_requirements(
-        pinned_manifest, harvested_urls, base_urls=base_urls, auxiliary_entries=aux_entries
+        pinned_manifest, harvested_urls, base_urls=base_urls, auxiliary_entries=aux_entries, writefile_entries=writefile_entries
     )
     full_freeze_lines = raw_full_freeze if args.full_freeze else None
 
