@@ -277,14 +277,10 @@ class NotebookImportVisitor(ast.NodeVisitor):
 def extract_imports_from_sources(
     code_sources: List[str]
 ) -> Tuple[Set[str], Dict[str, Set[str]], Set[str], List[str]]:
-    """
-    Extracts top-level imports, submodules, guarded imports, and dynamic warnings via AST.
-    """
     visitor = NotebookImportVisitor()
     for source in code_sources:
         cell_type, clean_body = classify_cell_source(source)
 
-        # Bypass AST parsing completely for shell scripts to avoid intentional SyntaxError drops
         if cell_type == "SHELL_SCRIPT":
             continue
 
@@ -300,13 +296,15 @@ def extract_imports_from_sources(
         except SyntaxError:
             continue
 
+    # Subtract writefile-only imports from primary imports
+    primary_imports = visitor.imports - visitor.writefile_imports
+
     return (
-        visitor.imports, 
+        primary_imports, 
         visitor.submodules, 
         visitor.guarded_imports, 
         visitor.dynamic_import_warnings
     )
-
 
 def extract_writefile_imports_from_sources(code_sources: List[str]) -> Set[str]:
     """Dedicated helper to extract writefile imports without altering extract_imports_from_sources signature."""

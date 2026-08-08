@@ -216,18 +216,20 @@ class TestMagicSinkNotebook:
         assert any("conda" in n.lower() for n in notices)
         assert any("apt-get" in n or "yum" in n for n in notices)
 
-    def test_writefile_gap_is_visible_via_ast_today(self, magic_sink_notebook) -> None:
+
+    def test_writefile_imports_isolated_from_primary_imports(self, magic_sink_notebook) -> None:
         """
-        Documents the related-but-separate gap noted in the fixture: today,
-        extract_imports_from_sources() only strips lines starting with '%' or '!',
-        so a %%writefile cell's body (meant to be written to disk, not executed)
-        still gets AST-scanned and its imports folded in as if they were live,
-        unconditional top-level imports. classify_cell_source() can already tell
-        these cells apart, but that classification isn't used by the AST path yet.
+        Verifies that imports inside %%writefile cells are isolated from primary notebook
+        imports and extracted separately via extract_writefile_imports_from_sources.
         """
         success, imports, submodules, code_sources, err, lang, guarded, dyn_warns = (
             ne.extract_from_file(str(magic_sink_notebook))
         )
         assert success is True
-        assert "requests" in imports
-        assert "requests" not in guarded  # not guarded, just mislabeled as unconditional
+
+        # Primary notebook imports should NOT include requests (which only lives in %%writefile)
+        assert "requests" not in imports
+
+        # requests SHOULD be captured via the writefile extraction helper
+        writefile_imports = ne.extract_writefile_imports_from_sources(code_sources)
+        assert "requests" in writefile_imports

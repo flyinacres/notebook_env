@@ -634,3 +634,16 @@ class TestIntegrationAndFormatting:
 
         assert len(aux_entries) == 2
         assert "# awscli  (installed via cell magic; not found in active env)" in aux_entries[1]
+
+    def test_writefile_script_dependencies_rendered_in_separate_section(self) -> None:
+        """Dependencies imported exclusively inside %%writefile cells render in a dedicated block."""
+        primary_imports = {"pandas"}
+        writefile_imports = {"requests", "pandas"}  # pandas is in primary, requests is script-only
+        frozen_env = {"pandas": "pandas==2.30.0", "requests": "requests==2.31.0"}
+
+        entries = ne.build_writefile_tool_entries(writefile_imports, primary_imports, frozen_env)
+
+        assert len(entries) == 2
+        assert entries[0] == "\n# --- WRITEFILE SCRIPT DEPENDENCIES ---"
+        assert "# requests==2.31.0" in entries[1]
+        assert "imported inside script generated via %%writefile" in entries[1]
