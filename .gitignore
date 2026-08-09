@@ -13,3 +13,6 @@ __pycache__/
 pinned_requirements.txt
 *.ipynb_checkpoints/
 output_executed.ipynb
+
+test_notebooks/
+hugging_face/

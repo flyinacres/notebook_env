@@ -63,3 +63,147 @@ Missing Feature: Dynamic metadata lookup (e.g., inspecting importlib.metadata or
 Current State: The author runs notebook_env.py to obtain the blueprint, but testing whether pinned_requirements.txt installs cleanly requires running Cell 2 inside the notebook manually.
 
 Missing Feature: A --test or --verify flag in notebook_env.py that spins up a temporary virtual environment (venv), attempts a trial pip install -r pinned_requirements.txt, and verifies that all top-level imports load successfully before generating the output text.
+
+Updated Test Plan (v18 Synchronized)
+Here is the revised, fully accurate test matrix incorporating all fixes:
+
+Section 1: AST Parsing & Import Harvesting
+Positive:
+
+Standard imports (import numpy, from sklearn import ...).
+
+Submodule flattening (import torch.nn.functional → torch).
+
+Standard library filtering (os, sys, json, re ignored).
+
+Line/cell magics (%, %%) and shell commands (!) stripped prior to AST parsing.
+
+Negative:
+
+Syntax Errors: Cell 3 syntax error skipped gracefully without dropping valid imports from Cells 1, 2, 4.
+
+Empty Cells: Markdown-only or empty code cells return empty sets cleanly.
+
+Commented Imports: # import tensorflow as tf ignored by AST parser.
+
+Section 2: Index URL Harvesting (harvest_index_urls_from_sources)
+Positive:
+
+Standard --extra-index-url <URL> and -i <URL> flags captured.
+
+Single/double-quoted URLs handled correctly.
+
+Negative & Edge Cases:
+
+Commented-Out Commands (NEW): Lines like # !pip install ... --extra-index-url https://... are stripped first and not harvested.
+
+Malformed Flags: Trailing flags without URLs do not raise regex errors or capture invalid strings.
+
+Section 3: Ingestion Paths & CLI Resilience
+Positive:
+
+Path A (Disk File): Valid .ipynb file parses cells and returns imports, submodules, code_sources.
+
+Path B (Live Session): __main__.In parsed cleanly when get_ipython() is active and notebook path is omitted.
+
+Kernel Parameter Safety: Hidden kernel args like -f connection.json ignored by parse_known_args().
+
+Negative:
+
+Path A - Missing File: python notebook_env.py non_existent.ipynb → outputs ❌ Error: File not found and exits 1.
+
+Path A - Corrupted JSON (UPDATED): Invalid JSON file raises caught JSONDecodeError → outputs ❌ Error: Invalid notebook format and exits 1.
+
+CLI Bare Execution: Running with no args in a standard shell prints usage help and exits 1.
+
+Section 4: Hardware Acceleration Inspection
+Positive:
+
+PyTorch CUDA / MPS: Active device name captured in Step 1 Markdown.
+
+TensorFlow / JAX: Active device name captured in Step 1 Markdown.
+
+Multi-Framework Attribution (NEW): torch + tensorflow both imported, CUDA active on torch → Step 1 Markdown explicitly attributes hardware to PyTorch without mislabeling TensorFlow.
+
+Negative:
+
+Framework Imported, GPU Inactive: torch imported, cuda.is_available() = False → Terminal logs author warning ⚠️ Acceleration Framework imported, but NO active accelerator was found!.
+
+Missing Library: Framework imported in notebook but not installed on host machine → handles ImportError gracefully (has_gpu = False).
+
+Section 5: Requirements Correlation & Blueprint Generation
+Positive:
+
+Alias Mapping: cv2 → opencv-python, sklearn → scikit-learn, PIL → Pillow.
+
+Local Tag + Harvested URL (NEW): Package torch==2.3.1+cu121 WITH harvested index URL → --extra-index-url included in manifest, URL displayed in Step 1 Markdown, no author warning printed.
+
+Local Tag Without Harvested URL: Package custom==1.0.0+test WITHOUT index URL → explicit author warning printed with copy-paste !pip install template.
+
+Direct Blueprint Return Assertions (UPDATED): Assert directly against result["step1_markdown"] and result["step2_code"] without stdout capture.
+
+Negative:
+
+Uninstalled Import: Top-level import not found in active pip freeze → outputs # package (not found in active env) comment in manifest without crashing.
+
+
+
+Worth separating what's actually lost from what's actually kept, since "misses so much" is true but not evenly true across the tool's outputs.
+
+What tool 2 cannot do at all, since there's no live kernel: confirm installed versions, confirm GPU availability, catch dynamic imports. Those are real, permanent gaps, not implementation debt, they're the difference between static and live inspection.
+
+What it can still do reliably, since AST extraction is solid regardless of execution: produce the list of top level imports and map them to likely pypi package names, same as tool 1's static half. On its own that's not very differentiated. Someone can eyeball a notebook's imports in a few seconds, and pipreqs already does roughly this for plain scripts.
+
+Two things worth separating out, since they change the calculus:
+
+First, if the notebook's own code contains explicit pinned installs (!pip install torch==2.3.1), that's real, verifiable evidence you can harvest with the same regex approach already built for index URLs. Author intent captured in the file itself is a different and stronger signal than "we guessed the version from nothing."
+
+Second, and this is the one from your original project overview that hasn't been touched since the reframe: correlating a notebook's run date or kernel metadata against Kaggle's docker-python changelog to infer what the base image probably contained at that time. That's the one piece of value here that nothing else, not tool 1, not pipreqs, not collect_env, provides. It's an estimate, not a confirmed fact, but it's a genuinely useful estimate for exactly the failure mode your project overview names, silent breakage months later from base image drift.
+
+So I'd reframe the question. Tool 2 isn't a weaker version of tool 1, it's a different kind of tool answering a different question: not "what did this notebook confirm it used" but "what does the evidence in this file suggest it probably needs." As long as it's presented that way, hedged, evidence graded (explicit pin found vs. inferred from changelog vs. bare import with no version signal at all), it's consistent with the honesty bar you've held throughout. Where it'd become not worthwhile is if it gets presented with false confidence, a plain unpinned import shouldn't come out looking as solid as an explicit pin found in the code.
+
+Is the changelog correlation piece actually appealing to you still, or has your interest genuinely moved to tool 1 and this is more of a "should I officially retire it" conversation?
+
+
+
+
+
+Execution Plan for Phase 3
+To keep our process disciplined:
+
+Step 1 (Tests): Write unit tests covering index URL ordering (--index-url placed before --extra-index-url), auxiliary package section formatting, and requirement file warnings.
+
+Step 2 (Implementation): Update process_package_requirements, generate_production_blueprint, and build_manifest_entries to assemble these separate manifest blocks.
+
+Step 3 (Validation): Run pytest to confirm Phase 3 features pass seamlessly alongside existing tests.
+
+Kaggle######
+Any way to test if this will work without internet??
+
+
+Testing
+
+Sets of notebooks with a wide variety of settings
+Positive and negative tests--need tests to fail in many different ways
+	Missing imports, no internet, other issues?
+
+different environments: Kaggle, Colab, venv--is this sufficient
+Batch vs. non batch
+
+What types of notebooks users are there?  HOw do they use them?
+
+
+Found a paper on reproducibility: https://arxiv.org/pdf/2602.07195
+
+Looks like I can take their reproducible tests and run them through my system, first on the Kaggle docker image, then on a non-Kaggle system.
+
+For GPU based notebooks I'll will need to run them on Kaggle by hand.
+
+I can run a larger set through my code just to make sure my code doesn't crash.
+
+Either way, I'd stop treating "randomly sample from Reproducible" as your sampling strategy. Stratify instead — deliberately select your positive pool from the intersection of Error-Free Reproducible and "has ≥1 of: GPU framework import, hardware-tagged version string, pip/conda magic, submodule import matching a known extras package." That directly targets the feature surface you're trying to validate, rather than letting the label alone drive selection. You'll end up with a smaller pool, but a far more informative one — passing on a stratified hard set means something; passing on an unfiltered easy set doesn't tell you much either way.
+
+Note that I would still want to include the Train In Data notebooks in my tests...
+
+1. CPU Automated Validation ArchitectureTo run local automated tests on your Mac (or in CI/CD docker containers), you can build a wrapper script (e.g., test_real_world_notebooks.py) that executes an end-to-end extraction and dry-run verification loop:Validation Workflow StrategyFetch & Sample: Filter MLEModernizer notebooks for CPU-only execution (e.g., scikit-learn, pandas, basic stats/tabular pipelines, natural language processing without heavy local LLMs/transformers).Execute notebook_env (AST Scan):Pass the sampled .ipynb through extract_from_file() or run notebook_env.py via CLI.  Verify generated requirements outputs: Check that pinned_requirements.txt correctly harvested imports, mapped PyPI names (e.g., sklearn $\rightarrow$ scikit-learn), and captured any %pip / --extra-index-url flags.  Containerized Sanity Check (Docker):Spin up a clean base Python Docker image (or a Kaggle CPU base image gcr.io/kaggle-images/python).Inject pinned_requirements.txt into the container.Run pip install -r pinned_requirements.txt.Headlessly execute the notebook using jupyter nbconvert --execute or papermill.Pass Criteria: The environment resolves all dependencies without ModuleNotFoundError or unhandled package resolution errors.2. Testing Against Kaggle vs. Non-Kaggle Base EnvironmentsEnvironment LayerWhat It Tests in notebook_envWhy It MattersKaggle CPU Image (gcr.io/kaggle-images/python)Pre-installed battery test. Tests if notebook_env correctly identifies dependencies already satisfied by heavy base images versus missing ones.Kaggle images ship with hundreds of packages pre-installed; ensures notebook_env pins compatible runtime versions instead of breaking existing installations.Vanilla Python Image (python:3.11-slim or 3.12-slim)Clean slate test. Tests if pinned_requirements.txt is truly self-contained and complete from zero.  Validates that a user running your generated Cell 2 setup script in a blank local venv gets a working environment without hidden system/implicit assumptions.  3. Educational Notebooks (Train In Data) CoverageEducational notebooks are famous for "missing import" or "hidden setup cell" friction. They are perfect for testing notebook_env's auxiliary and guarded import logic:Guarded / Optional Imports: Verifies that imports tucked inside try/except blocks (often used by instructors for conditional fallback features) get properly cataloged as optional/commented dependencies rather than breaking hard installs.  %%writefile & Script Isolation: Course notebooks often use %%writefile script.py to demonstrate module building. notebook_env's isolated writefile_imports parser will ensure setup scripts don't accidentally pull classroom sample code into the main notebook's runtime manifest.  4. Manual GPU Verification Matrix (Colab / Kaggle)For GPU acceleration (PyTorch CUDA, JAX, TensorFlow GPU), manual verification on Colab or Kaggle fits well into a structured test matrix:Manual Test ProtocolsHardware Detection Logging: Run notebook_env on a GPU notebook inside Colab (with a GPU runtime connected).Expected: Logger should output: ⚡ Active accelerator detected: NVIDIA Tesla...  Cell 1 Output: Markdown setup header should include the Hardware Acceleration warning section explaining CUDA requirements.  Local Build / Extra Tag Warnings: Test notebooks that install specialized torch wheels (e.g., +cu121 or custom wheel URLs).Expected: process_package_requirements() flags local tag builds and appends --extra-index-url cleanly into the manifest payload.  
+
