@@ -159,3 +159,16 @@ class TestKitchenSinkNotebook:
 
         assert "umap-learn[plot]==0.5.5" in out
         assert "umap.plot" in caplog.text
+
+class TestPypiMapTranslations:
+    """Tests resolution of special case package translations."""
+
+    def test_import_to_pypi_translation_misses(self) -> None:
+        """dotenv resolves to python-dotenv and mpl_toolkits resolves to matplotlib."""
+        frozen_env = {}
+        
+        pin_dotenv, _ = ne.resolve_pypi_package_and_extras("dotenv", set(), frozen_env)
+        assert "python-dotenv" in pin_dotenv
+
+        pin_mpl, _ = ne.resolve_pypi_package_and_extras("mpl_toolkits", set(), frozen_env)
+        assert "matplotlib" in pin_mpl

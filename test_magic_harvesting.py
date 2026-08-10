@@ -233,3 +233,21 @@ class TestMagicSinkNotebook:
         # requests SHOULD be captured via the writefile extraction helper
         writefile_imports = ne.extract_writefile_imports_from_sources(code_sources)
         assert "requests" in writefile_imports
+
+
+class TestCellConsumingMagics:
+    """Tests handling of cell-consuming magics (%%sql, %%html, %%R)."""
+
+    def test_cell_consuming_magics_bypassed(self) -> None:
+        """Cell-consuming magics like %%sql, %%html, and %%R bypass AST parsing cleanly."""
+        sources = [
+            "%%sql\nSELECT * FROM users WHERE age > 21;\n",
+            "%%html\n<h1>Title</h1><p>Body text</p>\n",
+            "%%R\nlibrary(ggplot2)\n"
+        ]
+
+        # Ensure classify_cell_source handles or AST parser skips them without SyntaxError
+        for src in sources:
+            cell_type, clean_body = ne.classify_cell_source(src)
+            imports, submodules, guarded, warnings = ne.extract_imports_from_sources([src])
+            assert imports == set()

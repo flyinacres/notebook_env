@@ -94,6 +94,14 @@ class NotebookScanResult:
         if self.code_sources and not self.harvested_urls:
             self.harvested_urls = harvest_index_urls_from_sources(self.code_sources)
 
+# To be added to constants section of notebook_env.py
+
+PLATFORM_PSEUDO_MODULES: Set[str] = {
+    "dbutils",
+    "kaggle_secrets",
+    "google.colab",
+    "pyspark.dbutils"
+}
 
 # Mappings & Stdlib lookup
 IMPORT_TO_PYPI_MAP: Dict[str, str] = {
@@ -103,7 +111,9 @@ IMPORT_TO_PYPI_MAP: Dict[str, str] = {
     "yaml": "PyYAML",
     "bs4": "beautifulsoup4",
     "attr": "attrs",
-    "serial": "pyserial"
+    "serial": "pyserial",
+    "dotenv": "python-dotenv",
+    "mpl_toolkits": "matplotlib"
 }
 
 STD_LIB: Set[str] = set(sys.stdlib_module_names) if hasattr(sys, 'stdlib_module_names') else {
