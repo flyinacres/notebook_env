@@ -116,7 +116,7 @@ def main():
     with_hw_tags = [f for f in all_findings if f["hardware_tags"]]
     with_rel_import = [f for f in all_findings if f["relative_imports"]]
     with_parse_error = [f for f in all_findings if f["parse_error"]]
-    py2_notebooks = [f for f in all_findings if f["python_version"] and f["python_version"].startswith("2.")]
+    py2_notebooks = [f for f in all_findings if f["python_version"] and str(f["python_version"]).startswith("2.")]
 
     print("=" * 70)
     print("COVERAGE SUMMARY")
