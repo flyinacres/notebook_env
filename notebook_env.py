@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-notebook_env.py (v32)
+notebook_env.py (v33)
 Headless Jupyter Notebook Dependency Scanner & Lockfile Generator.
 
 Standalone, zero-dependency utility for analyzing notebook environments,
@@ -94,16 +94,8 @@ class NotebookScanResult:
         if self.code_sources and not self.harvested_urls:
             self.harvested_urls = harvest_index_urls_from_sources(self.code_sources)
 
-# To be added to constants section of notebook_env.py
 
-PLATFORM_PSEUDO_MODULES: Set[str] = {
-    "dbutils",
-    "kaggle_secrets",
-    "google.colab",
-    "pyspark.dbutils"
-}
-
-# Mappings & Stdlib lookup
+# Mappings, Platform Injections & Stdlib lookup
 IMPORT_TO_PYPI_MAP: Dict[str, str] = {
     "cv2": "opencv-python",
     "sklearn": "scikit-learn",
@@ -116,10 +108,36 @@ IMPORT_TO_PYPI_MAP: Dict[str, str] = {
     "mpl_toolkits": "matplotlib"
 }
 
+PLATFORM_PSEUDO_MODULES: Set[str] = {
+    "dbutils",
+    "kaggle_secrets",
+    "google.colab",
+    "pyspark.dbutils"
+}
+
 STD_LIB: Set[str] = set(sys.stdlib_module_names) if hasattr(sys, 'stdlib_module_names') else {
     "os", "sys", "re", "json", "ast", "subprocess", "datetime", "math", "random", 
     "time", "pathlib", "typing", "collections", "itertools", "functools", "shutil"
 }
+
+
+def discover_local_repo_modules(target_dir: str) -> Set[str]:
+    """Scans target_dir for local .py files and package directories containing __init__.py."""
+    local_mods: Set[str] = set()
+    target_path = Path(target_dir)
+    if not target_path.exists():
+        return local_mods
+
+    try:
+        for entry in target_path.iterdir():
+            if entry.is_file() and entry.suffix == ".py":
+                local_mods.add(entry.stem)
+            elif entry.is_dir() and (entry / "__init__.py").exists():
+                local_mods.add(entry.name)
+    except Exception:
+        pass
+
+    return local_mods
 
 
 # =====================================================================
@@ -561,9 +579,16 @@ def resolve_pypi_package_and_extras(
     submodules_set: Set[str], 
     frozen_env: Dict[str, str], 
     pkg_dist_map: Optional[Dict[str, List[str]]] = None,
-    is_guarded: bool = False
+    is_guarded: bool = False,
+    local_repo_modules: Optional[Set[str]] = None
 ) -> Tuple[str, Optional[str]]:
-    """Resolves top-level import to PyPI package name using memoized metadata first."""
+    """Resolves top-level import to PyPI package name, platform pseudo-module, or local repo module."""
+    if imp in PLATFORM_PSEUDO_MODULES:
+        return f"# {imp} (platform pseudo-module provided by runtime environment)", None
+
+    if local_repo_modules and imp in local_repo_modules:
+        return f"# {imp} (local repo module; not a PyPI package)", None
+
     pypi_name = None
     if pkg_dist_map is None and hasattr(importlib.metadata, "packages_distributions"):
         try:
@@ -620,7 +645,8 @@ def build_manifest_entries(
     submodules: Dict[str, Set[str]], 
     frozen_env: Dict[str, str], 
     pkg_dist_map: Optional[Dict[str, List[str]]] = None,
-    guarded_imports: Optional[Set[str]] = None
+    guarded_imports: Optional[Set[str]] = None,
+    local_repo_modules: Optional[Set[str]] = None
 ) -> Tuple[List[str], List[str]]:
     """Single shared helper for generating correlated pinned manifest entries."""
     pinned_manifest: List[str] = []
@@ -633,7 +659,7 @@ def build_manifest_entries(
         submods = submodules.get(imp, set())
         is_guarded = imp in guarded_set
         pin_entry, notice = resolve_pypi_package_and_extras(
-            imp, submods, frozen_env, pkg_dist_map=pkg_dist_map, is_guarded=is_guarded
+            imp, submods, frozen_env, pkg_dist_map=pkg_dist_map, is_guarded=is_guarded, local_repo_modules=local_repo_modules
         )
         pinned_manifest.append(pin_entry)
         if notice and notice not in promotion_notices:
@@ -955,6 +981,7 @@ class RepoEnvironmentMap:
         self.package_to_notebooks: Dict[str, List[Path]] = {}
         self.harvested_packages_to_notebooks: Dict[str, List[Path]] = {}
         self.url_to_notebooks: Dict[str, List[Path]] = {}
+        self.local_repo_modules: Set[str] = discover_local_repo_modules(target_dir)
 
     def add_result(self, result: NotebookScanResult) -> None:
         if result.parse_error:
@@ -1093,7 +1120,12 @@ def generate_batch_analysis_report(
 
     for res in repo_map.scan_results:
         pinned_entries, notes = build_manifest_entries(
-            res.imports, res.submodules, frozen_env, pkg_dist_map, guarded_imports=res.guarded_imports
+            res.imports, 
+            res.submodules, 
+            frozen_env, 
+            pkg_dist_map, 
+            guarded_imports=res.guarded_imports,
+            local_repo_modules=repo_map.local_repo_modules
         )
         for note in notes:
             if note not in promotions:
@@ -1113,6 +1145,8 @@ def generate_batch_analysis_report(
 
         for pin_entry in pinned_entries:
             if pin_entry.startswith("#"):
+                if "platform pseudo-module" in pin_entry or "local repo module" in pin_entry:
+                    continue
                 pypi_name = pin_entry.split()[1]
                 missing_packages.setdefault(pypi_name, []).append(res.path.name)
             else:
@@ -1121,7 +1155,7 @@ def generate_batch_analysis_report(
 
         # Process harvested magic packages
         for pkg in res.harvested_pkgs:
-            if pkg in STD_LIB:
+            if pkg in STD_LIB or pkg in PLATFORM_PSEUDO_MODULES or pkg in repo_map.local_repo_modules:
                 continue
             pypi_name = IMPORT_TO_PYPI_MAP.get(pkg, pkg)
             matched_pin = frozen_env.get(pypi_name.lower())
@@ -1213,7 +1247,12 @@ def generate_universal_manifest(
     pinned_entries_set: Set[str] = set()
     for res in repo_map.scan_results:
         entries, _ = build_manifest_entries(
-            res.imports, res.submodules, frozen_env, pkg_dist_map, guarded_imports=res.guarded_imports
+            res.imports, 
+            res.submodules, 
+            frozen_env, 
+            pkg_dist_map, 
+            guarded_imports=res.guarded_imports,
+            local_repo_modules=repo_map.local_repo_modules
         )
         pinned_entries_set.update(entries)
 
@@ -1234,11 +1273,17 @@ def apply_output_to_notebook(
     pkg_dist_map: Dict[str, List[str]], 
     batch_hw_cache: Optional[GpuInfo], 
     suffix: str = "_merged", 
-    in_place: bool = False
+    in_place: bool = False,
+    local_repo_modules: Optional[Set[str]] = None
 ) -> Path:
     """Writes per-notebook locked file or replaces cells in-place."""
     pinned_manifest, _ = build_manifest_entries(
-        scan_res.imports, scan_res.submodules, frozen_env, pkg_dist_map, guarded_imports=scan_res.guarded_imports
+        scan_res.imports, 
+        scan_res.submodules, 
+        frozen_env, 
+        pkg_dist_map, 
+        guarded_imports=scan_res.guarded_imports,
+        local_repo_modules=local_repo_modules
     )
     harvested_pkgs, base_urls, extra_urls, _, _ = harvest_cell_magics_and_commands(scan_res.code_sources)
     aux_entries = build_auxiliary_tool_entries(harvested_pkgs, scan_res.imports, frozen_env)
@@ -1331,8 +1376,13 @@ def main() -> None:
             logger.info(f"\n🚀 Writing per-notebook locked files ({'in-place' if args.in_place else 'suffix: ' + args.suffix})...")
             for res in repo_map.scan_results:
                 written_path = apply_output_to_notebook(
-                    res, frozen_env, pkg_dist_map, batch_hw_cache, 
-                    suffix=args.suffix, in_place=args.in_place
+                    res, 
+                    frozen_env, 
+                    pkg_dist_map, 
+                    batch_hw_cache, 
+                    suffix=args.suffix, 
+                    in_place=args.in_place,
+                    local_repo_modules=repo_map.local_repo_modules
                 )
                 logger.info(f"  • Updated '{written_path.name}'")
             logger.info("✅ Batch output complete.")
@@ -1347,6 +1397,9 @@ def main() -> None:
             in_live_ipython = True
     except ImportError:
         pass
+
+    target_single_file_dir = str(Path(args.notebook).parent) if (args.notebook and not os.path.isdir(args.notebook)) else "."
+    single_file_local_modules = discover_local_repo_modules(target_single_file_dir)
 
     if args.notebook and not os.path.isdir(args.notebook):
         logger.info(f"🔍 [Path A] Analyzing saved notebook file '{args.notebook}' via AST...")
@@ -1375,7 +1428,12 @@ def main() -> None:
 
     # Unified manifest building
     pinned_manifest, promotion_notices = build_manifest_entries(
-        imports, submodules, frozen_env, pkg_dist_map, guarded_imports=guarded_imports
+        imports, 
+        submodules, 
+        frozen_env, 
+        pkg_dist_map, 
+        guarded_imports=guarded_imports,
+        local_repo_modules=single_file_local_modules
     )
     
     # Build auxiliary tool and writefile dependency sections
