@@ -193,3 +193,32 @@ class TestBatchFailureModes:
         # Assert
         assert "--extra-index-url https://index.a.com" in manifest
         assert "--extra-index-url https://index.b.com" in manifest
+
+    def test_batch_magic_requirements_file_warning_aggregated(self, tmp_path, mock_batch_env):
+        frozen_env, pkg_dist_map = mock_batch_env
+        nb = {
+            "metadata": {"kernelspec": {"language": "python"}},
+            "cells": [{"cell_type": "code", "source": ["!pip install -r requirements.txt\n"]}]
+        }
+        (tmp_path / "req_warn.ipynb").write_text(json.dumps(nb))
+
+        repo_map = ne.walk_and_scan_directory(str(tmp_path))
+        report, is_clean = ne.generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, None)
+
+        assert is_clean is True
+        assert "requirements file" in report.lower()
+
+
+    def test_batch_magic_conda_notice_aggregated(self, tmp_path, mock_batch_env):
+        frozen_env, pkg_dist_map = mock_batch_env
+        nb = {
+            "metadata": {"kernelspec": {"language": "python"}},
+            "cells": [{"cell_type": "code", "source": ["%conda install lightgbm\n"]}]
+        }
+        (tmp_path / "conda_notice.ipynb").write_text(json.dumps(nb))
+
+        repo_map = ne.walk_and_scan_directory(str(tmp_path))
+        report, is_clean = ne.generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, None)
+
+        assert is_clean is True
+        assert "conda" in report.lower()

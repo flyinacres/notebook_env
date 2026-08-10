@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-notebook_env.py (v31)
+notebook_env.py (v32)
 Headless Jupyter Notebook Dependency Scanner & Lockfile Generator.
 
 Standalone, zero-dependency utility for analyzing notebook environments,
@@ -84,6 +84,11 @@ class NotebookScanResult:
     code_sources: List[str] = field(default_factory=list)
     harvested_urls: Set[str] = field(default_factory=set)
     writefile_imports: Set[str] = field(default_factory=set)
+    harvested_pkgs: Set[str] = field(default_factory=set)
+    base_index_urls: Set[str] = field(default_factory=set)
+    extra_index_urls: Set[str] = field(default_factory=set)
+    magic_warnings: List[str] = field(default_factory=list)
+    magic_notices: List[str] = field(default_factory=list)
 
     def __post_init__(self):
         if self.code_sources and not self.harvested_urls:
@@ -133,8 +138,6 @@ def detect_notebook_language(nb_data: Dict[str, Any], strict: bool = False) -> T
     if active_lang:
         return (active_lang == StatusLabel.PYTHON), active_lang
         
-    if strict:
-        return False, StatusLabel.MISSING_METADATA
     return True, "unspecified (assuming python)"
 
 
@@ -940,6 +943,7 @@ class RepoEnvironmentMap:
         self.parse_errors: List[NotebookScanResult] = []
         self.global_imports: Set[str] = set()
         self.package_to_notebooks: Dict[str, List[Path]] = {}
+        self.harvested_packages_to_notebooks: Dict[str, List[Path]] = {}
         self.url_to_notebooks: Dict[str, List[Path]] = {}
 
     def add_result(self, result: NotebookScanResult) -> None:
@@ -955,6 +959,11 @@ class RepoEnvironmentMap:
             if imp not in STD_LIB:
                 self.global_imports.add(imp)
                 self.package_to_notebooks.setdefault(imp, []).append(result.path)
+
+        for pkg in result.harvested_pkgs:
+            if pkg not in STD_LIB:
+                self.global_imports.add(pkg)
+                self.harvested_packages_to_notebooks.setdefault(pkg, []).append(result.path)
 
         for url in result.harvested_urls:
             self.url_to_notebooks.setdefault(url, []).append(result.path)
@@ -997,6 +1006,9 @@ def walk_and_scan_directory(target_dir: str) -> RepoEnvironmentMap:
                 full_path = Path(root) / file
                 success, imports, submodules, code_sources, err, lang_label, guarded_imports, dyn_warnings = extract_from_file(str(full_path), strict=True)
                 writefile_imports = extract_writefile_imports_from_sources(code_sources)
+                
+                h_pkgs, base_urls, extra_urls, m_warns, m_notices = harvest_cell_magics_and_commands(code_sources)
+                harvested_urls = base_urls.union(extra_urls)
 
                 parse_err = err if (not success and "Skipped non-Python notebook" not in (err or "")) else None                
                 res = NotebookScanResult(
@@ -1009,7 +1021,13 @@ def walk_and_scan_directory(target_dir: str) -> RepoEnvironmentMap:
                     guarded_imports=guarded_imports,
                     dynamic_warnings=dyn_warnings,
                     code_sources=code_sources,
-                    writefile_imports=writefile_imports
+                    harvested_urls=harvested_urls,
+                    writefile_imports=writefile_imports,
+                    harvested_pkgs=h_pkgs,
+                    base_index_urls=base_urls,
+                    extra_index_urls=extra_urls,
+                    magic_warnings=m_warns,
+                    magic_notices=m_notices
                 )
                 repo_map.add_result(res)
 
@@ -1060,6 +1078,8 @@ def generate_batch_analysis_report(
     missing_packages: Dict[str, List[str]] = {}
     promotions: List[str] = []
     dynamic_warnings: List[str] = []
+    aggregated_magic_warnings: List[str] = []
+    aggregated_magic_notices: List[str] = []
 
     for res in repo_map.scan_results:
         pinned_entries, notes = build_manifest_entries(
@@ -1073,6 +1093,14 @@ def generate_batch_analysis_report(
             if warn not in dynamic_warnings:
                 dynamic_warnings.append(warn)
 
+        for warn in res.magic_warnings:
+            if warn not in aggregated_magic_warnings:
+                aggregated_magic_warnings.append(warn)
+
+        for notice in res.magic_notices:
+            if notice not in aggregated_magic_notices:
+                aggregated_magic_notices.append(notice)
+
         for pin_entry in pinned_entries:
             if pin_entry.startswith("#"):
                 pypi_name = pin_entry.split()[1]
@@ -1080,6 +1108,18 @@ def generate_batch_analysis_report(
             else:
                 pkg_name = pin_entry.split("==")[0]
                 matched_packages.add(pkg_name)
+
+        # Process harvested magic packages
+        for pkg in res.harvested_pkgs:
+            if pkg in STD_LIB:
+                continue
+            pypi_name = IMPORT_TO_PYPI_MAP.get(pkg, pkg)
+            matched_pin = frozen_env.get(pypi_name.lower())
+            if matched_pin:
+                pkg_name = matched_pin.split("==")[0]
+                matched_packages.add(pkg_name)
+            else:
+                missing_packages.setdefault(pypi_name, []).append(res.path.name)
 
     out.append(f"📦 IMPORTED DEPENDENCY FOOTPRINT (Across {py_count} Python notebooks):")
     out.append(f"  • Installed & Matched: {len(matched_packages)} packages ({', '.join(sorted(matched_packages)[:5])}{'...' if len(matched_packages) > 5 else ''})")
@@ -1094,10 +1134,18 @@ def generate_batch_analysis_report(
         out.append("  • Uninstalled in active env: 0 packages")
     out.append("")
 
-    if dynamic_warnings:
-        out.append("⚠️ DYNAMIC IMPORTS DETECTED:")
+    if dynamic_warnings or aggregated_magic_warnings:
+        out.append("⚠️ WARNINGS DETECTED:")
         for warn in dynamic_warnings:
             out.append(f"  • {warn}")
+        for warn in aggregated_magic_warnings:
+            out.append(f"  • {warn}")
+        out.append("")
+
+    if aggregated_magic_notices:
+        out.append("ℹ️ NOTICES:")
+        for notice in aggregated_magic_notices:
+            out.append(f"  • {notice}")
         out.append("")
 
     if promotions:
@@ -1158,6 +1206,11 @@ def generate_universal_manifest(
             res.imports, res.submodules, frozen_env, pkg_dist_map, guarded_imports=res.guarded_imports
         )
         pinned_entries_set.update(entries)
+
+        aux_entries = build_auxiliary_tool_entries(res.harvested_pkgs, res.imports, frozen_env)
+        for aux in aux_entries:
+            if not aux.startswith("\n# ---"):
+                pinned_entries_set.add(aux)
 
     for entry in sorted(pinned_entries_set):
         lines.append(entry)

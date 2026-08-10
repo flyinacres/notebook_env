@@ -146,3 +146,61 @@ class TestBatchOrchestration:
         assert len(out_nb["cells"]) == 3
         assert "OLD CONTENT" not in out_nb["cells"][0]["source"][0]
         assert out_nb["cells"][0]["metadata"]["notebook_env"]["managed"] is True
+
+
+def test_batch_walk_populates_cell_magic_fields(tmp_path, mock_batch_env):
+    frozen_env, pkg_dist_map = mock_batch_env
+    
+    nb = {
+        "metadata": {"kernelspec": {"language": "python"}},
+        "cells": [{
+            "cell_type": "code", 
+            "source": [
+                "%pip install seaborn\n",
+                "!pip install -i https://index.foo.com custom_pkg\n"
+            ]
+        }]
+    }
+    nb_path = tmp_path / "magic_test.ipynb"
+    nb_path.write_text(json.dumps(nb))
+
+    repo_map = ne.walk_and_scan_directory(str(tmp_path))
+    assert len(repo_map.scan_results) == 1
+    
+    res = repo_map.scan_results[0]
+    assert "seaborn" in res.harvested_pkgs
+    assert "custom_pkg" in res.harvested_pkgs
+    assert "https://index.foo.com" in res.base_index_urls
+    assert "https://index.foo.com" in res.harvested_urls
+
+
+    def test_batch_report_surfaces_unimported_magic_packages(tmp_path, mock_batch_env):
+        frozen_env, pkg_dist_map = mock_batch_env
+        
+        nb = {
+            "metadata": {"kernelspec": {"language": "python"}},
+            "cells": [{"cell_type": "code", "source": ["!pip install gdown\n"]}]
+        }
+        nb_path = tmp_path / "unimported_magic.ipynb"
+        nb_path.write_text(json.dumps(nb))
+
+        repo_map = ne.walk_and_scan_directory(str(tmp_path))
+        report, is_clean = ne.generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, None)
+
+        assert "gdown" in report
+
+
+    def test_universal_manifest_includes_magic_packages(tmp_path, mock_batch_env):
+        frozen_env, pkg_dist_map = mock_batch_env
+        
+        nb = {
+            "metadata": {"kernelspec": {"language": "python"}},
+            "cells": [{"cell_type": "code", "source": ["!pip install gdown\n"]}]
+        }
+        nb_path = tmp_path / "magic_manifest.ipynb"
+        nb_path.write_text(json.dumps(nb))
+
+        repo_map = ne.walk_and_scan_directory(str(tmp_path))
+        uni_manifest = ne.generate_universal_manifest(repo_map, frozen_env, pkg_dist_map)
+
+        assert "gdown" in uni_manifest
