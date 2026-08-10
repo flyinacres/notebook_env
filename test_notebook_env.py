@@ -471,6 +471,22 @@ class TestGpuInspection:
         assert result is not None
         assert result["has_gpu"] is False
 
+    def test_fastai_transitive_torch_gpu_detection(self, monkeypatch) -> None:
+        fake_torch = types.ModuleType("torch")
+        fake_torch.cuda = types.SimpleNamespace(
+            is_available=lambda: True,
+            get_device_name=lambda i: "NVIDIA RTX 3090",
+        )
+        fake_torch.backends = types.SimpleNamespace(mps=types.SimpleNamespace(is_available=lambda: False))
+        _install_fake_module(monkeypatch, "torch", fake_torch)
+
+        # Note: imported_packages contains 'fastai' but NOT 'torch' directly
+        result: Optional[GpuInfo] = ne.inspect_gpu_environment({"fastai"})
+        assert result is not None
+        assert result["has_gpu"] is True
+        assert result["active_framework"] == "PyTorch"
+        assert "RTX 3090" in result["device_name"]
+
 
 # =====================================================================
 # 6. REQUIREMENT CORRELATION & BLUEPRINT GENERATION

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-notebook_env.py (v33)
+notebook_env.py (v34)
 Headless Jupyter Notebook Dependency Scanner & Lockfile Generator.
 
 Standalone, zero-dependency utility for analyzing notebook environments,
@@ -28,8 +28,8 @@ import re
 import sys
 import argparse
 import logging
-import subprocess
 import warnings
+import subprocess
 import importlib.metadata
 from pathlib import Path
 from datetime import datetime
@@ -114,6 +114,15 @@ PLATFORM_PSEUDO_MODULES: Set[str] = {
     "kaggle_secrets",
     "google.colab",
     "pyspark.dbutils"
+}
+
+TRANSITIVE_FRAMEWORK_MAP: Dict[str, str] = {
+    "fastai": "torch",
+    "torchvision": "torch",
+    "torchaudio": "torch",
+    "timm": "torch",
+    "keras": "tensorflow",
+    "flax": "jax",
 }
 
 STD_LIB: Set[str] = set(sys.stdlib_module_names) if hasattr(sys, 'stdlib_module_names') else {
@@ -330,6 +339,7 @@ def extract_imports_from_sources(
         except SyntaxError:
             continue
 
+    # Subtract writefile-only imports from primary imports
     primary_imports = visitor.imports - visitor.writefile_imports
 
     return (
@@ -340,6 +350,7 @@ def extract_imports_from_sources(
     )
 
 def extract_writefile_imports_from_sources(code_sources: List[str]) -> Set[str]:
+    """Dedicated helper to extract writefile imports without altering extract_imports_from_sources signature."""
     visitor = NotebookImportVisitor()
     for source in code_sources:
         cell_type, clean_body = classify_cell_source(source)
@@ -751,9 +762,28 @@ def process_package_requirements(
 # =====================================================================
 
 def inspect_gpu_environment(imported_packages: Set[str]) -> Optional[GpuInfo]:
-    """Per-framework GPU/accelerator inspection logic."""
+    """Per-framework GPU/accelerator inspection logic including transitive wrapper resolution."""
     gpu_frameworks = {"torch", "tensorflow", "jax"}
-    found_frameworks = list(gpu_frameworks.intersection(imported_packages))
+    
+    # Expand imported packages with transitive framework dependencies
+    expanded_imports = set(imported_packages)
+    for pkg in imported_packages:
+        base_fw = TRANSITIVE_FRAMEWORK_MAP.get(pkg)
+        if base_fw:
+            expanded_imports.add(base_fw)
+        else:
+            # Dynamic fallback via importlib metadata if installed in host environment
+            try:
+                reqs = importlib.metadata.requires(pkg) or []
+                for req in reqs:
+                    req_lower = req.lower()
+                    for fw in gpu_frameworks:
+                        if fw in req_lower:
+                            expanded_imports.add(fw)
+            except Exception:
+                pass
+
+    found_frameworks = list(gpu_frameworks.intersection(expanded_imports))
     
     if not found_frameworks:
         return None
@@ -1354,11 +1384,21 @@ def main() -> None:
     # Environment inspection
     frozen_env, raw_full_freeze = get_installed_environment()
     pkg_dist_map = importlib.metadata.packages_distributions() if hasattr(importlib.metadata, "packages_distributions") else {}
-    batch_hw_cache = inspect_gpu_environment({"torch", "tensorflow", "jax"})
+    
+    # Pre-harvest all imported framework dependencies for hardware checks
+    target_batch_dir = args.batch or (args.notebook if args.notebook and os.path.isdir(args.notebook) else None)
+    initial_imports = {"torch", "tensorflow", "jax"}
+    
+    if target_batch_dir:
+        repo_map_pre = walk_and_scan_directory(target_batch_dir)
+        initial_imports.update(repo_map_pre.global_imports)
+    elif args.notebook and os.path.isfile(args.notebook):
+        _, single_imports, _, _, _, _, _, _ = extract_from_file(args.notebook, strict=False)
+        initial_imports.update(single_imports)
+
+    batch_hw_cache = inspect_gpu_environment(initial_imports)
 
     # --- BATCH DISPATCH ---
-    target_batch_dir = args.batch or (args.notebook if args.notebook and os.path.isdir(args.notebook) else None)
-
     if target_batch_dir:
         repo_map = walk_and_scan_directory(target_batch_dir)
         report_text, is_clean = generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, batch_hw_cache)
