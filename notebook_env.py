@@ -29,6 +29,7 @@ import sys
 import argparse
 import logging
 import subprocess
+import warnings
 import importlib.metadata
 from pathlib import Path
 from datetime import datetime
@@ -322,12 +323,13 @@ def extract_imports_from_sources(
             if not line.strip().startswith('%') and not line.strip().startswith('!')
         ])
         try:
-            tree = ast.parse(clean_source)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=SyntaxWarning)
+                tree = ast.parse(clean_source)
             visitor.visit(tree)
         except SyntaxError:
             continue
 
-    # Subtract writefile-only imports from primary imports
     primary_imports = visitor.imports - visitor.writefile_imports
 
     return (
@@ -338,7 +340,6 @@ def extract_imports_from_sources(
     )
 
 def extract_writefile_imports_from_sources(code_sources: List[str]) -> Set[str]:
-    """Dedicated helper to extract writefile imports without altering extract_imports_from_sources signature."""
     visitor = NotebookImportVisitor()
     for source in code_sources:
         cell_type, clean_body = classify_cell_source(source)
@@ -349,7 +350,9 @@ def extract_writefile_imports_from_sources(code_sources: List[str]) -> Set[str]:
                 if not line.strip().startswith('%') and not line.strip().startswith('!')
             ])
             try:
-                tree = ast.parse(clean_source)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", category=SyntaxWarning)
+                    tree = ast.parse(clean_source)
                 visitor.visit(tree)
             except SyntaxError:
                 continue

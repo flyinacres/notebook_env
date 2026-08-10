@@ -10,6 +10,7 @@ blueprint generation, and runtime sandbox execution.
 import json
 import sys
 import types
+import warnings
 import importlib.metadata
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Any
@@ -76,6 +77,20 @@ class TestImportExtraction:
         imports, _, _, _ = ne.extract_imports_from_sources(sources)
         assert "tensorflow" not in imports
         assert "json" in imports
+
+    def test_syntax_warning_suppressed_during_ast_parse(self) -> None:
+        sources = [
+            "x = '\\w+\\d+'\n"
+            "import math"
+        ]
+        
+        with warnings.catch_warnings(record=True) as recorded_warnings:
+            warnings.simplefilter("always")
+            imports, _, _, _ = ne.extract_imports_from_sources(sources)
+            
+        syntax_warnings = [w for w in recorded_warnings if issubclass(w.category, SyntaxWarning)]
+        assert len(syntax_warnings) == 0
+        assert "math" in imports
 
 
 class TestGuardedImports:
