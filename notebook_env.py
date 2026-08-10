@@ -1381,6 +1381,11 @@ def main() -> None:
     elif args.verbose:
         logger.setLevel(logging.DEBUG)
 
+    # Pre-flight argument validation: Output flags without target
+    if (args.output or args.in_place) and not args.batch and not args.notebook:
+        logger.error("❌ Error: --output or --in-place requires a target notebook file path or --batch directory.")
+        sys.exit(1)
+
     # Environment inspection
     frozen_env, raw_full_freeze = get_installed_environment()
     pkg_dist_map = importlib.metadata.packages_distributions() if hasattr(importlib.metadata, "packages_distributions") else {}
@@ -1398,14 +1403,16 @@ def main() -> None:
 
     batch_hw_cache = inspect_gpu_environment(initial_imports)
 
+    # =====================================================================
     # --- BATCH DISPATCH ---
+    # =====================================================================
     if target_batch_dir:
         repo_map = walk_and_scan_directory(target_batch_dir)
         report_text, is_clean = generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, batch_hw_cache)
         print(report_text)
 
-        if not is_clean and (args.universal or args.output):
-            logger.error("\n❌ Execution aborted: Resolve file/parse errors before running --universal or --output.")
+        if not is_clean and (args.universal or args.output or args.in_place):
+            logger.error("\n❌ Execution aborted: Resolve file/parse errors before running --universal, --output, or --in-place.")
             sys.exit(1)
 
         if args.universal:
@@ -1415,7 +1422,8 @@ def main() -> None:
                 f.write(uni_content)
             logger.info(f"\n✅ Wrote universal repository manifest to '{out_file}'")
 
-        if args.output:
+        # BATCH DISPATCH FIX: Triggers on args.output OR args.in_place
+        if args.output or args.in_place:
             logger.info(f"\n🚀 Writing per-notebook locked files ({'in-place' if args.in_place else 'suffix: ' + args.suffix})...")
             for res in repo_map.scan_results:
                 written_path = apply_output_to_notebook(
@@ -1432,7 +1440,9 @@ def main() -> None:
 
         sys.exit(0)
 
+    # =====================================================================
     # --- SINGLE FILE / LIVE SESSION DISPATCH ---
+    # =====================================================================
     in_live_ipython = False
     try:
         from IPython import get_ipython
@@ -1536,12 +1546,8 @@ def main() -> None:
         magic_notices=magic_notices
     )
 
-    # --- SINGLE-FILE DISK WRITE ROUTING ---
+    # SINGLE-FILE DISK WRITE FIX: Triggers on args.output OR args.in_place
     if args.output or args.in_place:
-        if not args.notebook or os.path.isdir(args.notebook):
-            logger.error("❌ Error: --output or --in-place on single-file mode requires a valid notebook file path.")
-            sys.exit(1)
-
         logger.info(f"🚀 Writing updated notebook ({'in-place' if args.in_place else 'suffix: ' + args.suffix})...")
         written_path = apply_output_to_notebook(
             single_res,
