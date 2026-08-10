@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-notebook_env.py (v34)
+notebook_env.py (v35)
 Headless Jupyter Notebook Dependency Scanner & Lockfile Generator.
 
 Standalone, zero-dependency utility for analyzing notebook environments,
@@ -8,8 +8,8 @@ detecting GPU/accelerator requirements, harvesting index URLs, and emitting
 reproducible lockfile manifests (`pinned_requirements.txt`).
 
 Execution Modes:
-  1. Single Notebook CLI:  python notebook_env.py notebook.ipynb
-  2. Batch Repo Directory: python notebook_env.py --batch ./repo --universal
+  1. Single Notebook CLI:  python notebook_env.py notebook.ipynb [--output | --in-place]
+  2. Batch Repo Directory: python notebook_env.py --batch ./repo --universal [--output | --in-place]
   3. Live IPython Kernel:   import notebook_env as ne; ne.main()
 
 For full usage, CLI flag documentation, and architectural details, see README.md.
@@ -1366,7 +1366,7 @@ def main() -> None:
     parser.add_argument("--quiet", action="store_true", help="Suppress diagnostic and status logging outputs.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose debug output.")
     
-    # Batch Flags
+    # Batch / Output Flags
     parser.add_argument("--batch", metavar="DIR", help="Run in batch mode across all notebooks in specified directory.")
     parser.add_argument("--analyze", action="store_true", help="Run batch analysis mode (default when --batch is provided).")
     parser.add_argument("--universal", action="store_true", help="Generate root requirements-all.txt universal manifest.")
@@ -1517,6 +1517,45 @@ def main() -> None:
             logger.info(note)
         logger.info("")
 
+    # Construct scan result for single-file disk output
+    single_res = NotebookScanResult(
+        path=Path(args.notebook) if args.notebook and not os.path.isdir(args.notebook) else Path("session.ipynb"),
+        is_python=True,
+        lang_label=StatusLabel.PYTHON,
+        imports=imports,
+        submodules=submodules,
+        guarded_imports=guarded_imports,
+        dynamic_warnings=dyn_warnings,
+        code_sources=code_sources,
+        harvested_urls=harvested_urls,
+        writefile_imports=writefile_imports,
+        harvested_pkgs=harvested_pkgs,
+        base_index_urls=base_urls,
+        extra_index_urls=extra_urls,
+        magic_warnings=magic_warns,
+        magic_notices=magic_notices
+    )
+
+    # --- SINGLE-FILE DISK WRITE ROUTING ---
+    if args.output or args.in_place:
+        if not args.notebook or os.path.isdir(args.notebook):
+            logger.error("❌ Error: --output or --in-place on single-file mode requires a valid notebook file path.")
+            sys.exit(1)
+
+        logger.info(f"🚀 Writing updated notebook ({'in-place' if args.in_place else 'suffix: ' + args.suffix})...")
+        written_path = apply_output_to_notebook(
+            single_res,
+            frozen_env,
+            pkg_dist_map,
+            gpu_info,
+            suffix=args.suffix,
+            in_place=args.in_place,
+            local_repo_modules=single_file_local_modules
+        )
+        logger.info(f"✅ Updated '{written_path.name}'")
+        sys.exit(0)
+
+    # DEFAULT SINGLE-FILE EMISSION (stdout)
     blueprint = generate_production_blueprint(
         manifest_lines, 
         full_freeze_lines=full_freeze_lines, 
@@ -1524,7 +1563,6 @@ def main() -> None:
         gpu_info=gpu_info
     )
 
-    # DELIVERABLE OUTPUT (To stdout via print)
     print("--- [ STEP 1: PASTE INTO CELL 1 (MARKDOWN) ] ---\n")
     print(blueprint["step1_markdown"])
     print("\n" + "="*80 + "\n")

@@ -149,16 +149,18 @@ def test_inplace_idempotency_rerun(sample_notebook_file, mock_frozen_env):
 
 
 # =====================================================================
-# TIER 2: SUBPROCESS CLI PLUMBING TESTS (Real Interpreter / No Package Asserts)
+# TIER 2: SUBPROCESS CLI PLUMBING TESTS (Explicit UTF-8 Subprocess Handles)
 # =====================================================================
 
 def test_cli_single_file_inplace(sample_notebook_file):
     """CLI test for single-file --in-place execution."""
     cmd = [sys.executable, "notebook_env.py", str(sample_notebook_file), "--in-place"]
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
     assert res.returncode == 0
-    assert "Updated" in res.stderr or "Updated" in res.stdout
+    stdout = res.stdout or ""
+    stderr = res.stderr or ""
+    assert "Updated" in stdout or "Updated" in stderr
 
     with open(sample_notebook_file, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -170,7 +172,7 @@ def test_cli_single_file_inplace(sample_notebook_file):
 def test_cli_single_file_output_companion(sample_notebook_file):
     """CLI test for single-file --output companion execution."""
     cmd = [sys.executable, "notebook_env.py", str(sample_notebook_file), "--output"]
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
     assert res.returncode == 0
     companion = sample_notebook_file.parent / "test_notebook_merged.ipynb"
@@ -192,7 +194,7 @@ def test_cli_batch_output_and_inplace(tmp_path, sample_notebook_data):
         json.dump(sample_notebook_data, f)
 
     cmd = [sys.executable, "notebook_env.py", "--batch", str(tmp_path), "--output", "--in-place"]
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
     assert res.returncode == 0
 
