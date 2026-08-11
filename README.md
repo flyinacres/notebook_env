@@ -11,14 +11,14 @@ You don't need to be a software engineer to use it. This guide assumes you know 
 1. Finish your notebook. Run it from the top, in a fresh kernel (a fresh kernel means: restart it first, so nothing left over from earlier experimenting is still sitting in memory), so what you're about to check reflects what the notebook actually needs, not leftover state from something you tried and abandoned earlier.
 2. Get the tool next to your work:
    - **On your own computer:** download `notebook_env.py` and put it in the same folder as your notebook.
-   - **On Kaggle or Colab:** copy the entire contents of `notebook_env.py` and paste it into a new, empty cell in your notebook.
+   - **On Kaggle or Colab:** copy the entire contents of `notebook_env.py` and paste it into a new, empty cell in your notebook. It's a lot of code, but you will be able to delete it after running it.
 3. Run it:
    - **On your own computer**, open a terminal in that folder and run:
      ```bash
      python notebook_env.py your_notebook.ipynb
      ```
    - **On Kaggle or Colab**, just run the cell you pasted it into.
-4. It prints two blocks of text. Copy the first block into a new **Markdown** cell, and the second block into a new **Code** cell. Put both at the very top of your notebook, above everything else you've written.
+4. It prints two blocks of text. Copy the first block into a new **Markdown** cell, and the second block into a new **Code** cell. Put both at the very top of your notebook, above everything else you've written. Now, if you pasted the notebook_env.py code into a cell, you can safely delete that cell. 
 5. Save and share the notebook. When someone else opens it and runs it top to bottom, your new first two cells run first and set their environment up to match yours, automatically.
 
 That's the whole workflow for the common case. Everything past this point is either "here's what those two cells actually contain and mean," or "here's what to do if something looks off" — you can stop reading here and come back later if you hit a question.
