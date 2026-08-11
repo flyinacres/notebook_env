@@ -1,34 +1,44 @@
-# Notebook Environment-Lock Tool (v29)
+# Notebook Environment Setup Tool
 
-A dependency and hardware-requirement scanner for Jupyter/Kaggle notebooks. It looks at what your notebook actually imports, checks that against what's installed in your session, and hands you two cells to paste in so the notebook still runs the same way when someone else opens it.
+**What this does, in one sentence:** it looks at what your notebook actually needs to run, and gives you two cells to paste in so it still works the same way when someone else opens it.
 
-It's a single, standalone script. Nothing to install, no dependencies of its own — download it, or paste it into a cell, and run it.
+You don't need to be a software engineer to use it. This guide assumes you know how to run a notebook cell and use `pip install` — nothing more. Anywhere this guide uses a term you might not know, it's explained the first time it comes up, and there's a short glossary at the end.
 
-## Quick Start
+---
 
-1. Finish your notebook and run it top to bottom in a fresh kernel, so your environment reflects what the notebook actually needs.
-2. Get `notebook_env.py` next to your notebook, or paste its contents into a new cell if you're on Kaggle or Colab (see Usage below for which fits your setup).
+## Quick start
+
+1. Finish your notebook. Run it from the top, in a fresh kernel (a fresh kernel means: restart it first, so nothing left over from earlier experimenting is still sitting in memory), so what you're about to check reflects what the notebook actually needs, not leftover state from something you tried and abandoned earlier.
+2. Get the tool next to your work:
+   - **On your own computer:** download `notebook_env.py` and put it in the same folder as your notebook.
+   - **On Kaggle or Colab:** copy the entire contents of `notebook_env.py` and paste it into a new, empty cell in your notebook.
 3. Run it:
+   - **On your own computer**, open a terminal in that folder and run:
+     ```bash
+     python notebook_env.py your_notebook.ipynb
+     ```
+   - **On Kaggle or Colab**, just run the cell you pasted it into.
+4. It prints two blocks of text. Copy the first block into a new **Markdown** cell, and the second block into a new **Code** cell. Put both at the very top of your notebook, above everything else you've written.
+5. Save and share the notebook. When someone else opens it and runs it top to bottom, your new first two cells run first and set their environment up to match yours, automatically.
 
-   ```bash
-   python notebook_env.py your_notebook.ipynb
-   ```
+That's the whole workflow for the common case. Everything past this point is either "here's what those two cells actually contain and mean," or "here's what to do if something looks off" — you can stop reading here and come back later if you hit a question.
 
-4. It prints two blocks. Paste the first into a new Markdown cell and the second into a new code cell, both at the very top of your notebook, above everything else.
-5. Save and share the notebook. Whoever opens it next runs your new first two cells before anything else, and their environment gets set up to match yours.
+---
 
-That's the whole workflow. Here's roughly what the two pasted cells look like (shortened):
+## What you'll get back
 
-**Cell 1 (Markdown):**
+Here's a real (shortened) example of the two cells it hands you.
+
+**Cell 1 (Markdown) — explains what's about to happen:**
 
 > ### 🛠️ Environment Setup & Dependency Verification
 >
 > This notebook includes a pinned environment manifest (`pinned_requirements.txt`) to ensure reproducible execution.
 >
 > - **Dependency Sync:** Cell 2 will verify your active Python version and apply the exact package manifest recorded by the author.
-> - **Hardware Acceleration:** This notebook was created using an active accelerator (`NVIDIA GeForce RTX 3090`, verified via PyTorch). _(only shown if a GPU was actually detected)_
+> - **Hardware Acceleration:** This notebook was created using an active accelerator (`NVIDIA GeForce RTX 3090`, verified via PyTorch). *(only appears if a GPU was actually detected — see "Messages you might see" below)*
 
-**Cell 2 (Code):**
+**Cell 2 (Code) — actually checks and installs things:**
 
 ```python
 # =====================================================================
@@ -37,7 +47,7 @@ That's the whole workflow. Here's roughly what the two pasted cells look like (s
 import sys, subprocess
 
 REQUIRED_PYTHON = (3, 11)
-# ... checks your Python version matches, warns (doesn't block) on a minor mismatch ...
+# ... checks your Python version matches, warns (but doesn't stop) on a small mismatch ...
 
 requirements_content = """# Tested top-level packages for this notebook
 numpy==1.26.4
@@ -45,122 +55,126 @@ pandas==2.2.1
 scikit-learn==1.4.2
 # cupy (imported as 'cupy' in try/except or conditional block - optional fallback)
 """
-# ... writes pinned_requirements.txt and runs `pip install -r` on it ...
+# ... writes that list to a file called pinned_requirements.txt, then installs it with pip ...
 ```
 
-Notice the last line: `cupy` is commented out because the original notebook only imports it inside a `try/except`, so it's flagged as optional rather than forced on everyone who runs the notebook.
+Two things worth pointing out in that example, since they show up a lot:
 
-The rest of this document covers the workflow in more depth, batch scanning many notebooks at once, and the honest list of what this tool can't currently do. If you just want to run it once on your own notebook, the steps above are everything you need.
+- `==1.26.4` means "exactly this version, no substitutes." This is called **pinning** — it's how the tool guarantees the same versions the author actually tested with, instead of "whatever's newest today."
+- The `cupy` line is commented out (it starts with `#`, so it's ignored rather than installed). That's not a mistake. It means the original notebook only used `cupy` inside a fallback block (a `try/except`, explained below) — so it's optional, not something every reader is forced to install.
 
-## What this tool checks
+---
 
-- **Imports**: parses your notebook's code via Python's `ast` module to find every top-level import.
-- **Installed packages**: correlates each import against your live environment (`pip freeze` plus `importlib.metadata`) to find matching package names and versions. Package name resolution is dynamic — it queries what's actually installed rather than relying solely on a hardcoded map, so it correctly handles cases where the import name differs from the PyPI package name (e.g. `sklearn` → `scikit-learn`) even for packages not explicitly listed in this tool.
-- **Guarded / optional imports**: imports found inside `try/except` or `if/else` blocks are tracked separately from unconditional ones. If a package is only ever imported conditionally, its manifest entry is commented out and labeled as an optional dependency rather than pinned as a hard requirement — regardless of whether that package happens to be installed in your own environment. If the same package is _also_ imported unconditionally somewhere else in the notebook, it's treated as required.
-- **Dynamic imports (literal form)**: `importlib.import_module("pkg")`, `from importlib import import_module; import_module("pkg")`, aliased forms of both, and bare `__import__("pkg")` are resolved when the argument is a string literal, and treated the same as a normal import. When the argument isn't a literal (e.g. a variable or config value), the tool can't know what's being imported — it emits a diagnostic warning instead of guessing.
-- **Optional extras promotion**: if a submodule import matches a package's declared `Provides-Extra` metadata (e.g. `import umap.plot`), the manifest entry is promoted to include that extra (`umap-learn[plot]==...`), with a visible notice printed when this happens.
-- **Hardware-tagged builds**: flags packages with build-specific version tags (e.g. `torch==2.3.1+cu121`) and checks whether your notebook already specifies a download index for them.
-- **GPU/accelerator usage**: if your notebook imports `torch`, `tensorflow`, or `jax`, checks whether an active GPU/MPS/TPU accelerator was available in your session for that specific framework.
+## Messages you might see, and what to do about them
 
-This tool also supports a **batch mode** for scanning many notebooks at once (a course, a team's repo). See Batch Mode below.
+This is the reference section. You won't see all of these on any single run — skim for whatever you're actually looking at.
 
-## Required workflow
+### In the explainer cell (Cell 1)
 
-This tool must be run **by the notebook's author, in the same environment used to develop the notebook**, immediately after testing it. It reads the live state of your session (installed packages, GPU availability) — running it anywhere else, or later, tells you about that environment, not the notebook's actual requirements.
+| What it says | What it means | What to do |
+|---|---|---|
+| **Hardware Acceleration:** ...verified via PyTorch (or TensorFlow / JAX) | The notebook was authored on a machine with a GPU (a graphics card used to speed up heavy computation), and that GPU was actually confirmed working at the time. | If you're running on a machine without a GPU, the notebook may run correctly but much more slowly. This isn't an error — it's advance notice. |
+| **Specific Package Builds Detected** | One of your packages (usually `torch`, `tensorflow`, or similar) was built for a specific hardware setup, e.g. a version number ending in something like `+cu121`. | If installation fails later, this is the first thing to suspect — see "Setup failed" below. |
+| **Network Notice** | A reminder that installing packages usually needs an internet connection, unless they're already cached in your environment. | Nothing to do unless the install step actually fails while offline. |
 
-1. Start from a fresh environment/kernel.
-2. Run your notebook top to bottom, fixing any errors as they appear.
-3. **Restart the kernel** after each fix before rerunning — don't just rerun the failing cell. Previously executed cells stay in memory otherwise, which can hide problems that would break a true cold start.
-4. Exercise all code paths, including any GPU-only branches and any guarded (`try/except`) branches, so both the GPU check and the guarded-import detection reflect actual usage rather than partial coverage.
-5. Save the notebook.
-6. Run this tool (see Usage below).
+### While Cell 2 runs
 
-## Usage
+| What it says | What it means | What to do |
+|---|---|---|
+| **❌ Error: Major Python version mismatch** | The notebook was written for a different major Python version (e.g. Python 3 vs. Python 2 — a very rare mismatch today) than the one you're running it with. This stops execution, because it usually won't work at all. | Switch to a kernel/environment running the required Python version. |
+| **⚠️ This code was created with Python 3.X. You are trying to run it with 3.Y.** | A smaller mismatch — same major version, different minor version (e.g. 3.10 vs. 3.11). This is a warning, not a stop; execution continues. | Usually fine to ignore and just try running it. If something breaks in a confusing way later, this is worth revisiting. |
+| **✅ Setup complete! Environment ready.** | Everything installed successfully. | Nothing — you're done, continue running your notebook normally. |
+| **❌ Setup failed while installing pinned dependencies.** | The `pip install` step returned an error. **Known caveat as of this version:** the tool always suggests the failure is about hardware-specific builds (like GPU version tags), even when it isn't. If your notebook doesn't use any GPU-specific packages, that particular suggestion doesn't apply to you — the real reason is in the pip output printed just above this message; scroll up and read that first. | Look at the pip error text right above this message for the actual reason (a typo'd package name, no internet connection, a disk-space or permissions issue, and so on, are all more common in practice than a hardware mismatch). If it does turn out to be hardware-related, try installing the plain (non-hardware-tagged) version instead, e.g. `!pip install torch` in a new cell. |
 
-There are two ways to run this tool. Neither is strictly "recommended" over the other — which one fits depends on where you're working.
+### Inside the generated package list itself
 
-**Path A — CLI, against a saved `.ipynb` file:**
+These show up as comments (lines starting with `#`) inside the list of packages the tool writes out. A comment means "informational, not installed automatically."
 
-```bash
-python notebook_env.py your_notebook.ipynb
-```
+| What it looks like | What it means |
+|---|---|
+| `# package (imported as 'x' in try/except or conditional block - optional fallback)` | The notebook only imports this package inside a fallback block — code written to try one approach and fall back to another if the first isn't available. Since the notebook doesn't strictly require it, it's listed but not force-installed. |
+| `# package (platform pseudo-module provided by runtime environment)` | This isn't a real installable package — it's something Kaggle, Databricks, or a similar platform automatically provides while your notebook is running there. Installing it yourself isn't possible and isn't needed. |
+| `# package (local repo module; not a PyPI package)` | This "package" is actually a folder of code that lives right next to the notebook, not something from the internet. Nothing to install — it just needs to be copied along with the notebook. |
+| `# tool (installed via cell magic; not found in active env)` | Something in the notebook ran an install command (like `%pip install`) for a tool that isn't a regular Python import — the tool couldn't confirm it's currently installed. Worth double-checking manually if the notebook depends on it. |
 
-Reads the notebook's source directly from the saved `.ipynb` file on disk and runs AST parsing over it. This is the natural fit for local development (VS Code, JupyterLab, PyCharm, a terminal in your project directory) — you save the notebook, then run the script from your shell, without adding any extra code to the notebook itself.
+### GPU / accelerator messages specifically
 
-A `.ipynb` file never stores live memory or execution state, on any platform — it only stores whatever cell source was last saved. So Path A reflects exactly what's on disk as of your last save, nothing more and nothing less. If you tested interactively and made further changes without saving, Path A won't see them.
+| What it says | What it means |
+|---|---|
+| **⚡ Active accelerator detected: [device name]** | A GPU-related library was imported, and a GPU was confirmed available and working when the author ran it. Strong signal the notebook benefits from a GPU — not a guarantee every single step used it. |
+| **⚠️ Acceleration Framework imported, but NO active accelerator detected** | A GPU-related library was imported, but no GPU was actually available in that run. If the notebook was meant to require a GPU, this particular run just didn't confirm that — it doesn't necessarily mean it doesn't need one. |
 
-In single-notebook mode, a notebook with no `kernelspec`/`language_info` metadata at all is assumed to be Python rather than rejected — this is a common, valid case for minimal or hand-built notebooks. Metadata is only enforced strictly in batch mode, where it's needed to filter out non-Python kernels (R, Julia) across a whole directory; see Batch Mode below.
+**Known caveat:** if a notebook uses more than one GPU library at once (for example both `torch` and `tensorflow`), the device name shown can currently get attributed to the wrong one of the two. Treat the specific device name as a helpful hint rather than something to fully rely on for now.
 
-**Path B — pasted into a live notebook cell:**
+**Also worth knowing:** if your notebook uses a higher-level library that relies on `torch`/`tensorflow`/`jax` underneath (for example `fastai`, which is built on `torch`), GPU detection may currently miss it even though a GPU actually was used. This is a known gap, not something you did wrong.
 
-Paste the tool's code into a cell and call `main()`, or adapt it to call `extract_from_active_session()` directly. This reads IPython's `In` history (via `__main__.In`) rather than the saved file, so it reflects what has actually executed in the current kernel session, which can be _ahead of_ disk (recent edits not yet saved) or _behind_ it (cells that ran earlier and were later deleted from the notebook, but are still sitting in `In`). This is generally the better fit for ephemeral cloud runtimes (Colab, Kaggle, remote JupyterHub), where running a separate CLI step against a freshly-saved file is more friction than just running one more cell.
+### Extra messages
 
-**The stale-memory trap (Path B only):** `__main__.In` accumulates every statement executed for the life of the kernel. If you spent time trying (and then abandoning) `seaborn`, `plotly`, or `bokeh` imports before settling on your final approach, and never restarted the kernel, `In` still contains those abandoned imports even though they're no longer in the notebook. **Restart the kernel and run all cells fresh before the final snapshot** — this flushes the history so only your actual, final code path gets captured.
+| What it says | What it means |
+|---|---|
+| **💡 Extra Dependency Promotion:** importing 'x.y' automatically promoted requirement to 'package[y]==...' | Some packages have optional add-on features (called **extras**) that only get installed if you ask for them specifically. The tool noticed your notebook uses one of those add-ons and automatically included it, rather than leaving it out. Informational only. |
+| **⚠️ Dynamic import detected via non-literal argument...; statically unresolvable** | Somewhere in the notebook, code loads a package by name using a variable instead of writing the package name directly (e.g. loading whatever package name is stored in a variable, decided while the code runs, rather than typing `import pandas` directly). The tool can't figure out in advance what that will be, so it can't check or include it automatically. | If you know what that variable resolves to, add that package to the list by hand. |
+| **ℹ️ System package manager call detected** / **ℹ️ Conda installation detected** | The notebook installs something outside of Python's normal package system (e.g. `apt-get`, or a `conda install` command). These are outside what this tool tracks. | Make a note of these separately if you're documenting the notebook's full requirements — they won't appear in the generated Python package list. |
+| **⚠️ ...references an external requirements file; contents cannot be verified statically** | The notebook installs from a `requirements.txt` or similar file rather than listing packages directly. The tool can't see inside that file. | Check that file is included and shared alongside the notebook. |
 
-Do **not** invoke this tool via `import your_module; your_module.main()` inside the notebook you're scanning — the import line itself becomes part of the session history and may show up as a spurious entry in the generated manifest. Paste the tool inline instead.
+---
 
-**Desktop-specific caveat (Path A):** running the CLI correlates imports against whatever Python interpreter runs the script (`pip freeze` under `sys.executable`), not against the notebook's own kernel. On a desktop machine with multiple virtual environments (venv/conda/poetry), it's easy to accidentally run the script from the wrong terminal or the wrong activated environment — the script has no way to detect this, and would silently produce a plausible-looking but wrong manifest rather than an error. **Before running Path A, make sure the environment active in your terminal is the same one the notebook's kernel actually uses.** This is generally less of a concern on Kaggle/Colab, where there's typically only one active kernel environment to begin with.
+## Two ways to run it
 
-**Optional flag:**
+There are two ways to use this tool, and picking the right one matters.
 
-```bash
-python notebook_env.py your_notebook.ipynb --full-freeze
-```
+**File mode** *(called "Path A" in some places, including the technical notes)* — you run it from a terminal against your saved `.ipynb` file, like in the Quick Start above. It looks at exactly what's saved in that file. If you made changes and haven't saved yet, it won't see them.
 
-Appends a complete `pip freeze` snapshot after the targeted manifest, for cases where you want a full bit-for-bit fallback available. Off by default — a full freeze is generally too much noise for a data scientist audience, and top-level pins are good guidance most of the time.
+**Paste mode** *(called "Path B")* — you paste the tool directly into a notebook cell and run it there. This looks at everything that has actually run in your current session, whether or not you've saved. This is usually the better fit on Kaggle, Colab, or any cloud notebook where getting to a terminal is more hassle than just running one more cell.
 
-## Output
+**A trap to know about in Paste mode:** it looks at *everything you've run in this session*, including things you tried and later abandoned. If you experimented with a package earlier, decided against it, and never restarted your kernel, that abandoned attempt can still show up in the results. **Fix:** restart your kernel and run all cells fresh, right before you run this tool, so only your actual final code counts.
 
-The tool prints two blocks to paste into new cells at the top of your notebook:
+**A caution for File mode on your own computer:** if you use multiple Python environments (for example different projects with different setups), make sure you're running the tool from the same environment your notebook actually uses. The tool has no way to detect if you're in the wrong one — it will still produce a normal-looking result, just potentially the wrong one. It prints the Python location it's using at the top of its output specifically so you can double check this.
 
-1. **Markdown cell** — explains the setup, and if applicable, notes hardware-tagged builds and GPU/accelerator usage detected during authoring.
-2. **Code cell** — checks the Python version, writes a `pinned_requirements.txt`, and installs it via pip.
+---
 
-Before the blueprint, Path A also prints the active Python interpreter path (`sys.executable`). This exists specifically so you can visually confirm it matches the environment your notebook's kernel actually used — see the desktop caveat above.
+## Scanning many notebooks at once (for instructors)
 
-Any packages that were only ever imported inside a `try/except` or conditional block appear in the manifest as a commented-out, labeled optional entry rather than a hard pin — even if that package happens to be installed in your own environment. Any dynamic import calls the tool couldn't statically resolve (a variable or expression rather than a string literal) are surfaced as a diagnostic warning rather than silently dropped or guessed at.
-
-## Reading the GPU/accelerator messages
-
-- **"Active accelerator detected"**: a GPU-relevant library was imported and a GPU/MPS/TPU was available and confirmed for that framework in your session. This is a strong signal the notebook needs one, not certainty that every operation used it.
-- **"Framework imported, but no active accelerator found"**: you imported a GPU-capable library, but no accelerator was available in this test run. If you intended to require a GPU, this run doesn't confirm that — it just tells you this particular run happened on CPU.
-- When multiple GPU frameworks are imported together, only the framework(s) actually confirmed to have an accelerator are reflected in the device name — the message doesn't imply every listed framework had GPU access.
-
-## Batch Mode
-
-Scans a directory of notebooks at once, producing an audit-style report rather than per-notebook paste-in blueprints. Useful for an instructor checking a whole course's worth of notebooks, or auditing a shared repo, rather than the single-notebook author workflow above.
+If you're checking an entire course folder or shared repository rather than one notebook, point the tool at the folder instead of a single file:
 
 ```bash
 python notebook_env.py --batch ./course_materials
 ```
 
-This always runs analysis first — it scans every `.ipynb` in the directory, skips non-Python kernels (R, Julia) and notebooks with no language metadata at all, reports parse errors, and summarizes the dependency footprint across the batch (matched packages, missing packages with which notebooks need them, extras promotions, dynamic-import warnings, hardware/index-URL audit). No files are written in this mode.
+This gives you a summary report across every notebook in that folder — what's missing, what's inconsistent, and which notebooks have problems — without changing any files. It's meant for auditing, not for the single-notebook "paste two cells in" workflow above.
 
-```bash
-python notebook_env.py --batch ./course_materials --universal
-```
+There are a few more options for this mode (writing a combined package list for the whole folder, or actually inserting the setup cells into every notebook automatically). See `DEVELOPMENT.md` if you need those — they're less commonly needed and more worth understanding in detail before using.
 
-Writes one `requirements-all.txt` covering every notebook in the batch, correlated against a single shared reference environment (not each notebook's own author environment — batch mode audits against one common target, since aggregating "each notebook's own environment" doesn't mean anything at the directory level).
+**Known gap:** this folder-wide summary currently can't flag the hardware-specific build tag issue described above (the `+cu121`-style version warning) the way the single-notebook workflow can. If a notebook in your folder has that issue, batch mode won't currently tell you.
 
-```bash
-python notebook_env.py --batch ./course_materials --output
-```
+---
 
-Writes a companion `<name>_merged.ipynb` next to each source notebook, containing the setup cells. The original file is never touched by default. `--in-place` will overwrite the original directly instead (replacing any previously-generated setup cells rather than duplicating them) — use with care, and back up first; this tool does not currently create a backup automatically before an in-place write.
+## Things it can't do yet
 
-**Known caveat (`--output` mode):** the GPU/accelerator note in a per-notebook generated cell can currently misattribute which framework was actually confirmed to have GPU access, if the host machine has more than one of `torch`/`tensorflow`/`jax` installed. See `DEVELOPMENT.md` for details. Treat the GPU line in `--output` mode as worth double-checking rather than fully trusted, for now.
+Being upfront about this rather than letting you discover it the hard way:
 
-## Known limitations
+- If a package is loaded by name from a variable (rather than written directly, e.g. `import pandas`), and that variable's value isn't obvious from reading the code, the tool can't figure out what it is.
+- A specific, less common style of import (`from . import something`) isn't detected at all.
+- It only checks packages you import directly — not the packages *those* packages depend on internally. Those can still change version on their own between installs.
+- It confirms a GPU was *available*, not that every part of the notebook actually used it.
+- It can't automatically fix a hardware-specific build mismatch (like a GPU version tag) — only flag it.
+- Running it against a saved file vs. pasting it into a live notebook can genuinely give different answers (see "Two ways to run it" above) — they're not interchangeable, and picking the wrong one for your situation can produce a misleading result.
 
-- **Dynamic imports with non-literal arguments** (e.g. `importlib.import_module(pkg_name)` where `pkg_name` is a variable) can't be resolved by static AST scanning, since there's no literal module name in the source to read. The tool emits a diagnostic warning in this case rather than guessing. Literal-string dynamic imports (`importlib.import_module("torch")`, including aliased and `from`-imported forms) _are_ detected.
-- **Bare relative imports** (`from . import helper`) are silently invisible — nothing is extracted, filtered, or flagged.
-- **`exec()`/`eval()`-based code execution** is not inspected — imports embedded in a string passed to `exec()` won't be seen.
-- **Package installs introduced via cell magics** aren't harvested yet — `%pip install gdown` (no matching Python import), `%%bash`/`%%sh` shell cells, `%run` external scripts, and `%%writefile`-generated files. Only `--extra-index-url`/`-i` flags are currently picked up from magic/shell lines.
-- **Transitive dependencies are not pinned**, only top-level imports. Sub-dependencies can still drift between installs.
-- **GPU checks confirm availability, not actual usage** — a GPU can be available and imported without every tensor operation running on it.
-- **No Kaggle Docker image tag detection** — no documented environment variable exposes this from inside a running kernel.
-- **Path A vs Path B can diverge**: Path A reflects only what's saved to disk; Path B reflects live kernel history, which can be ahead of disk (unsaved edits) or behind it (deleted cells still in `In`). They are not interchangeable views of the same state.
-- **No automatic detection of interpreter/kernel mismatch**: Path A correlates against whatever environment is running the script, not necessarily the one the notebook's kernel used. This is not checked or warned about beyond printing the interpreter path — verifying the match is the author's responsibility.
-- Hardware-tagged builds (`+cu121`, etc.) are flagged, not auto-corrected — pip's default wheel selection when reinstalling an untagged version is not guaranteed to match the original hardware target.
+For the full technical list, ongoing work, and known internal bugs being tracked, see `DEVELOPMENT.md` — that document is written for whoever's actively developing this tool, not for day-to-day users, so it's denser than this guide on purpose.
 
-For the roadmap, in-progress work, and known internal bugs being tracked, see `DEVELOPMENT.md`.
+---
+
+## A few terms explained
+
+- **Dependency / package:** a piece of code someone else wrote that your notebook uses, installed with `pip install`.
+- **Pinning:** locking a package to one exact version (`==1.26.4`) instead of "whatever's newest," so results stay reproducible over time.
+- **Kernel:** the running Python process behind your notebook. "Restarting the kernel" clears everything in memory and starts fresh.
+- **Environment:** the specific combination of Python version and installed packages you're currently working in.
+- **Guarded / conditional import:** code that tries to import something, and has a planned fallback if that import fails — usually written as `try: import x except: ...`. Since it's optional by design, this tool treats it as optional too.
+- **Extras:** optional add-on features for a package that only install if specifically requested (e.g. `package[extra_name]`).
+- **GPU / accelerator:** specialized hardware that speeds up heavy numerical work, commonly used for machine learning. "Accelerator" also covers Apple Silicon GPUs (MPS) and Google TPUs, not just NVIDIA GPUs.
+- **Manifest:** the list of packages and versions this tool generates for your notebook.
+
+---
+
+*For the technical roadmap, in-progress work, and known internal bugs, see `DEVELOPMENT.md`.*
