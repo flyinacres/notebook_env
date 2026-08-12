@@ -125,6 +125,12 @@ TRANSITIVE_FRAMEWORK_MAP: Dict[str, str] = {
     "flax": "jax",
 }
 
+FRAMEWORK_NAME_TO_CANONICAL: Dict[str, str] = {
+    "PyTorch": "torch",
+    "TensorFlow": "tensorflow",
+    "JAX": "jax",
+}
+
 STD_LIB: Set[str] = set(sys.stdlib_module_names) if hasattr(sys, 'stdlib_module_names') else {
     "os", "sys", "re", "json", "ast", "subprocess", "datetime", "math", "random", 
     "time", "pathlib", "typing", "collections", "itertools", "functools", "shutil"
@@ -1328,10 +1334,35 @@ def apply_output_to_notebook(
     
     gpu_info: Optional[GpuInfo] = None
     if batch_hw_cache:
-        nb_fw = set(batch_hw_cache.get("frameworks", [])).intersection(scan_res.imports)
+        # Expand notebook imports transitively (e.g. fastai -> torch, keras -> tensorflow)
+        expanded_nb_imports = set(scan_res.imports)
+        for imp in scan_res.imports:
+            base_fw = TRANSITIVE_FRAMEWORK_MAP.get(imp)
+            if base_fw:
+                expanded_nb_imports.add(base_fw)
+
+        nb_fw = set(batch_hw_cache.get("frameworks", [])).intersection(expanded_nb_imports)
         if nb_fw:
-            gpu_info = dict(batch_hw_cache)
-            gpu_info["frameworks"] = list(nb_fw)
+            active_fw_name = batch_hw_cache.get("active_framework")
+            # Map human-readable active framework back to canonical set
+            canonical_active_fw = FRAMEWORK_NAME_TO_CANONICAL.get(active_fw_name, "").lower()
+
+            if batch_hw_cache.get("has_gpu") and canonical_active_fw in nb_fw:
+                gpu_info = {
+                    "has_gpu": True,
+                    "type": batch_hw_cache.get("type"),
+                    "active_framework": active_fw_name,
+                    "device_name": batch_hw_cache.get("device_name"),
+                    "frameworks": sorted(list(nb_fw))
+                }
+            else:
+                gpu_info = {
+                    "has_gpu": False,
+                    "type": None,
+                    "active_framework": None,
+                    "device_name": None,
+                    "frameworks": sorted(list(nb_fw))
+                }
 
     blueprint = generate_production_blueprint(manifest_lines, local_tagged_info=local_tagged, gpu_info=gpu_info)
     managed_cells = create_managed_cells(blueprint)

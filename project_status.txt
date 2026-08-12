@@ -207,3 +207,49 @@ Note that I would still want to include the Train In Data notebooks in my tests.
 
 1. CPU Automated Validation ArchitectureTo run local automated tests on your Mac (or in CI/CD docker containers), you can build a wrapper script (e.g., test_real_world_notebooks.py) that executes an end-to-end extraction and dry-run verification loop:Validation Workflow StrategyFetch & Sample: Filter MLEModernizer notebooks for CPU-only execution (e.g., scikit-learn, pandas, basic stats/tabular pipelines, natural language processing without heavy local LLMs/transformers).Execute notebook_env (AST Scan):Pass the sampled .ipynb through extract_from_file() or run notebook_env.py via CLI.  Verify generated requirements outputs: Check that pinned_requirements.txt correctly harvested imports, mapped PyPI names (e.g., sklearn $\rightarrow$ scikit-learn), and captured any %pip / --extra-index-url flags.  Containerized Sanity Check (Docker):Spin up a clean base Python Docker image (or a Kaggle CPU base image gcr.io/kaggle-images/python).Inject pinned_requirements.txt into the container.Run pip install -r pinned_requirements.txt.Headlessly execute the notebook using jupyter nbconvert --execute or papermill.Pass Criteria: The environment resolves all dependencies without ModuleNotFoundError or unhandled package resolution errors.2. Testing Against Kaggle vs. Non-Kaggle Base EnvironmentsEnvironment LayerWhat It Tests in notebook_envWhy It MattersKaggle CPU Image (gcr.io/kaggle-images/python)Pre-installed battery test. Tests if notebook_env correctly identifies dependencies already satisfied by heavy base images versus missing ones.Kaggle images ship with hundreds of packages pre-installed; ensures notebook_env pins compatible runtime versions instead of breaking existing installations.Vanilla Python Image (python:3.11-slim or 3.12-slim)Clean slate test. Tests if pinned_requirements.txt is truly self-contained and complete from zero.  Validates that a user running your generated Cell 2 setup script in a blank local venv gets a working environment without hidden system/implicit assumptions.  3. Educational Notebooks (Train In Data) CoverageEducational notebooks are famous for "missing import" or "hidden setup cell" friction. They are perfect for testing notebook_env's auxiliary and guarded import logic:Guarded / Optional Imports: Verifies that imports tucked inside try/except blocks (often used by instructors for conditional fallback features) get properly cataloged as optional/commented dependencies rather than breaking hard installs.  %%writefile & Script Isolation: Course notebooks often use %%writefile script.py to demonstrate module building. notebook_env's isolated writefile_imports parser will ensure setup scripts don't accidentally pull classroom sample code into the main notebook's runtime manifest.  4. Manual GPU Verification Matrix (Colab / Kaggle)For GPU acceleration (PyTorch CUDA, JAX, TensorFlow GPU), manual verification on Colab or Kaggle fits well into a structured test matrix:Manual Test ProtocolsHardware Detection Logging: Run notebook_env on a GPU notebook inside Colab (with a GPU runtime connected).Expected: Logger should output: ⚡ Active accelerator detected: NVIDIA Tesla...  Cell 1 Output: Markdown setup header should include the Hardware Acceleration warning section explaining CUDA requirements.  Local Build / Extra Tag Warnings: Test notebooks that install specialized torch wheels (e.g., +cu121 or custom wheel URLs).Expected: process_package_requirements() flags local tag builds and appends --extra-index-url cleanly into the manifest payload.  
 
+
+
+FINDINGS FROM A BROADER TEST
+Confirmed issues found in real-world testing
+
+Batch mode's strict=True metadata gate rejected any notebook lacking kernelspec/language_info entirely, not just genuinely non-Python ones. Fixed today, 97/97 tests still pass.
+Platform-injected pseudo-modules reported as "uninstalled" when they're not installable at all: dbutils (Databricks), kaggle_secrets (Kaggle). Two independent real-world hits now, same underlying category. Unresolved.
+Possible local, repo-relative imports (cookbook, runners, tools, utils in the Databricks corpus) misreported as missing third-party packages. Still unconfirmed, waiting on you checking those notebooks' actual code.
+Two concrete IMPORT_TO_PYPI_MAP misses: dotenv (should resolve to python-dotenv) and mpl_toolkits (should resolve to matplotlib, it's a namespace subpackage not a standalone distribution). Unresolved.
+GPU detection blind spot: inspect_gpu_environment only checks direct imports for {"torch","tensorflow","jax"}. GTXvsRTX notebooks use fastai wrapping torch as a transitive dependency, so zero hardware signal fired on notebooks whose entire point is GPU comparison. This is the most significant one given hardware detection is a headline feature.
+torch showing "uninstalled" on foreign notebooks: not a bug, expected behavior for a static scan of someone else's notebook in your bare local venv. Worth remembering as a permanent caveat when reading these reports, not something to fix.
+Cosmetic: SyntaxWarning: invalid escape sequence noise from ast.parse on notebooks with unescaped \d, \w, \l, \g, \S in non-raw strings. Doesn't affect correctness, just stderr noise.
+New, just noticed while compiling this: generate_batch_analysis_report never calls harvest_cell_magics_and_commands or surfaces auxiliary/magic-installed packages. It only reports on direct AST imports via build_manifest_entries. So every batch report you've read so far is blind to anything installed only via %pip/!pip magic and not directly imported — --batch (analysis) and --output (per-notebook cells) use genuinely different, non-overlapping detection logic, and you haven't been seeing the magic-harvesting half of the tool at all in these runs.
+
+1. BATCH & OUTPUT DISCREPANCY (CELL MAGICS)
+• Cause: walk_and_scan_directory() omits harvest_cell_magics_and_commands().
+• Fix: Run magic harvester in batch loop; attach harvested_pkgs & index_urls to NotebookScanResult; include in report analysis.
+
+2. GPU DETECTION BLIND SPOT (TRANSITIVE WRAPPERS)
+• Cause: inspect_gpu_environment() checks direct imports only (torch, tf, jax). misses wrappers like fastai, keras, flax.
+• Fix: Define TRANSITIVE_FRAMEWORK_MAP = {"fastai": "torch", "keras": "tensorflow", "flax": "jax"}. Expand inspected set before running hardware probes.
+
+3. PLATFORM PSEUDO-MODULES (dbutils, kaggle_secrets)
+• Cause: Static AST flags platform-injected runtime objects as missing PyPI packages.
+• Fix: Define PLATFORM_PSEUDO_MODULES set. Intercept matching imports and flag as runtime-provided in manifest comments.
+
+4. REPO-RELATIVE / LOCAL IMPORTS
+• Cause: Relative helper modules (cookbook, utils) misidentified as missing third-party dependencies.
+• Fix: Probe notebook parent/repo dir for matching local .py files or package directories. Flag matches as local repo modules.
+
+5. MAP MISSES (dotenv, mpl_toolkits)
+• Cause: Missing import-to-distribution mappings.
+• Fix: Add "dotenv": "python-dotenv" and "mpl_toolkits": "matplotlib" to IMPORT_TO_PYPI_MAP.
+
+6. AST SYNTAXWARNING NOISE
+• Cause: Python 3.12+ ast.parse emits SyntaxWarning on unescaped backslashes in non-raw strings.
+• Fix: Wrap ast.parse in warnings.catch_warnings() filter inside extract_imports_from_sources().
+
+Suggested Prioritization
+Unify Cell Magic Harvesting in Batch Reports (resolves architectural inconsistency between single and batch modes).  
+
+GPU Transitive Detection (fastai $\rightarrow$ torch) (restores core hardware audit value proposition).
+
+ Platform Pseudo-Modules & Local Imports (eliminates false-positive noise in real-world corpora).  
+
+IMPORT_TO_PYPI_MAP expansion & SyntaxWarning filter (quick hygiene fixes).  

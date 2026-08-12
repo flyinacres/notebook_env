@@ -117,6 +117,40 @@ def test_apply_output_companion_overwrite_existing(sample_notebook_file, mock_fr
         data = json.load(f)
     assert len(data["cells"]) == 3
 
+def test_apply_output_gpu_misattribution_prevented(sample_notebook_file, mock_frozen_env):
+    """Verify that a TensorFlow notebook does not inherit PyTorch CUDA device attributions from batch cache."""
+    scan_res = ne.NotebookScanResult(
+        path=sample_notebook_file,
+        is_python=True,
+        lang_label="python",
+        imports={"tensorflow"},
+        code_sources=["import tensorflow as tf"]
+    )
+
+    # Batch HW cache populated by a PyTorch notebook on CUDA
+    pytorch_batch_cache: ne.GpuInfo = {
+        "has_gpu": True,
+        "type": "NVIDIA CUDA",
+        "active_framework": "PyTorch",
+        "device_name": "NVIDIA GeForce RTX 4090 (via PyTorch)",
+        "frameworks": ["torch", "tensorflow"]
+    }
+
+    out_path = ne.apply_output_to_notebook(
+        scan_res, 
+        mock_frozen_env, 
+        {}, 
+        pytorch_batch_cache, 
+        in_place=True
+    )
+
+    with open(out_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    markdown_cell_source = "".join(data["cells"][0]["source"])
+    
+    # Assert PyTorch CUDA device name is NOT misattributed to the TensorFlow notebook
+    assert "NVIDIA GeForce RTX 4090 (via PyTorch)" not in markdown_cell_source
 
 def test_apply_output_inplace(sample_notebook_file, mock_frozen_env):
     """Verify in-place modification updates the target file directly."""
