@@ -411,9 +411,9 @@ class TestGpuInspection:
 
         result: Optional[GpuInfo] = ne.inspect_gpu_environment({"torch"})
         assert result is not None
-        assert result["has_gpu"] is True
-        assert result["active_framework"] == "PyTorch"
-        assert "RTX 3090" in result["device_name"]
+        assert result.has_gpu is True
+        assert result.active_framework == "PyTorch"
+        assert "RTX 3090" in result.device_name
 
     def test_torch_mps_active(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake_torch = types.ModuleType("torch")
@@ -423,8 +423,8 @@ class TestGpuInspection:
 
         result: Optional[GpuInfo] = ne.inspect_gpu_environment({"torch"})
         assert result is not None
-        assert result["has_gpu"] is True
-        assert "Metal" in result["device_name"]
+        assert result.has_gpu is True
+        assert "Metal" in result.device_name
 
     def test_torch_imported_no_gpu_available(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake_torch = types.ModuleType("torch")
@@ -434,8 +434,8 @@ class TestGpuInspection:
 
         result: Optional[GpuInfo] = ne.inspect_gpu_environment({"torch"})
         assert result is not None
-        assert result["has_gpu"] is False
-        assert result["frameworks"] == ["torch"]
+        assert result.has_gpu is False
+        assert result.frameworks == ["torch"]
 
     def test_tensorflow_gpu_active(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake_tf = types.ModuleType("tensorflow")
@@ -450,9 +450,9 @@ class TestGpuInspection:
 
         result: Optional[GpuInfo] = ne.inspect_gpu_environment({"tensorflow"})
         assert result is not None
-        assert result["has_gpu"] is True
-        assert result["active_framework"] == "TensorFlow"
-        assert "Tesla T4" in result["device_name"]
+        assert result.has_gpu is True
+        assert result.active_framework == "TensorFlow"
+        assert "Tesla T4" in result.device_name
 
     def test_jax_accelerator_active(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake_jax = types.ModuleType("jax")
@@ -462,14 +462,27 @@ class TestGpuInspection:
 
         result: Optional[GpuInfo] = ne.inspect_gpu_environment({"jax"})
         assert result is not None
-        assert result["has_gpu"] is True
-        assert result["active_framework"] == "JAX"
+        assert result.has_gpu is True
+        assert result.active_framework == "JAX"
+
+    def test_jax_metal_active(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """jax-metal reports platform='METAL' (uppercase), not 'gpu'/'tpu' — see probe_jax_gpu."""
+        fake_jax = types.ModuleType("jax")
+        fake_device = types.SimpleNamespace(platform="METAL", device_kind="Metal")
+        fake_jax.devices = lambda: [fake_device]
+        _install_fake_module(monkeypatch, "jax", fake_jax)
+
+        result: Optional[GpuInfo] = ne.inspect_gpu_environment({"jax"})
+        assert result is not None
+        assert result.has_gpu is True
+        assert result.active_framework == "JAX"
+        assert "METAL" in result.device_name
 
     def test_framework_not_installed_falls_back_gracefully(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setitem(sys.modules, "torch", None)
         result: Optional[GpuInfo] = ne.inspect_gpu_environment({"torch"})
         assert result is not None
-        assert result["has_gpu"] is False
+        assert result.has_gpu is False
 
     def test_fastai_transitive_torch_gpu_detection(self, monkeypatch) -> None:
         fake_torch = types.ModuleType("torch")
@@ -483,9 +496,9 @@ class TestGpuInspection:
         # Note: imported_packages contains 'fastai' but NOT 'torch' directly
         result: Optional[GpuInfo] = ne.inspect_gpu_environment({"fastai"})
         assert result is not None
-        assert result["has_gpu"] is True
-        assert result["active_framework"] == "PyTorch"
-        assert "RTX 3090" in result["device_name"]
+        assert result.has_gpu is True
+        assert result.active_framework == "PyTorch"
+        assert "RTX 3090" in result.device_name
 
 
 # =====================================================================
@@ -527,12 +540,12 @@ class TestBlueprintGeneration:
         assert expected_guard in blueprint["step2_code"]
 
     def test_gpu_section_included_when_gpu_present(self) -> None:
-        gpu_info: GpuInfo = {
-            "has_gpu": True,
-            "active_framework": "PyTorch",
-            "device_name": "NVIDIA GeForce RTX 3090 (via PyTorch)",
-            "frameworks": ["torch"],
-        }
+        gpu_info = ne.GpuInfo(
+            has_gpu=True,
+            active_framework="PyTorch",
+            device_name="NVIDIA GeForce RTX 3090 (via PyTorch)",
+            frameworks=["torch"],
+        )
         blueprint: BlueprintResult = ne.generate_production_blueprint(["torch==2.3.1"], gpu_info=gpu_info)
         assert "RTX 3090" in blueprint["step1_markdown"]
 

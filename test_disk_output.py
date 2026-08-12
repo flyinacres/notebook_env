@@ -128,13 +128,13 @@ def test_apply_output_gpu_misattribution_prevented(sample_notebook_file, mock_fr
     )
 
     # Batch HW cache populated by a PyTorch notebook on CUDA
-    pytorch_batch_cache: ne.GpuInfo = {
-        "has_gpu": True,
-        "type": "NVIDIA CUDA",
-        "active_framework": "PyTorch",
-        "device_name": "NVIDIA GeForce RTX 4090 (via PyTorch)",
-        "frameworks": ["torch", "tensorflow"]
-    }
+    pytorch_batch_cache = ne.GpuInfo(
+        has_gpu=True,
+        type="NVIDIA CUDA",
+        active_framework="PyTorch",
+        device_name="NVIDIA GeForce RTX 4090 (via PyTorch)",
+        frameworks=["torch", "tensorflow"]
+    )
 
     out_path = ne.apply_output_to_notebook(
         scan_res, 
@@ -309,17 +309,17 @@ def test_apply_output_multi_framework_gpu_resolution(sample_notebook_file, mock_
     )
 
     # Cache where both PyTorch and TensorFlow were independently probed
-    multi_fw_cache: ne.GpuInfo = {
-        "has_gpu": True,
-        "type": "NVIDIA CUDA",
-        "active_framework": "PyTorch",
-        "device_name": "NVIDIA GeForce RTX 4090 (via PyTorch)",
-        "frameworks": ["torch", "tensorflow"],
-        "framework_devices": {
+    multi_fw_cache = ne.GpuInfo(
+        has_gpu=True,
+        type="NVIDIA CUDA",
+        active_framework="PyTorch",
+        device_name="NVIDIA GeForce RTX 4090 (via PyTorch)",
+        frameworks=["torch", "tensorflow"],
+        framework_devices={
             "torch": "NVIDIA GeForce RTX 4090 (via PyTorch)",
             "tensorflow": "NVIDIA GPU (via TensorFlow)"
         }
-    }
+    )
 
     out_path = ne.apply_output_to_notebook(
         scan_res, 

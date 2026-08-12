@@ -46,7 +46,7 @@ import importlib.metadata
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field
-from typing import Set, Dict, List, Tuple, Optional, Any, TypedDict, Callable
+from typing import Set, Dict, List, Tuple, Optional, Any, TypedDict, Callable, NamedTuple
 
 
 # Force UTF-8 encoding for stdout and stderr on Windows/redirected environments
@@ -96,7 +96,8 @@ class StatusLabel:
     MISSING_METADATA = "missing metadata"
 
 
-class GpuInfo(TypedDict, total=False):
+@dataclass
+class GpuInfo:
     """
     Payload representing active host accelerator capabilities across PyTorch, TensorFlow, and JAX.
 
@@ -108,12 +109,12 @@ class GpuInfo(TypedDict, total=False):
         frameworks: List of canonical framework stems detected in imports (['torch', 'tensorflow', 'jax']).
         framework_devices: Map of canonical framework stem -> verified device descriptor string (or None if CPU-only).
     """
-    has_gpu: bool
-    type: Optional[str]
-    active_framework: Optional[str]
-    device_name: Optional[str]
-    frameworks: List[str]
-    framework_devices: Dict[str, Optional[str]]
+    has_gpu: bool = False
+    type: Optional[str] = None
+    active_framework: Optional[str] = None
+    device_name: Optional[str] = None
+    frameworks: List[str] = field(default_factory=list)
+    framework_devices: Dict[str, Optional[str]] = field(default_factory=dict)
 
 
 class BlueprintResult(TypedDict):
@@ -1047,12 +1048,18 @@ def expand_transitive_frameworks(imports: Set[str]) -> Set[str]:
     return expanded
 
 
-def probe_torch_gpu() -> Optional[Tuple[str, str]]:
+class GpuProbeResult(NamedTuple):
+    """Result of a single framework's GPU/accelerator probe."""
+    accelerator_type: str
+    device_name: str
+
+
+def probe_torch_gpu() -> Optional[GpuProbeResult]:
     """
     Probes PyTorch for CUDA or Apple Silicon MPS acceleration.
 
-    Returns (accelerator_type, device_name), or None if torch isn't installed
-    or no accelerator is available. If torch is installed but the probe itself
+    Returns a GpuProbeResult, or None if torch isn't installed or no
+    accelerator is available. If torch is installed but the probe itself
     fails unexpectedly (not just "not installed"), logs at debug level
     (visible via --verbose) rather than silently reporting no GPU.
     """
@@ -1062,22 +1069,21 @@ def probe_torch_gpu() -> Optional[Tuple[str, str]]:
         return None
     try:
         if torch.cuda.is_available():
-            return ("NVIDIA CUDA", f"{torch.cuda.get_device_name(0)} (via PyTorch)")
+            return GpuProbeResult("NVIDIA CUDA", f"{torch.cuda.get_device_name(0)} (via PyTorch)")
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return ("Apple Silicon MPS", "Apple Silicon GPU (Metal via PyTorch)")
+            return GpuProbeResult("Apple Silicon MPS", "Apple Silicon GPU (Metal via PyTorch)")
     except Exception as e:
         logger.debug(f"PyTorch GPU probe failed unexpectedly: {e}")
     return None
 
 
-def probe_tensorflow_gpu() -> Optional[Tuple[str, str]]:
+def probe_tensorflow_gpu() -> Optional[GpuProbeResult]:
     """
     Probes TensorFlow for GPU acceleration.
 
-    Returns (accelerator_type, device_name), or None if tensorflow isn't
-    installed or no GPU is available. If tensorflow is installed but the probe
-    itself fails unexpectedly, logs at debug level rather than silently
-    reporting no GPU.
+    Returns a GpuProbeResult, or None if tensorflow isn't installed or no
+    GPU is available. If tensorflow is installed but the probe itself fails
+    unexpectedly, logs at debug level rather than silently reporting no GPU.
     """
     try:
         import tensorflow as tf
@@ -1093,18 +1099,18 @@ def probe_tensorflow_gpu() -> Optional[Tuple[str, str]]:
             dev_name = f"{details.get('device_name', 'NVIDIA GPU')} (via TensorFlow)"
         except Exception:
             pass  # Cosmetic detail lookup only; falls back to the generic name above.
-        return ("GPU", dev_name)
+        return GpuProbeResult("GPU", dev_name)
     except Exception as e:
         logger.debug(f"TensorFlow GPU probe failed unexpectedly: {e}")
     return None
 
 
-def probe_jax_gpu() -> Optional[Tuple[str, str]]:
+def probe_jax_gpu() -> Optional[GpuProbeResult]:
     """
     Probes JAX for GPU/TPU acceleration.
 
-    Returns (accelerator_type, device_name), or None if jax isn't installed
-    or no accelerator is available. If jax is installed but the probe itself
+    Returns a GpuProbeResult, or None if jax isn't installed or no
+    accelerator is available. If jax is installed but the probe itself
     fails unexpectedly, logs at debug level rather than silently reporting no GPU.
     """
     try:
@@ -1112,19 +1118,19 @@ def probe_jax_gpu() -> Optional[Tuple[str, str]]:
     except ImportError:
         return None
     try:
-        accelerators = [d for d in jax.devices() if d.platform in ("gpu", "tpu")]
+        accelerators = [d for d in jax.devices() if d.platform.lower() in ("gpu", "tpu", "metal")]
         if not accelerators:
             return None
         first_accel = accelerators[0]
         accel_type = first_accel.platform.upper()
-        return (accel_type, f"{accel_type} ({first_accel.device_kind}) via JAX")
+        return GpuProbeResult(accel_type, f"{accel_type} ({first_accel.device_kind}) via JAX")
     except Exception as e:
         logger.debug(f"JAX GPU probe failed unexpectedly: {e}")
     return None
 
 
 # Fixed probe order preserves prior "first successful framework wins as primary" behavior.
-GPU_PROBES: List[Tuple[str, Callable[[], Optional[Tuple[str, str]]]]] = [
+GPU_PROBES: List[Tuple[str, Callable[[], Optional[GpuProbeResult]]]] = [
     ("torch", probe_torch_gpu),
     ("tensorflow", probe_tensorflow_gpu),
     ("jax", probe_jax_gpu),
@@ -1148,25 +1154,24 @@ def inspect_gpu_environment(imported_packages: Set[str]) -> Optional[GpuInfo]:
             continue
         result = probe()
         if result:
-            accel_type, dev_name = result
-            framework_devices[fw_stem] = dev_name
-            active_types.append(accel_type)
+            framework_devices[fw_stem] = result.device_name
+            active_types.append(result.accelerator_type)
             if not primary_dev:
                 primary_fw = CANONICAL_TO_FRAMEWORK_DISPLAY.get(fw_stem, fw_stem.capitalize())
-                primary_dev = dev_name
+                primary_dev = result.device_name
         else:
             framework_devices[fw_stem] = None
 
     has_gpu = primary_dev is not None
 
-    return {
-        "has_gpu": has_gpu,
-        "type": active_types[0] if active_types else None,
-        "active_framework": primary_fw,
-        "device_name": primary_dev,
-        "frameworks": sorted(found_frameworks),
-        "framework_devices": framework_devices
-    }
+    return GpuInfo(
+        has_gpu=has_gpu,
+        type=active_types[0] if active_types else None,
+        active_framework=primary_fw,
+        device_name=primary_dev,
+        frameworks=sorted(found_frameworks),
+        framework_devices=framework_devices
+    )
 
 
 # =====================================================================
@@ -1186,9 +1191,9 @@ def generate_production_blueprint(
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     gpu_markdown_section = ""
-    if gpu_info and gpu_info.get("has_gpu"):
-        dev_name = gpu_info["device_name"]
-        active_fw = gpu_info.get("active_framework", "Framework")
+    if gpu_info and gpu_info.has_gpu:
+        dev_name = gpu_info.device_name
+        active_fw = gpu_info.active_framework or "Framework"
         gpu_markdown_section = (
             f"- **Hardware Acceleration:** This notebook was created using a GPU accelerator (`{dev_name}`, verified via {active_fw}).\n"
             f"  If execution feels slow, ensure your runtime has a GPU accelerator enabled in environment settings."
@@ -1577,8 +1582,8 @@ def format_batch_report(summary: BatchAnalysisSummary) -> str:
         out.append("")
 
     out.append("⚡ ACCELERATOR & DOWNLOAD INDEX CHECK:")
-    if summary.batch_hw_cache and summary.batch_hw_cache.get("has_gpu"):
-        out.append(f"  • Active Hardware Accelerator: {summary.batch_hw_cache['device_name']}")
+    if summary.batch_hw_cache and summary.batch_hw_cache.has_gpu:
+        out.append(f"  • Active Hardware Accelerator: {summary.batch_hw_cache.device_name}")
     else:
         out.append("  • Active Hardware Accelerator: None (CPU-only execution environment)")
 
@@ -1711,9 +1716,9 @@ def apply_output_to_notebook(
     gpu_info: Optional[GpuInfo] = None
     if batch_hw_cache:
         expanded_nb_imports = expand_transitive_frameworks(scan_res.imports)
-        nb_fw = set(batch_hw_cache.get("frameworks", [])).intersection(expanded_nb_imports)
+        nb_fw = set(batch_hw_cache.frameworks).intersection(expanded_nb_imports)
         if nb_fw:
-            fw_devices = batch_hw_cache.get("framework_devices", {})
+            fw_devices = batch_hw_cache.framework_devices
             matched_fw = None
             matched_device = None
 
@@ -1725,24 +1730,24 @@ def apply_output_to_notebook(
 
             if matched_device:
                 active_label = CANONICAL_TO_FRAMEWORK_DISPLAY.get(matched_fw, matched_fw.capitalize())
-                
-                gpu_info = {
-                    "has_gpu": True,
-                    "type": batch_hw_cache.get("type"),
-                    "active_framework": active_label,
-                    "device_name": matched_device,
-                    "frameworks": sorted(list(nb_fw)),
-                    "framework_devices": fw_devices
-                }
+
+                gpu_info = GpuInfo(
+                    has_gpu=True,
+                    type=batch_hw_cache.type,
+                    active_framework=active_label,
+                    device_name=matched_device,
+                    frameworks=sorted(nb_fw),
+                    framework_devices=fw_devices
+                )
             else:
-                gpu_info = {
-                    "has_gpu": False,
-                    "type": None,
-                    "active_framework": None,
-                    "device_name": None,
-                    "frameworks": sorted(list(nb_fw)),
-                    "framework_devices": fw_devices
-                }
+                gpu_info = GpuInfo(
+                    has_gpu=False,
+                    type=None,
+                    active_framework=None,
+                    device_name=None,
+                    frameworks=sorted(nb_fw),
+                    framework_devices=fw_devices
+                )
 
     blueprint = generate_production_blueprint(manifest_lines, local_tagged_info=local_tagged, gpu_info=gpu_info)
     managed_cells = create_managed_cells(blueprint)
@@ -1905,10 +1910,10 @@ def run_single_file_pipeline(
         logger.info("")
 
     if gpu_info:
-        if gpu_info.get("has_gpu"):
-            logger.info(f"⚡ Active accelerator detected: {gpu_info['device_name']}\n")
-        elif gpu_info.get("frameworks"):
-            fw_list = ", ".join(gpu_info["frameworks"])
+        if gpu_info.has_gpu:
+            logger.info(f"⚡ Active accelerator detected: {gpu_info.device_name}\n")
+        elif gpu_info.frameworks:
+            fw_list = ", ".join(gpu_info.frameworks)
             logger.warning(f"⚠️ Acceleration Framework ({fw_list}) imported, but NO active accelerator detected in host runtime.\n")
 
     if promotion_notices:
