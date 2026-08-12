@@ -1537,91 +1537,54 @@ def apply_output_to_notebook(
 
     return target_path
 
+def run_batch_pipeline(
+    target_batch_dir: str, 
+    args: argparse.Namespace, 
+    frozen_env: Dict[str, str], 
+    pkg_dist_map: Dict[str, List[str]], 
+    batch_hw_cache: Optional[GpuInfo]
+) -> None:
+    """Executes the batch processing pipeline across a directory of notebooks."""
+    repo_map = walk_and_scan_directory(target_batch_dir)
+    report_text, is_clean = generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, batch_hw_cache)
+    print(report_text)
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate environment lockfiles for Jupyter Notebooks.")
-    parser.add_argument("notebook", nargs="?", help="Path to target .ipynb file or directory (when using --batch).")
-    parser.add_argument("--full-freeze", action="store_true", help="Append full environment pip freeze after targeted manifest.")
-    parser.add_argument("--quiet", action="store_true", help="Suppress diagnostic and status logging outputs.")
-    parser.add_argument("--verbose", action="store_true", help="Enable verbose debug output.")
-    
-    # Batch / Output Flags
-    parser.add_argument("--batch", metavar="DIR", help="Run in batch mode across all notebooks in specified directory.")
-    parser.add_argument("--analyze", action="store_true", help="Run batch analysis mode (default when --batch is provided).")
-    parser.add_argument("--universal", action="store_true", help="Generate root requirements-all.txt universal manifest.")
-    parser.add_argument("--output", action="store_true", help="Generate per-notebook merged lockfiles.")
-    parser.add_argument("--suffix", default="_merged", help="File suffix for merged notebook outputs (default: '_merged').")
-    parser.add_argument("--in-place", action="store_true", help="Overwrite original notebooks in-place instead of creating companion files.")
-
-    args, unknown = parser.parse_known_args()
-
-    if args.quiet:
-        logger.setLevel(logging.ERROR)
-    elif args.verbose:
-        logger.setLevel(logging.DEBUG)
-
-    # Pre-flight argument validation: Output flags without target
-    if (args.output or args.in_place) and not args.batch and not args.notebook:
-        logger.error("❌ Error: --output or --in-place requires a target notebook file path or --batch directory.")
+    if not is_clean and (args.universal or args.output or args.in_place):
+        logger.error("\n❌ Execution aborted: Resolve file/parse errors before running --universal, --output, or --in-place.")
         sys.exit(1)
 
-    # Environment inspection
-    frozen_env, raw_full_freeze = get_installed_environment()
-    pkg_dist_map = importlib.metadata.packages_distributions() if hasattr(importlib.metadata, "packages_distributions") else {}
-    
-    # Pre-harvest all imported framework dependencies for hardware checks
-    target_batch_dir = args.batch or (args.notebook if args.notebook and os.path.isdir(args.notebook) else None)
-    initial_imports = {"torch", "tensorflow", "jax"}
-    
-    if target_batch_dir:
-        repo_map_pre = walk_and_scan_directory(target_batch_dir)
-        initial_imports.update(repo_map_pre.global_imports)
-    elif args.notebook and os.path.isfile(args.notebook):
-        _, single_imports, _, _, _, _, _, _ = extract_from_file(args.notebook, strict=False)
-        initial_imports.update(single_imports)
+    if args.universal:
+        uni_content = generate_universal_manifest(repo_map, frozen_env, pkg_dist_map)
+        out_file = Path(target_batch_dir) / "requirements-all.txt"
+        with open(out_file, 'w', encoding='utf-8') as f:
+            f.write(uni_content)
+        logger.info(f"\n✅ Wrote universal repository manifest to '{out_file}'")
 
-    batch_hw_cache = inspect_gpu_environment(initial_imports)
+    if args.output or args.in_place:
+        logger.info(f"\n🚀 Writing per-notebook locked files ({'in-place' if args.in_place else 'suffix: ' + args.suffix})...")
+        for res in repo_map.scan_results:
+            written_path = apply_output_to_notebook(
+                res, 
+                frozen_env, 
+                pkg_dist_map, 
+                batch_hw_cache, 
+                suffix=args.suffix, 
+                in_place=args.in_place,
+                local_repo_modules=repo_map.local_repo_modules
+            )
+            logger.info(f"  • Updated '{written_path.name}'")
+        logger.info("✅ Batch output complete.")
 
-    # =====================================================================
-    # --- BATCH DISPATCH ---
-    # =====================================================================
-    if target_batch_dir:
-        repo_map = walk_and_scan_directory(target_batch_dir)
-        report_text, is_clean = generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, batch_hw_cache)
-        print(report_text)
+    sys.exit(0)
 
-        if not is_clean and (args.universal or args.output or args.in_place):
-            logger.error("\n❌ Execution aborted: Resolve file/parse errors before running --universal, --output, or --in-place.")
-            sys.exit(1)
 
-        if args.universal:
-            uni_content = generate_universal_manifest(repo_map, frozen_env, pkg_dist_map)
-            out_file = Path(target_batch_dir) / "requirements-all.txt"
-            with open(out_file, 'w', encoding='utf-8') as f:
-                f.write(uni_content)
-            logger.info(f"\n✅ Wrote universal repository manifest to '{out_file}'")
-
-        # BATCH DISPATCH FIX: Triggers on args.output OR args.in_place
-        if args.output or args.in_place:
-            logger.info(f"\n🚀 Writing per-notebook locked files ({'in-place' if args.in_place else 'suffix: ' + args.suffix})...")
-            for res in repo_map.scan_results:
-                written_path = apply_output_to_notebook(
-                    res, 
-                    frozen_env, 
-                    pkg_dist_map, 
-                    batch_hw_cache, 
-                    suffix=args.suffix, 
-                    in_place=args.in_place,
-                    local_repo_modules=repo_map.local_repo_modules
-                )
-                logger.info(f"  • Updated '{written_path.name}'")
-            logger.info("✅ Batch output complete.")
-
-        sys.exit(0)
-
-    # =====================================================================
-    # --- SINGLE FILE / LIVE SESSION DISPATCH ---
-    # =====================================================================
+def run_single_file_pipeline(
+    args: argparse.Namespace, 
+    frozen_env: Dict[str, str], 
+    raw_full_freeze: List[str],
+    pkg_dist_map: Dict[str, List[str]]
+) -> None:
+    """Executes single-notebook analysis or live IPython kernel history extraction."""
     in_live_ipython = False
     try:
         from IPython import get_ipython
@@ -1637,28 +1600,30 @@ def main() -> None:
         logger.info(f"🔍 [Path A] Analyzing saved notebook file '{args.notebook}' via AST...")
         logger.info(f"📌 Active Python Interpreter: {sys.executable}\n")
         
-        success, imports, submodules, code_sources, error_msg, _, guarded_imports, dyn_warnings = extract_from_file(args.notebook, strict=False)
-        if not success:
-            logger.error(f"❌ Error: {error_msg}")
+        ext_res = extract_from_file(args.notebook, strict=False)
+        if not ext_res.success:
+            logger.error(f"❌ Error: {ext_res.error_msg}")
             sys.exit(1)
             
+        imports, submodules, code_sources = ext_res.imports, ext_res.submodules, ext_res.code_sources
+        guarded_imports, dyn_warnings = ext_res.guarded_imports, ext_res.dynamic_warnings
         writefile_imports = extract_writefile_imports_from_sources(code_sources)
     elif in_live_ipython:
         logger.info("🔍 [Path B] Analyzing live IPython session kernel history via AST...")
         imports, submodules, code_sources, guarded_imports, dyn_warnings = extract_from_active_session()
         writefile_imports = extract_writefile_imports_from_sources(code_sources)
     else:
-        parser.print_help()
-        sys.exit(1)
+        return
 
-    harvested_pkgs, base_urls, extra_urls, magic_warns, magic_notices = harvest_cell_magics_and_commands(code_sources)
+    h_res = harvest_cell_magics_and_commands(code_sources)
+    harvested_pkgs = h_res.harvested_packages
+    base_urls, extra_urls = h_res.base_index_urls, h_res.extra_index_urls
+    magic_warns, magic_notices = h_res.magic_warnings, h_res.magic_notices
     harvested_urls = extra_urls.union(base_urls)
+
     gpu_info = inspect_gpu_environment(imports)
-    
-    # Combined warnings
     all_warnings = dyn_warnings + magic_warns
 
-    # Unified manifest building
     pinned_manifest, promotion_notices = build_manifest_entries(
         imports, 
         submodules, 
@@ -1668,7 +1633,6 @@ def main() -> None:
         local_repo_modules=single_file_local_modules
     )
     
-    # Build auxiliary tool and writefile dependency sections
     aux_entries = build_auxiliary_tool_entries(harvested_pkgs, imports, frozen_env)
     writefile_entries = build_writefile_tool_entries(writefile_imports, imports, frozen_env)
 
@@ -1677,7 +1641,7 @@ def main() -> None:
     )
     full_freeze_lines = raw_full_freeze if args.full_freeze else None
 
-    # DIAGNOSTIC LOGGING (To stderr via logger)
+    # Diagnostic logging to stderr
     if warnings:
         logger.warning("⚠️ HARDWARE BUILD WARNINGS:")
         for pkg in warnings:
@@ -1706,7 +1670,6 @@ def main() -> None:
             logger.info(note)
         logger.info("")
 
-    # Construct scan result for single-file disk output
     single_res = NotebookScanResult(
         path=Path(args.notebook) if args.notebook and not os.path.isdir(args.notebook) else Path("session.ipynb"),
         is_python=True,
@@ -1725,7 +1688,6 @@ def main() -> None:
         magic_notices=magic_notices
     )
 
-    # SINGLE-FILE DISK WRITE FIX: Triggers on args.output OR args.in_place
     if args.output or args.in_place:
         logger.info(f"🚀 Writing updated notebook ({'in-place' if args.in_place else 'suffix: ' + args.suffix})...")
         written_path = apply_output_to_notebook(
@@ -1740,7 +1702,7 @@ def main() -> None:
         logger.info(f"✅ Updated '{written_path.name}'")
         sys.exit(0)
 
-    # DEFAULT SINGLE-FILE EMISSION (stdout)
+    # Default single-file stdout emission
     blueprint = generate_production_blueprint(
         manifest_lines, 
         full_freeze_lines=full_freeze_lines, 
@@ -1756,6 +1718,52 @@ def main() -> None:
     print(blueprint["step2_code"])
     print("\n" + "="*80)
 
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Generate environment lockfiles for Jupyter Notebooks.")
+    parser.add_argument("notebook", nargs="?", help="Path to target .ipynb file or directory (when using --batch).")
+    parser.add_argument("--full-freeze", action="store_true", help="Append full environment pip freeze after targeted manifest.")
+    parser.add_argument("--quiet", action="store_true", help="Suppress diagnostic and status logging outputs.")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose debug output.")
+    
+    # Batch / Output Flags
+    parser.add_argument("--batch", metavar="DIR", help="Run in batch mode across all notebooks in specified directory.")
+    parser.add_argument("--analyze", action="store_true", help="Run batch analysis mode (default when --batch is provided).")
+    parser.add_argument("--universal", action="store_true", help="Generate root requirements-all.txt universal manifest.")
+    parser.add_argument("--output", action="store_true", help="Generate per-notebook merged lockfiles.")
+    parser.add_argument("--suffix", default="_merged", help="File suffix for merged notebook outputs (default: '_merged').")
+    parser.add_argument("--in-place", action="store_true", help="Overwrite original notebooks in-place instead of creating companion files.")
+
+    args, unknown = parser.parse_known_args()
+
+    if args.quiet:
+        logger.setLevel(logging.ERROR)
+    elif args.verbose:
+        logger.setLevel(logging.DEBUG)
+
+    if (args.output or args.in_place) and not args.batch and not args.notebook:
+        logger.error("❌ Error: --output or --in-place requires a target notebook file path or --batch directory.")
+        sys.exit(1)
+
+    frozen_env, raw_full_freeze = get_installed_environment()
+    pkg_dist_map = importlib.metadata.packages_distributions() if hasattr(importlib.metadata, "packages_distributions") else {}
+    
+    target_batch_dir = args.batch or (args.notebook if args.notebook and os.path.isdir(args.notebook) else None)
+    initial_imports = {"torch", "tensorflow", "jax"}
+    
+    if target_batch_dir:
+        repo_map_pre = walk_and_scan_directory(target_batch_dir)
+        initial_imports.update(repo_map_pre.global_imports)
+    elif args.notebook and os.path.isfile(args.notebook):
+        ext_res = extract_from_file(args.notebook, strict=False)
+        initial_imports.update(ext_res.imports)
+
+    batch_hw_cache = inspect_gpu_environment(initial_imports)
+
+    if target_batch_dir:
+        run_batch_pipeline(target_batch_dir, args, frozen_env, pkg_dist_map, batch_hw_cache)
+    else:
+        run_single_file_pipeline(args, frozen_env, raw_full_freeze, pkg_dist_map)
 
 if __name__ == "__main__":
     main()
