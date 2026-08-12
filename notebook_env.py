@@ -23,7 +23,7 @@ see the repository README:
 
 Execution Modes:
   1. Single Notebook CLI:  python notebook_env.py notebook.ipynb [--output | --in-place]
-  2. Batch Repo Directory: python notebook_env.py --batch ./repo --universal [--output | --in-place]
+  2. Batch Repo Directory: python notebook_env.py --batch ./repo [--universal [FILENAME]] [--output | --in-place]
   3. Live IPython Kernel:   import notebook_env as ne; ne.main()
 """
 
@@ -61,6 +61,30 @@ logger.setLevel(logging.INFO)
 console_handler = logging.StreamHandler(sys.stderr)
 console_handler.setFormatter(logging.Formatter("%(message)s"))
 logger.addHandler(console_handler)
+
+
+# =====================================================================
+# SYSTEM CONSTANTS & CONFIGURATION DEFAULTS
+# Configurable manifest filenames, documentation URLs, directory ignores, and hardware targets.
+# =====================================================================
+
+DEFAULT_PINNED_MANIFEST_NAME: str = "pinned_requirements.txt"
+DEFAULT_UNIVERSAL_MANIFEST_NAME: str = "requirements-all.txt"
+
+HELP_URL: str = "https://github.com/flyinacres/notebook_env/blob/main/HELP.md"
+README_URL: str = "https://github.com/flyinacres/notebook_env/blob/main/README.md"
+
+DEFAULT_IGNORED_DIRS: Set[str] = {
+    ".git", ".venv", "venv", "env", "__pycache__", ".ipynb_checkpoints", "build", "dist"
+}
+
+SUPPORTED_GPU_FRAMEWORKS: Set[str] = {"torch", "tensorflow", "jax"}
+
+CANONICAL_TO_FRAMEWORK_DISPLAY: Dict[str, str] = {
+    "torch": "PyTorch",
+    "tensorflow": "TensorFlow",
+    "jax": "JAX"
+}
 
 
 class StatusLabel:
@@ -293,11 +317,9 @@ TRANSITIVE_FRAMEWORK_MAP: Dict[str, str] = {
     "flax": "jax",
 }
 
-# Maps human-readable active framework labels from hardware inspection back to canonical import stems.
+# Inverts CANONICAL_TO_FRAMEWORK_DISPLAY for input mapping.
 FRAMEWORK_NAME_TO_CANONICAL: Dict[str, str] = {
-    "PyTorch": "torch",
-    "TensorFlow": "tensorflow",
-    "JAX": "jax",
+    v: k for k, v in CANONICAL_TO_FRAMEWORK_DISPLAY.items()
 }
 
 # Python standard library module stems. Used to filter built-in modules out of PyPI lockfile manifests.
@@ -314,14 +336,12 @@ def discover_local_repo_modules(target_dir: str) -> Set[str]:
     if not target_path.exists():
         return local_mods
 
-    ignored_dirs = {".git", ".venv", "venv", "env", "__pycache__", ".ipynb_checkpoints", "build", "dist"}
-
     try:
         # 1. Top-level .py files (directly importable as `import foo`)
         for entry in target_path.iterdir():
             if entry.is_file() and entry.suffix == ".py" and entry.stem != "__init__":
                 local_mods.add(entry.stem)
-            elif entry.is_dir() and entry.name not in ignored_dirs and not entry.name.startswith('.'):
+            elif entry.is_dir() and entry.name not in DEFAULT_IGNORED_DIRS and not entry.name.startswith('.'):
                 # 2. Top-level packages/directories (e.g. `import src` or `from src.utils import x`)
                 # Only register if it contains Python files
                 if any(entry.rglob("*.py")):
@@ -539,7 +559,7 @@ class NotebookImportVisitor(ast.NodeVisitor):
             else:
                 expr_repr = ast.unparse(first_arg) if hasattr(ast, "unparse") else "expression"
                 self.dynamic_import_warnings.append(
-                    f"⚠️ Dynamic import detected via non-literal argument '{expr_repr}'; statically unresolvable."
+                    f"⚠️ Dynamic import detected via variable '{expr_repr}'. Check that this package is installed if execution fails."
                 )
 
         self.generic_visit(node)
@@ -716,15 +736,13 @@ def harvest_cell_magics_and_commands(
 
                 if SYSTEM_PKG_PATTERN.match(seg):
                     magic_notices.append(
-                        f"ℹ️ System package manager call detected in cell {cell_idx} ('{seg}'); "
-                        f"system-level dependencies are outside Python package manifests."
+                        f"ℹ️ Cell {cell_idx} uses a system install command ('{seg}'). Note: System dependencies must be run manually by readers."
                     )
                     continue
 
                 if CONDA_INSTALL_PATTERN.match(seg):
                     magic_notices.append(
-                        f"ℹ️ Conda installation detected in cell {cell_idx} ('{seg}'); "
-                        f"conda packages are outside pip freeze correlation."
+                        f"ℹ️ Cell {cell_idx} uses 'conda install'. Conda packages are not tracked in pip requirements manifests."
                     )
                     continue
 
@@ -734,8 +752,7 @@ def harvest_cell_magics_and_commands(
 
                     if "-r " in args_str or "--requirement" in args_str:
                         magic_warnings.append(
-                            f"⚠️ Cell {cell_idx} magic '{seg}' references an external requirements file; "
-                            f"contents cannot be verified statically."
+                            f"⚠️ Cell {cell_idx} references an external requirements file ('{seg}'). Ensure that file is shared alongside your notebook."
                         )
                         continue
 
@@ -795,9 +812,9 @@ def build_auxiliary_tool_entries(
     for tool in unimported_tools:
         matched_pin = frozen_env.get(tool.lower())
         if matched_pin:
-            aux_entries.append(f"# {matched_pin}  (installed via cell magic; not directly imported in Python code)")
+            aux_entries.append(f"# {matched_pin}  (installed via cell command; not directly imported in Python code)")
         else:
-            aux_entries.append(f"# {tool}  (installed via cell magic; not found in active env)")
+            aux_entries.append(f"# {tool}  (installed via cell command; not found in active env)")
 
     return aux_entries
 
@@ -839,10 +856,10 @@ def resolve_pypi_package_and_extras(
 ) -> Tuple[str, Optional[str]]:
     """Resolves top-level import to PyPI package name, platform pseudo-module, or local repo module."""
     if imp in PLATFORM_PSEUDO_MODULES:
-        return f"# {imp} (platform pseudo-module provided by runtime environment)", None
+        return f"# {imp} (provided automatically by platform like Colab/Databricks; no install needed)", None
 
     if local_repo_modules and imp in local_repo_modules:
-        return f"# {imp} (local repo module; not a PyPI package)", None
+        return f"# {imp} (local folder/file next to notebook; ensure sibling files were shared)", None
 
     pypi_name = None
     if pkg_dist_map is None and hasattr(importlib.metadata, "packages_distributions"):
@@ -864,8 +881,8 @@ def resolve_pypi_package_and_extras(
 
     if is_guarded:
         if matched_pin:
-            return f"# {matched_pin} (guarded import in try/except or conditional block - optional dependency)", None
-        return f"# {pypi_name} (imported as '{imp}' in try/except or conditional block - optional fallback)", None
+            return f"# {matched_pin} (optional dependency used in conditional block; not required)", None
+        return f"# {pypi_name} (optional dependency used in conditional block; not required)", None
 
     if not matched_pin:
         return f"# {pypi_name} (imported as '{imp}', not currently found in active env)", None
@@ -1004,8 +1021,6 @@ def process_package_requirements(
 
 def inspect_gpu_environment(imported_packages: Set[str]) -> Optional[GpuInfo]:
     """Per-framework GPU/accelerator inspection logic across PyTorch, TensorFlow, and JAX."""
-    gpu_frameworks = {"torch", "tensorflow", "jax"}
-    
     expanded_imports = set(imported_packages)
     for pkg in imported_packages:
         base_fw = TRANSITIVE_FRAMEWORK_MAP.get(pkg)
@@ -1016,13 +1031,13 @@ def inspect_gpu_environment(imported_packages: Set[str]) -> Optional[GpuInfo]:
                 reqs = importlib.metadata.requires(pkg) or []
                 for req in reqs:
                     req_lower = req.lower()
-                    for fw in gpu_frameworks:
+                    for fw in SUPPORTED_GPU_FRAMEWORKS:
                         if fw in req_lower:
                             expanded_imports.add(fw)
             except Exception:
                 pass
 
-    found_frameworks = list(gpu_frameworks.intersection(expanded_imports))
+    found_frameworks = list(SUPPORTED_GPU_FRAMEWORKS.intersection(expanded_imports))
     if not found_frameworks:
         return None
 
@@ -1125,8 +1140,8 @@ def generate_production_blueprint(
         dev_name = gpu_info["device_name"]
         active_fw = gpu_info.get("active_framework", "Framework")
         gpu_markdown_section = (
-            f"- **Hardware Acceleration:** This notebook was created using an active accelerator (`{dev_name}`, verified via {active_fw}).\n"
-            f"  If execution is slow or fails, you MAY need to enable a GPU accelerator in your environment settings (e.g. CUDA/MPS/TPU)."
+            f"- **Hardware Acceleration:** This notebook was created using a GPU accelerator (`{dev_name}`, verified via {active_fw}).\n"
+            f"  If execution feels slow, ensure your runtime has a GPU accelerator enabled in environment settings."
         )
 
     local_builds_section = ""
@@ -1138,13 +1153,13 @@ def generate_production_blueprint(
                 for u in urls:
                     bullet_lines.append(f"    Download index: `{u}`")
             else:
-                bullet_lines.append("    ⚠️ No download URL was specified in notebook cells. If installation fails, ensure your target runtime matches this build or supply an `--extra-index-url`.")
-        local_builds_section = f"- **Specific Package Builds Detected:** The following package(s) use custom or platform-specific local builds:\n" + "\n".join(bullet_lines)
+                bullet_lines.append("    ⚠️ Specific hardware build tag detected. If installation fails, ensure your runtime matches this build.")
+        local_builds_section = f"- **Specific Package Builds Detected:** The following package(s) use custom or hardware-specific builds:\n" + "\n".join(bullet_lines)
 
     markdown_lines = [
         "### 🛠️ Environment Setup & Dependency Verification",
-        "This notebook includes a pinned environment manifest (`pinned_requirements.txt`) to ensure reproducible execution.\n",
-        "- **Dependency Sync:** Cell 2 will verify your active Python version and apply the exact package manifest recorded by the author."
+        f"This notebook includes a pinned dependency list (`{DEFAULT_PINNED_MANIFEST_NAME}`) to ensure reproducible execution.\n",
+        "- **Automatic Setup:** Cell 2 will verify your Python version and apply the exact package versions used by the author."
     ]
     
     if gpu_markdown_section:
@@ -1152,27 +1167,12 @@ def generate_production_blueprint(
     if local_builds_section:
         markdown_lines.append(local_builds_section)
         
-    markdown_lines.append("- **Network Notice:** If required packages are not already cached in your current runtime environment, internet access may be needed to download missing wheels.")
+    markdown_lines.append("- **Network Notice:** Active internet access is required to download uncached packages.")
 
     step1_markdown = "\n".join(markdown_lines)
     payload_string = "\n".join(manifest_lines).strip()
     if full_freeze_lines:
         payload_string += "\n\n# --- FULL FREEZE FALLBACK BLOCK ---\n" + "\n".join(full_freeze_lines)
-
-    has_local_tags = any('+' in line for line in manifest_lines if not line.startswith('#'))
-
-    if has_local_tags:
-        failure_advice = """print("\\n❌ Setup failed while installing pinned dependencies.")
-print("It looks like your environment could not locate a matching wheel for local tag builds (e.g. +cu121, +cpu).\\n")
-print("Possible solutions:")
-print("1. Make sure your notebook runtime matches the required hardware (e.g. GPU vs CPU).")
-print("2. Or try installing the standard version directly in a code cell (e.g. !pip install torch).")"""
-    else:
-        failure_advice = """print("\\n❌ Setup failed while installing pinned dependencies.\\n")
-print("Possible solutions:")
-print("1. Ensure your notebook environment has active internet access to download wheels.")
-print("2. Verify that your current Python version is compatible with the required packages.")
-print("3. Try running '!pip install <package>' manually to view detailed compiler/pip error logs.")"""
 
     step2_code = f"""# =====================================================================
 # VERIFIED ENVIRONMENT DEPENDENCIES ({timestamp})
@@ -1197,29 +1197,34 @@ if CURRENT_PYTHON[1] != REQUIRED_PYTHON[1]:
     req_ver = f"{{REQUIRED_PYTHON[0]}}.{{REQUIRED_PYTHON[1]}}"
     curr_ver = f"{{CURRENT_PYTHON[0]}}.{{CURRENT_PYTHON[1]}}"
     print(f"⚠️ This code was created with Python {{req_ver}}. You are trying to run it with {{curr_ver}}.")
-    print(f"If installation fails, you may need to change your Python version back to {{req_ver}}.\\n")
+    print(f"If installation fails, consider changing your runtime Python version back to {{req_ver}}.\\n")
 
 # Write explicit library requirements to a local file
 requirements_content = \"\"\"# Tested top-level packages for this notebook
 {payload_string}
 \"\"\"
 
-with open("pinned_requirements.txt", "w") as f:
+with open("{DEFAULT_PINNED_MANIFEST_NAME}", "w") as f:
     f.write(requirements_content.strip())
 
 print(f"Applying pinned environment manifest [{timestamp}]...")
-print("💡 Note: If you see 'Retrying...' messages below while offline, enable Internet access and re-run this cell.\\n")
+print("💡 Note: If installation pauses while offline, enable Internet access and re-run this cell.\\n")
 
 # Run single-pass installation natively via pip
 result = subprocess.run(
-    [sys.executable, "-m", "pip", "install", "-r", "pinned_requirements.txt"],
+    [sys.executable, "-m", "pip", "install", "-r", "{DEFAULT_PINNED_MANIFEST_NAME}"],
     capture_output=False
 )
 
 if result.returncode == 0:
     print("\\n✅ Setup complete! Environment ready.")
 else:
-    {failure_advice}"""
+    print("\\n❌ Setup failed while installing required packages.\\n")
+    print("Troubleshooting Steps:")
+    print("1. Internet Access: Ensure your notebook environment has active internet access.")
+    print("2. GPU / Hardware: If using PyTorch or TensorFlow, check that GPU acceleration is enabled.")
+    print("3. Detailed Error: Scroll up above this line to inspect detailed pip error logs.")
+    print(f"\\n👉 For a detailed guide on resolving setup errors, see: {HELP_URL}")"""
 
     return {
         "step1_markdown": step1_markdown,
@@ -1327,7 +1332,7 @@ def walk_and_scan_directory(target_dir: str) -> RepoEnvironmentMap:
     target_path = Path(target_dir)
 
     for root, dirs, files in os.walk(target_path):
-        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('venv', 'env', '__pycache__')]
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in DEFAULT_IGNORED_DIRS]
         for file in sorted(files):
             if file.endswith('.ipynb'):
                 full_path = Path(root) / file
@@ -1430,7 +1435,7 @@ def analyze_batch_repository(
 
         for pin_entry in pinned_entries:
             if pin_entry.startswith("#"):
-                if "platform pseudo-module" in pin_entry or "local repo module" in pin_entry:
+                if "provided automatically" in pin_entry or "local folder/file" in pin_entry:
                     continue
                 pypi_name = pin_entry.split()[1]
                 summary.missing_packages.setdefault(pypi_name, []).append(res.path.name)
@@ -1563,7 +1568,7 @@ def generate_batch_analysis_report(
 def generate_universal_manifest(
     repo_map: RepoEnvironmentMap, frozen_env: Dict[str, str], pkg_dist_map: Dict[str, List[str]]
 ) -> str:
-    """Generates content string for requirements-all.txt."""
+    """Generates content string for universal manifest."""
     lines = []
     lines.append("# =====================================================================")
     lines.append("# REPOSITORY UNIVERSAL DEPENDENCY MANIFEST")
@@ -1672,8 +1677,7 @@ def apply_output_to_notebook(
                     break
 
             if matched_device:
-                fw_display_map = {"torch": "PyTorch", "tensorflow": "TensorFlow", "jax": "JAX"}
-                active_label = fw_display_map.get(matched_fw, matched_fw.capitalize())
+                active_label = CANONICAL_TO_FRAMEWORK_DISPLAY.get(matched_fw, matched_fw.capitalize())
                 
                 gpu_info = {
                     "has_gpu": True,
@@ -1736,8 +1740,9 @@ def run_batch_pipeline(
         sys.exit(1)
 
     if args.universal:
+        manifest_filename = args.universal if isinstance(args.universal, str) else DEFAULT_UNIVERSAL_MANIFEST_NAME
         uni_content = generate_universal_manifest(repo_map, frozen_env, pkg_dist_map)
-        out_file = Path(target_batch_dir) / "requirements-all.txt"
+        out_file = Path(target_batch_dir) / manifest_filename
         with open(out_file, 'w', encoding='utf-8') as f:
             f.write(uni_content)
         logger.info(f"\n✅ Wrote universal repository manifest to '{out_file}'")
@@ -1829,7 +1834,7 @@ def run_single_file_pipeline(
         logger.warning("⚠️ HARDWARE BUILD WARNINGS:")
         for pkg in warnings:
             logger.warning(f"  • Specific hardware build detected: `{pkg}`")
-            logger.warning("    No matching download URL was found in code cells. If installation fails on target machines, ensure runtime matches or supply an --extra-index-url.\n")
+            logger.warning("    No matching download URL was found in code cells. Ensure target machines match this build or supply an --extra-index-url.\n")
 
     if all_warnings:
         for warn in all_warnings:
@@ -1913,7 +1918,14 @@ def main() -> None:
     # Batch / Output Flags
     parser.add_argument("--batch", metavar="DIR", help="Run in batch mode across all notebooks in specified directory.")
     parser.add_argument("--analyze", action="store_true", help="Run batch analysis mode (default when --batch is provided).")
-    parser.add_argument("--universal", action="store_true", help="Generate root requirements-all.txt universal manifest.")
+    parser.add_argument(
+        "--universal", 
+        nargs="?", 
+        const=DEFAULT_UNIVERSAL_MANIFEST_NAME, 
+        default=None, 
+        metavar="FILENAME",
+        help=f"Generate universal repository manifest (default: '{DEFAULT_UNIVERSAL_MANIFEST_NAME}' when flag is provided)."
+    )
     parser.add_argument("--output", action="store_true", help="Generate per-notebook merged lockfiles.")
     parser.add_argument("--suffix", default="_merged", help="File suffix for merged notebook outputs (default: '_merged').")
     parser.add_argument("--in-place", action="store_true", help="Overwrite original notebooks in-place instead of creating companion files.")
@@ -1933,7 +1945,7 @@ def main() -> None:
     pkg_dist_map = importlib.metadata.packages_distributions() if hasattr(importlib.metadata, "packages_distributions") else {}
     
     target_batch_dir = args.batch or (args.notebook if args.notebook and os.path.isdir(args.notebook) else None)
-    initial_imports = {"torch", "tensorflow", "jax"}
+    initial_imports = set(SUPPORTED_GPU_FRAMEWORKS)
     
     if target_batch_dir:
         repo_map_pre = walk_and_scan_directory(target_batch_dir)

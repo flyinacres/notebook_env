@@ -653,7 +653,8 @@ class TestIntegrationAndFormatting:
         assert len(aux_entries) == 2
         assert aux_entries[0] == "\n# --- AUXILIARY TOOL INSTALLS (harvested from cell magics) ---"
         assert "# gdown==5.1.0" in aux_entries[1]
-        assert "installed via cell magic" in aux_entries[1]
+        assert "installed via cell command" in aux_entries[1]
+
 
     def test_uninstalled_auxiliary_tools_rendered_as_unpinned_comment(self) -> None:
         """Auxiliary tools not found in the active environment render as unpinned commented entries."""
@@ -664,8 +665,7 @@ class TestIntegrationAndFormatting:
         aux_entries = ne.build_auxiliary_tool_entries(harvested_pkgs, imports, frozen_env)
 
         assert len(aux_entries) == 2
-        assert "# awscli  (installed via cell magic; not found in active env)" in aux_entries[1]
-
+        assert "# awscli  (installed via cell command; not found in active env)" in aux_entries[1]
     def test_writefile_script_dependencies_rendered_in_separate_section(self) -> None:
         """Dependencies imported exclusively inside %%writefile cells render in a dedicated block."""
         primary_imports = {"pandas"}
@@ -693,12 +693,13 @@ def test_discover_local_repo_modules_top_level(tmp_path):
     assert "helpers" not in discovered
 
 def test_production_blueprint_failure_message_dynamic():
-    """Verify Cell 2 failure advice adapts based on whether local build tags (+cu121) exist in manifest."""
+    """Verify Cell 2 failure advice adaptively includes user troubleshooting steps and HELP_URL link."""
     # Standard manifest without local tags
     std_blueprint = ne.generate_production_blueprint(["pandas==2.1.0", "numpy==1.25.0"])
-    assert "internet access" in std_blueprint["step2_code"]
-    assert "+cu121" not in std_blueprint["step2_code"]
+    assert "Internet Access" in std_blueprint["step2_code"]
+    assert ne.HELP_URL in std_blueprint["step2_code"]
 
     # Manifest containing local tag build
     tagged_blueprint = ne.generate_production_blueprint(["torch==2.1.0+cu121"])
-    assert "local tag builds (e.g. +cu121, +cpu)" in tagged_blueprint["step2_code"]
+    assert "Troubleshooting Steps:" in tagged_blueprint["step2_code"]
+    assert ne.HELP_URL in tagged_blueprint["step2_code"]
