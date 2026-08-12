@@ -73,13 +73,23 @@ class StatusLabel:
 
 
 class GpuInfo(TypedDict, total=False):
-    """Payload representing active host accelerator capabilities."""
+    """
+    Payload representing active host accelerator capabilities across PyTorch, TensorFlow, and JAX.
+    
+    Fields:
+        has_gpu: True if at least one framework verified an active GPU/accelerator.
+        type: Primary hardware string (e.g., 'NVIDIA CUDA', 'Apple Silicon MPS', 'GPU', 'TPU').
+        active_framework: Human-readable display label of the primary active framework (e.g., 'PyTorch', 'TensorFlow', 'JAX').
+        device_name: Primary device hardware descriptor string.
+        frameworks: List of canonical framework stems detected in imports (['torch', 'tensorflow', 'jax']).
+        framework_devices: Map of canonical framework stem -> verified device descriptor string (or None if CPU-only).
+    """
     has_gpu: bool
     type: Optional[str]
     active_framework: Optional[str]
     device_name: Optional[str]
     frameworks: List[str]
-    framework_devices: Dict[str, Optional[str]]  # Map canonical fw stem -> device_nam
+    framework_devices: Dict[str, Optional[str]]
 
 
 class BlueprintResult(TypedDict):
@@ -261,6 +271,15 @@ def discover_local_repo_modules(target_dir: str) -> Set[str]:
 
     return local_mods
 
+def get_notebook_local_modules(notebook_path: Path, root_dir: Optional[str] = None) -> Set[str]:
+    """
+    Discovers local repo modules scoped to both the notebook's immediate parent directory
+    and the overall repository root directory.
+    """
+    local_mods = discover_local_repo_modules(str(notebook_path.parent))
+    if root_dir and Path(root_dir).exists():
+        local_mods.update(discover_local_repo_modules(root_dir))
+    return local_mods
 
 # =====================================================================
 # CELL CLASSIFICATION & SOURCE PIPELINE
@@ -1286,13 +1305,16 @@ def analyze_batch_repository(
         )
 
     for res in repo_map.scan_results:
+        # Scope local repo modules to both the notebook's parent directory and repository root
+        nb_local_mods = get_notebook_local_modules(res.path, repo_map.target_dir)
+
         pinned_entries, notes = build_manifest_entries(
             res.imports, 
             res.submodules, 
             frozen_env, 
             pkg_dist_map, 
             guarded_imports=res.guarded_imports,
-            local_repo_modules=repo_map.local_repo_modules
+            local_repo_modules=nb_local_mods
         )
 
         _, _, hw_warns = process_package_requirements(
@@ -1329,8 +1351,9 @@ def analyze_batch_repository(
                 pkg_name = pin_entry.split("==")[0]
                 summary.matched_packages.add(pkg_name)
 
+        # Process harvested magic packages
         for pkg in res.harvested_pkgs:
-            if pkg in STD_LIB or pkg in PLATFORM_PSEUDO_MODULES or pkg in repo_map.local_repo_modules:
+            if pkg in STD_LIB or pkg in PLATFORM_PSEUDO_MODULES or pkg in nb_local_mods:
                 continue
             pypi_name = IMPORT_TO_PYPI_MAP.get(pkg, pkg)
             matched_pin = frozen_env.get(pypi_name.lower())
@@ -1503,9 +1526,13 @@ def apply_output_to_notebook(
     batch_hw_cache: Optional[GpuInfo], 
     suffix: str = "_merged", 
     in_place: bool = False,
-    local_repo_modules: Optional[Set[str]] = None
+    local_repo_modules: Optional[Set[str]] = None,
+    root_dir: Optional[str] = None
 ) -> Path:
     """Writes per-notebook locked file or replaces cells in-place."""
+    if local_repo_modules is None:
+        local_repo_modules = get_notebook_local_modules(scan_res.path, root_dir)
+
     pinned_manifest, _ = build_manifest_entries(
         scan_res.imports, 
         scan_res.submodules, 
@@ -1521,7 +1548,7 @@ def apply_output_to_notebook(
     manifest_lines, local_tagged, _ = process_package_requirements(
         pinned_manifest, scan_res.harvested_urls, base_urls=base_urls, auxiliary_entries=aux_entries, writefile_entries=writefile_entries
     )
-    
+
     gpu_info: Optional[GpuInfo] = None
     if batch_hw_cache:
         expanded_nb_imports = set(scan_res.imports)
@@ -1618,6 +1645,7 @@ def run_batch_pipeline(
     if args.output or args.in_place:
         logger.info(f"\n🚀 Writing per-notebook locked files ({'in-place' if args.in_place else 'suffix: ' + args.suffix})...")
         for res in repo_map.scan_results:
+            nb_local_mods = get_notebook_local_modules(res.path, repo_map.target_dir)
             written_path = apply_output_to_notebook(
                 res, 
                 frozen_env, 
@@ -1625,7 +1653,7 @@ def run_batch_pipeline(
                 batch_hw_cache, 
                 suffix=args.suffix, 
                 in_place=args.in_place,
-                local_repo_modules=repo_map.local_repo_modules
+                local_repo_modules=nb_local_mods
             )
             logger.info(f"  • Updated '{written_path.name}'")
         logger.info("✅ Batch output complete.")

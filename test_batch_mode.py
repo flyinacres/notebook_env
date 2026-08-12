@@ -321,3 +321,37 @@ def test_batch_report_surfaces_hardware_tag_warnings(tmp_path):
     
     assert "Local / Hardware Tag Build Warnings:" in report_text
     assert "torch==2.1.0+cu121" in report_text
+
+def test_batch_mode_scopes_local_modules_to_notebook_subdirectory(tmp_path):
+    """Verify batch analysis recognizes local modules in subdirectories relative to the notebook."""
+    # Build nested layout: repo_root/databricks/notebook.ipynb and repo_root/databricks/cookbook/__init__.py
+    sub_dir = tmp_path / "databricks"
+    cookbook_dir = sub_dir / "cookbook"
+    cookbook_dir.mkdir(parents=True)
+    (cookbook_dir / "__init__.py").write_text("# local package", encoding="utf-8")
+
+    nb_path = sub_dir / "05_tool_calling_agent.ipynb"
+    nb_data = {
+        "cells": [{"cell_type": "code", "execution_count": 1, "metadata": {}, "outputs": [], "source": ["import cookbook"]}],
+        "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"}},
+        "nbformat": 4,
+        "nbformat_minor": 5
+    }
+    with open(nb_path, "w", encoding="utf-8") as f:
+        json.dump(nb_data, f)
+
+    scan_res = ne.NotebookScanResult(
+        path=nb_path,
+        is_python=True,
+        lang_label="python",
+        imports={"cookbook"},
+        code_sources=["import cookbook"]
+    )
+
+    repo_map = ne.RepoEnvironmentMap(str(tmp_path))
+    repo_map.add_result(scan_res)
+
+    summary = ne.analyze_batch_repository(repo_map, {}, {}, None)
+
+    # Assert 'cookbook' is recognized as a local repo module and NOT flagged as missing PyPI package
+    assert "cookbook" not in summary.missing_packages
