@@ -46,7 +46,7 @@ import importlib.metadata
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field
-from typing import Set, Dict, List, Tuple, Optional, Any, TypedDict
+from typing import Set, Dict, List, Tuple, Optional, Any, TypedDict, Callable
 
 
 # Force UTF-8 encoding for stdout and stderr on Windows/redirected environments
@@ -1019,13 +1019,21 @@ def process_package_requirements(
 # PyTorch (CUDA/MPS), TensorFlow (GPU), and JAX (GPU/TPU).
 # =====================================================================
 
-def inspect_gpu_environment(imported_packages: Set[str]) -> Optional[GpuInfo]:
-    """Per-framework GPU/accelerator inspection logic across PyTorch, TensorFlow, and JAX."""
-    expanded_imports = set(imported_packages)
-    for pkg in imported_packages:
+def expand_transitive_frameworks(imports: Set[str]) -> Set[str]:
+    """
+    Expands a set of import stems to include their base GPU framework.
+
+    Checks the static TRANSITIVE_FRAMEWORK_MAP first (e.g. `fastai` -> `torch`),
+    then falls back to a dynamic `importlib.metadata.requires()` lookup for
+    packages not in the static map that declare a framework dependency.
+    Shared by inspect_gpu_environment (host-level probing) and
+    apply_output_to_notebook (per-notebook attribution) so the two stay in sync.
+    """
+    expanded = set(imports)
+    for pkg in imports:
         base_fw = TRANSITIVE_FRAMEWORK_MAP.get(pkg)
         if base_fw:
-            expanded_imports.add(base_fw)
+            expanded.add(base_fw)
         else:
             try:
                 reqs = importlib.metadata.requires(pkg) or []
@@ -1033,10 +1041,99 @@ def inspect_gpu_environment(imported_packages: Set[str]) -> Optional[GpuInfo]:
                     req_lower = req.lower()
                     for fw in SUPPORTED_GPU_FRAMEWORKS:
                         if fw in req_lower:
-                            expanded_imports.add(fw)
+                            expanded.add(fw)
             except Exception:
                 pass
+    return expanded
 
+
+def probe_torch_gpu() -> Optional[Tuple[str, str]]:
+    """
+    Probes PyTorch for CUDA or Apple Silicon MPS acceleration.
+
+    Returns (accelerator_type, device_name), or None if torch isn't installed
+    or no accelerator is available. If torch is installed but the probe itself
+    fails unexpectedly (not just "not installed"), logs at debug level
+    (visible via --verbose) rather than silently reporting no GPU.
+    """
+    try:
+        import torch
+    except ImportError:
+        return None
+    try:
+        if torch.cuda.is_available():
+            return ("NVIDIA CUDA", f"{torch.cuda.get_device_name(0)} (via PyTorch)")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return ("Apple Silicon MPS", "Apple Silicon GPU (Metal via PyTorch)")
+    except Exception as e:
+        logger.debug(f"PyTorch GPU probe failed unexpectedly: {e}")
+    return None
+
+
+def probe_tensorflow_gpu() -> Optional[Tuple[str, str]]:
+    """
+    Probes TensorFlow for GPU acceleration.
+
+    Returns (accelerator_type, device_name), or None if tensorflow isn't
+    installed or no GPU is available. If tensorflow is installed but the probe
+    itself fails unexpectedly, logs at debug level rather than silently
+    reporting no GPU.
+    """
+    try:
+        import tensorflow as tf
+    except ImportError:
+        return None
+    try:
+        gpus = tf.config.list_physical_devices('GPU')
+        if not gpus:
+            return None
+        dev_name = "NVIDIA GPU (via TensorFlow)"
+        try:
+            details = tf.config.experimental.get_device_details(gpus[0])
+            dev_name = f"{details.get('device_name', 'NVIDIA GPU')} (via TensorFlow)"
+        except Exception:
+            pass  # Cosmetic detail lookup only; falls back to the generic name above.
+        return ("GPU", dev_name)
+    except Exception as e:
+        logger.debug(f"TensorFlow GPU probe failed unexpectedly: {e}")
+    return None
+
+
+def probe_jax_gpu() -> Optional[Tuple[str, str]]:
+    """
+    Probes JAX for GPU/TPU acceleration.
+
+    Returns (accelerator_type, device_name), or None if jax isn't installed
+    or no accelerator is available. If jax is installed but the probe itself
+    fails unexpectedly, logs at debug level rather than silently reporting no GPU.
+    """
+    try:
+        import jax
+    except ImportError:
+        return None
+    try:
+        accelerators = [d for d in jax.devices() if d.platform in ("gpu", "tpu")]
+        if not accelerators:
+            return None
+        first_accel = accelerators[0]
+        accel_type = first_accel.platform.upper()
+        return (accel_type, f"{accel_type} ({first_accel.device_kind}) via JAX")
+    except Exception as e:
+        logger.debug(f"JAX GPU probe failed unexpectedly: {e}")
+    return None
+
+
+# Fixed probe order preserves prior "first successful framework wins as primary" behavior.
+GPU_PROBES: List[Tuple[str, Callable[[], Optional[Tuple[str, str]]]]] = [
+    ("torch", probe_torch_gpu),
+    ("tensorflow", probe_tensorflow_gpu),
+    ("jax", probe_jax_gpu),
+]
+
+
+def inspect_gpu_environment(imported_packages: Set[str]) -> Optional[GpuInfo]:
+    """Coordinates per-framework GPU/accelerator probing across PyTorch, TensorFlow, and JAX."""
+    expanded_imports = expand_transitive_frameworks(imported_packages)
     found_frameworks = list(SUPPORTED_GPU_FRAMEWORKS.intersection(expanded_imports))
     if not found_frameworks:
         return None
@@ -1046,66 +1143,19 @@ def inspect_gpu_environment(imported_packages: Set[str]) -> Optional[GpuInfo]:
     primary_fw: Optional[str] = None
     primary_dev: Optional[str] = None
 
-    # Probe PyTorch
-    if "torch" in found_frameworks:
-        try:
-            import torch
-            if torch.cuda.is_available():
-                dev_str = f"{torch.cuda.get_device_name(0)} (via PyTorch)"
-                framework_devices["torch"] = dev_str
-                active_types.append("NVIDIA CUDA")
-                if not primary_dev:
-                    primary_fw, primary_dev = "PyTorch", dev_str
-            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                dev_str = "Apple Silicon GPU (Metal via PyTorch)"
-                framework_devices["torch"] = dev_str
-                active_types.append("Apple Silicon MPS")
-                if not primary_dev:
-                    primary_fw, primary_dev = "PyTorch", dev_str
-            else:
-                framework_devices["torch"] = None
-        except Exception:
-            framework_devices["torch"] = None
-
-    # Probe TensorFlow
-    if "tensorflow" in found_frameworks:
-        try:
-            import tensorflow as tf
-            gpus = tf.config.list_physical_devices('GPU')
-            if gpus:
-                dev_name = "NVIDIA GPU (via TensorFlow)"
-                try:
-                    details = tf.config.experimental.get_device_details(gpus[0])
-                    dev_name = f"{details.get('device_name', 'NVIDIA GPU')} (via TensorFlow)"
-                except Exception:
-                    pass
-                framework_devices["tensorflow"] = dev_name
-                active_types.append("GPU")
-                if not primary_dev:
-                    primary_fw, primary_dev = "TensorFlow", dev_name
-            else:
-                framework_devices["tensorflow"] = None
-        except Exception:
-            framework_devices["tensorflow"] = None
-
-    # Probe JAX
-    if "jax" in found_frameworks:
-        try:
-            import jax
-            devices = jax.devices()
-            accelerators = [d for d in devices if d.platform in ("gpu", "tpu")]
-            if accelerators:
-                first_accel = accelerators[0]
-                accel_type = first_accel.platform.upper()
-                dev_name = f"{accel_type} ({first_accel.device_kind}) via JAX"
-                framework_devices["jax"] = dev_name
-                active_types.append(accel_type)
-                if not primary_dev:
-                    primary_fw, primary_dev = "JAX", dev_name
-            else:
-                framework_devices["jax"] = None
-        except Exception:
-            framework_devices["jax"] = None
+    for fw_stem, probe in GPU_PROBES:
+        if fw_stem not in found_frameworks:
+            continue
+        result = probe()
+        if result:
+            accel_type, dev_name = result
+            framework_devices[fw_stem] = dev_name
+            active_types.append(accel_type)
+            if not primary_dev:
+                primary_fw = CANONICAL_TO_FRAMEWORK_DISPLAY.get(fw_stem, fw_stem.capitalize())
+                primary_dev = dev_name
+        else:
+            framework_devices[fw_stem] = None
 
     has_gpu = primary_dev is not None
 
@@ -1660,12 +1710,7 @@ def apply_output_to_notebook(
     
     gpu_info: Optional[GpuInfo] = None
     if batch_hw_cache:
-        expanded_nb_imports = set(scan_res.imports)
-        for imp in scan_res.imports:
-            base_fw = TRANSITIVE_FRAMEWORK_MAP.get(imp)
-            if base_fw:
-                expanded_nb_imports.add(base_fw)
-
+        expanded_nb_imports = expand_transitive_frameworks(scan_res.imports)
         nb_fw = set(batch_hw_cache.get("frameworks", [])).intersection(expanded_nb_imports)
         if nb_fw:
             fw_devices = batch_hw_cache.get("framework_devices", {})
@@ -1773,9 +1818,19 @@ def run_single_file_pipeline(
     args: argparse.Namespace, 
     frozen_env: Dict[str, str], 
     raw_full_freeze: List[str],
-    pkg_dist_map: Dict[str, List[str]]
+    pkg_dist_map: Dict[str, List[str]],
+    precomputed_gpu_info: Optional[GpuInfo] = None
 ) -> None:
-    """Executes single-notebook analysis or live IPython kernel history extraction."""
+    """
+    Executes single-notebook analysis or live IPython kernel history extraction.
+
+    Args:
+        precomputed_gpu_info: GPU inspection result already computed by main()
+            from this same notebook file's imports (Path A only). Reused here
+            to avoid probing GPU frameworks twice. Ignored for Path B (live
+            kernel), where imports aren't known until session history is read,
+            so GPU inspection is always run fresh in that branch.
+    """
     in_live_ipython = False
     try:
         from IPython import get_ipython
@@ -1799,10 +1854,12 @@ def run_single_file_pipeline(
         imports, submodules, code_sources = ext_res.imports, ext_res.submodules, ext_res.code_sources
         guarded_imports, dyn_warnings = ext_res.guarded_imports, ext_res.dynamic_warnings
         writefile_imports = extract_writefile_imports_from_sources(code_sources)
+        gpu_info = precomputed_gpu_info
     elif in_live_ipython:
         logger.info("🔍 [Path B] Analyzing live IPython session kernel history via AST...")
         imports, submodules, code_sources, guarded_imports, dyn_warnings = extract_from_active_session()
         writefile_imports = extract_writefile_imports_from_sources(code_sources)
+        gpu_info = inspect_gpu_environment(imports)
     else:
         return
 
@@ -1812,7 +1869,6 @@ def run_single_file_pipeline(
     magic_warns, magic_notices = h_res.magic_warnings, h_res.magic_notices
     harvested_urls = extra_urls.union(base_urls)
 
-    gpu_info = inspect_gpu_environment(imports)
     all_warnings = dyn_warnings + magic_warns
 
     pinned_manifest, promotion_notices = build_manifest_entries(
@@ -1947,8 +2003,8 @@ def main() -> None:
     pkg_dist_map = importlib.metadata.packages_distributions() if hasattr(importlib.metadata, "packages_distributions") else {}
     
     target_batch_dir = args.batch or (args.notebook if args.notebook and os.path.isdir(args.notebook) else None)
-    initial_imports = set(SUPPORTED_GPU_FRAMEWORKS)
-    
+    initial_imports: Set[str] = set()
+
     if target_batch_dir:
         repo_map_pre = walk_and_scan_directory(target_batch_dir)
         initial_imports.update(repo_map_pre.global_imports)
@@ -1956,12 +2012,20 @@ def main() -> None:
         ext_res = extract_from_file(args.notebook, strict=False)
         initial_imports.update(ext_res.imports)
 
+    # Only probe GPU frameworks that are actually imported somewhere in the target
+    # notebook(s) — inspect_gpu_environment returns None early if initial_imports
+    # has no overlap with SUPPORTED_GPU_FRAMEWORKS, avoiding an unconditional
+    # `import torch`/`tensorflow`/`jax` on every run regardless of notebook content.
     batch_hw_cache = inspect_gpu_environment(initial_imports)
 
     if target_batch_dir:
         run_batch_pipeline(target_batch_dir, args, frozen_env, pkg_dist_map, batch_hw_cache)
     else:
-        run_single_file_pipeline(args, frozen_env, raw_full_freeze, pkg_dist_map)
+        # For Path A (saved notebook file), batch_hw_cache above was already computed
+        # from this same file's imports, so it's reused rather than re-probed.
+        # For Path B (live IPython kernel), imports aren't known until
+        # run_single_file_pipeline extracts kernel history, so it probes fresh there.
+        run_single_file_pipeline(args, frozen_env, raw_full_freeze, pkg_dist_map, batch_hw_cache)
 
 
 if __name__ == "__main__":
