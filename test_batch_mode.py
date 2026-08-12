@@ -274,7 +274,7 @@ class TestBatchOrchestration:
         assert is_clean is True
         assert "Uninstalled in active env: 0 packages" in report
 
-    def test_local_repo_modules_not_flagged_as_missing_pypi_packages(slef, tmp_path, mock_batch_env):
+    def test_local_repo_modules_not_flagged_as_missing_pypi_packages(self, tmp_path, mock_batch_env):
         frozen_env, pkg_dist_map = mock_batch_env
 
         (tmp_path / "cookbook.py").write_text("# local helper file", encoding="utf-8")

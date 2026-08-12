@@ -296,3 +296,44 @@ def test_cli_single_file_flags_without_notebook_errors():
     res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
     assert res.returncode != 0
+
+
+def test_apply_output_multi_framework_gpu_resolution(sample_notebook_file, mock_frozen_env):
+    """Verify TensorFlow notebook receives TensorFlow CUDA attribution when PyTorch is also in batch HW cache."""
+    scan_res = ne.NotebookScanResult(
+        path=sample_notebook_file,
+        is_python=True,
+        lang_label="python",
+        imports={"tensorflow"},
+        code_sources=["import tensorflow as tf"]
+    )
+
+    # Cache where both PyTorch and TensorFlow were independently probed
+    multi_fw_cache: ne.GpuInfo = {
+        "has_gpu": True,
+        "type": "NVIDIA CUDA",
+        "active_framework": "PyTorch",
+        "device_name": "NVIDIA GeForce RTX 4090 (via PyTorch)",
+        "frameworks": ["torch", "tensorflow"],
+        "framework_devices": {
+            "torch": "NVIDIA GeForce RTX 4090 (via PyTorch)",
+            "tensorflow": "NVIDIA GPU (via TensorFlow)"
+        }
+    }
+
+    out_path = ne.apply_output_to_notebook(
+        scan_res, 
+        mock_frozen_env, 
+        {}, 
+        multi_fw_cache, 
+        in_place=True
+    )
+
+    with open(out_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    markdown_cell_source = "".join(data["cells"][0]["source"])
+    
+    # Assert TensorFlow notebook gets its own TensorFlow accelerator attribution, not PyTorch
+    assert "NVIDIA GPU (via TensorFlow)" in markdown_cell_source
+    assert "PyTorch" not in markdown_cell_source

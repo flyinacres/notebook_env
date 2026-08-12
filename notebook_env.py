@@ -79,6 +79,7 @@ class GpuInfo(TypedDict, total=False):
     active_framework: Optional[str]
     device_name: Optional[str]
     frameworks: List[str]
+    framework_devices: Dict[str, Optional[str]]  # Map canonical fw stem -> device_nam
 
 
 class BlueprintResult(TypedDict):
@@ -905,9 +906,8 @@ def process_package_requirements(
 # Probes runtime framework state for GPU/accelerator availability across 
 # PyTorch (CUDA/MPS), TensorFlow (GPU), and JAX (GPU/TPU).
 # =====================================================================
-
 def inspect_gpu_environment(imported_packages: Set[str]) -> Optional[GpuInfo]:
-    """Per-framework GPU/accelerator inspection logic including transitive wrapper resolution."""
+    """Per-framework GPU/accelerator inspection logic across PyTorch, TensorFlow, and JAX."""
     gpu_frameworks = {"torch", "tensorflow", "jax"}
     
     expanded_imports = set(imported_packages)
@@ -927,32 +927,36 @@ def inspect_gpu_environment(imported_packages: Set[str]) -> Optional[GpuInfo]:
                 pass
 
     found_frameworks = list(gpu_frameworks.intersection(expanded_imports))
-    
     if not found_frameworks:
         return None
 
+    framework_devices: Dict[str, Optional[str]] = {}
+    active_types: List[str] = []
+    primary_fw: Optional[str] = None
+    primary_dev: Optional[str] = None
+
+    # Probe PyTorch
     if "torch" in found_frameworks:
         try:
             import torch
             if torch.cuda.is_available():
-                return {
-                    "has_gpu": True,
-                    "type": "NVIDIA CUDA",
-                    "active_framework": "PyTorch",
-                    "device_name": f"{torch.cuda.get_device_name(0)} (via PyTorch)",
-                    "frameworks": found_frameworks
-                }
+                dev_str = f"{torch.cuda.get_device_name(0)} (via PyTorch)"
+                framework_devices["torch"] = dev_str
+                active_types.append("NVIDIA CUDA")
+                if not primary_dev:
+                    primary_fw, primary_dev = "PyTorch", dev_str
             elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                return {
-                    "has_gpu": True,
-                    "type": "Apple Silicon MPS",
-                    "active_framework": "PyTorch",
-                    "device_name": "Apple Silicon GPU (Metal via PyTorch)",
-                    "frameworks": found_frameworks
-                }
+                dev_str = "Apple Silicon GPU (Metal via PyTorch)"
+                framework_devices["torch"] = dev_str
+                active_types.append("Apple Silicon MPS")
+                if not primary_dev:
+                    primary_fw, primary_dev = "PyTorch", dev_str
+            else:
+                framework_devices["torch"] = None
         except Exception:
-            pass
+            framework_devices["torch"] = None
 
+    # Probe TensorFlow
     if "tensorflow" in found_frameworks:
         try:
             import tensorflow as tf
@@ -964,16 +968,16 @@ def inspect_gpu_environment(imported_packages: Set[str]) -> Optional[GpuInfo]:
                     dev_name = f"{details.get('device_name', 'NVIDIA GPU')} (via TensorFlow)"
                 except Exception:
                     pass
-                return {
-                    "has_gpu": True,
-                    "type": "GPU",
-                    "active_framework": "TensorFlow",
-                    "device_name": dev_name,
-                    "frameworks": found_frameworks
-                }
+                framework_devices["tensorflow"] = dev_name
+                active_types.append("GPU")
+                if not primary_dev:
+                    primary_fw, primary_dev = "TensorFlow", dev_name
+            else:
+                framework_devices["tensorflow"] = None
         except Exception:
-            pass
+            framework_devices["tensorflow"] = None
 
+    # Probe JAX
     if "jax" in found_frameworks:
         try:
             import jax
@@ -983,22 +987,24 @@ def inspect_gpu_environment(imported_packages: Set[str]) -> Optional[GpuInfo]:
                 first_accel = accelerators[0]
                 accel_type = first_accel.platform.upper()
                 dev_name = f"{accel_type} ({first_accel.device_kind}) via JAX"
-                return {
-                    "has_gpu": True,
-                    "type": accel_type,
-                    "active_framework": "JAX",
-                    "device_name": dev_name,
-                    "frameworks": found_frameworks
-                }
+                framework_devices["jax"] = dev_name
+                active_types.append(accel_type)
+                if not primary_dev:
+                    primary_fw, primary_dev = "JAX", dev_name
+            else:
+                framework_devices["jax"] = None
         except Exception:
-            pass
+            framework_devices["jax"] = None
+
+    has_gpu = primary_dev is not None
 
     return {
-        "has_gpu": False,
-        "type": None,
-        "active_framework": None,
-        "device_name": None,
-        "frameworks": found_frameworks
+        "has_gpu": has_gpu,
+        "type": active_types[0] if active_types else None,
+        "active_framework": primary_fw,
+        "device_name": primary_dev,
+        "frameworks": sorted(found_frameworks),
+        "framework_devices": framework_devices
     }
 
 
@@ -1526,16 +1532,29 @@ def apply_output_to_notebook(
 
         nb_fw = set(batch_hw_cache.get("frameworks", [])).intersection(expanded_nb_imports)
         if nb_fw:
-            active_fw_name = batch_hw_cache.get("active_framework")
-            canonical_active_fw = FRAMEWORK_NAME_TO_CANONICAL.get(active_fw_name, "").lower()
+            fw_devices = batch_hw_cache.get("framework_devices", {})
+            matched_fw = None
+            matched_device = None
 
-            if batch_hw_cache.get("has_gpu") and canonical_active_fw in nb_fw:
+            # Check if any framework imported by this notebook has verified GPU acceleration
+            for fw_stem in sorted(nb_fw):
+                if fw_devices.get(fw_stem):
+                    matched_fw = fw_stem
+                    matched_device = fw_devices[fw_stem]
+                    break
+
+            if matched_device:
+                # Format canonical label back to human-readable string (e.g. torch -> PyTorch)
+                fw_display_map = {"torch": "PyTorch", "tensorflow": "TensorFlow", "jax": "JAX"}
+                active_label = fw_display_map.get(matched_fw, matched_fw.capitalize())
+                
                 gpu_info = {
                     "has_gpu": True,
                     "type": batch_hw_cache.get("type"),
-                    "active_framework": active_fw_name,
-                    "device_name": batch_hw_cache.get("device_name"),
-                    "frameworks": sorted(list(nb_fw))
+                    "active_framework": active_label,
+                    "device_name": matched_device,
+                    "frameworks": sorted(list(nb_fw)),
+                    "framework_devices": fw_devices
                 }
             else:
                 gpu_info = {
@@ -1543,7 +1562,8 @@ def apply_output_to_notebook(
                     "type": None,
                     "active_framework": None,
                     "device_name": None,
-                    "frameworks": sorted(list(nb_fw))
+                    "frameworks": sorted(list(nb_fw)),
+                    "framework_devices": fw_devices
                 }
 
     blueprint = generate_production_blueprint(manifest_lines, local_tagged_info=local_tagged, gpu_info=gpu_info)
