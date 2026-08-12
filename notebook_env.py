@@ -94,7 +94,74 @@ class NotebookScanResult:
     def __post_init__(self):
         if self.code_sources and not self.harvested_urls:
             self.harvested_urls = harvest_index_urls_from_sources(self.code_sources)
+@dataclass
+class ExtractionResult:
+    """Encapsulates the raw extraction payload from reading a notebook file."""
+    success: bool
+    lang_label: str
+    imports: Set[str] = field(default_factory=set)
+    submodules: Dict[str, Set[str]] = field(default_factory=dict)
+    code_sources: List[str] = field(default_factory=list)
+    error_msg: Optional[str] = None
+    guarded_imports: Set[str] = field(default_factory=set)
+    dynamic_warnings: List[str] = field(default_factory=list)
 
+    def __iter__(self):
+        """Legacy tuple-unpacking fallback for backward compatibility."""
+        return iter((
+            self.success,
+            self.imports,
+            self.submodules,
+            self.code_sources,
+            self.error_msg,
+            self.lang_label,
+            self.guarded_imports,
+            self.dynamic_warnings,
+        ))
+
+
+@dataclass
+class HarvestResult:
+    """Encapsulates harvested packages, index URLs, warnings, and notices from cell magics."""
+    harvested_packages: Set[str] = field(default_factory=set)
+    base_index_urls: Set[str] = field(default_factory=set)
+    extra_index_urls: Set[str] = field(default_factory=set)
+    magic_warnings: List[str] = field(default_factory=list)
+    magic_notices: List[str] = field(default_factory=list)
+
+    def __iter__(self):
+        """Legacy tuple-unpacking fallback for backward compatibility."""
+        return iter((
+            self.harvested_packages,
+            self.base_index_urls,
+            self.extra_index_urls,
+            self.magic_warnings,
+            self.magic_notices,
+        ))
+
+@dataclass
+class BatchAnalysisSummary:
+    """Aggregated analysis metrics across all notebooks in a batch repo scan."""
+    target_dir: str
+    total_python_notebooks: int = 0
+    non_python_count: int = 0
+    non_python_languages: Dict[str, int] = field(default_factory=dict)
+    parse_errors: List[NotebookScanResult] = field(default_factory=list)
+    matched_packages: Set[str] = field(default_factory=set)
+    missing_packages: Dict[str, List[str]] = field(default_factory=dict)
+    promotions: List[str] = field(default_factory=list)
+    dynamic_warnings: List[str] = field(default_factory=list)
+    magic_warnings: List[str] = field(default_factory=list)
+    magic_notices: List[str] = field(default_factory=list)
+    batch_hardware_warnings: Dict[str, List[str]] = field(default_factory=dict)
+    primary_url: Optional[str] = None
+    primary_url_reason: Optional[str] = None
+    batch_hw_cache: Optional[GpuInfo] = None
+
+    @property
+    def is_clean(self) -> bool:
+        """Returns True if no blocking parse/file errors exist in the batch."""
+        return len(self.parse_errors) == 0
 
 # Mappings, Platform Injections & Stdlib lookup
 IMPORT_TO_PYPI_MAP: Dict[str, str] = {
@@ -193,30 +260,59 @@ def detect_notebook_language(nb_data: Dict[str, Any], strict: bool = False) -> T
 
 def extract_from_file(
     notebook_path: str, strict: bool = False
-) -> Tuple[bool, Set[str], Dict[str, Set[str]], List[str], Optional[str], str, Set[str], List[str]]:
+) -> ExtractionResult:
     """Reads a Jupyter Notebook JSON file and extracts code sources, imports, guarded state, and dynamic warnings."""
     if not os.path.exists(notebook_path):
-        return False, set(), {}, [], f"File '{notebook_path}' not found.", StatusLabel.UNKNOWN, set(), []
+        return ExtractionResult(
+            success=False,
+            lang_label=StatusLabel.UNKNOWN,
+            error_msg=f"File '{notebook_path}' not found."
+        )
 
     try:
         with open(notebook_path, 'r', encoding='utf-8') as f:
             nb_data = json.load(f)
     except json.JSONDecodeError as e:
-        return False, set(), {}, [], f"Invalid JSON structure ({e})", StatusLabel.CORRUPTED, set(), []
+        return ExtractionResult(
+            success=False,
+            lang_label=StatusLabel.CORRUPTED,
+            error_msg=f"Invalid JSON structure ({e})"
+        )
     except Exception as e:
-        return False, set(), {}, [], f"File read failure ({e})", StatusLabel.ERROR, set(), []
+        return ExtractionResult(
+            success=False,
+            lang_label=StatusLabel.ERROR,
+            error_msg=f"File read failure ({e})"
+        )
 
     if not isinstance(nb_data, dict) or "cells" not in nb_data or not isinstance(nb_data.get("cells"), list):
-        return False, set(), {}, [], "Unparseable notebook structure (Missing or invalid 'cells' array)", StatusLabel.CORRUPTED, set(), []
+        return ExtractionResult(
+            success=False,
+            lang_label=StatusLabel.CORRUPTED,
+            error_msg="Unparseable notebook structure (Missing or invalid 'cells' array)"
+        )
 
     is_py, lang_label = detect_notebook_language(nb_data, strict=strict)
     if not is_py:
-        return False, set(), {}, [], f"Skipped non-Python notebook (Language: {lang_label})", lang_label, set(), []
+        return ExtractionResult(
+            success=False,
+            lang_label=lang_label,
+            error_msg=f"Skipped non-Python notebook (Language: {lang_label})"
+        )
 
     cells = nb_data.get("cells", [])
     code_sources = ["".join(c.get("source", [])) for c in cells if c.get("cell_type") == "code"]
     imports, submodules, guarded_imports, dyn_warnings = extract_imports_from_sources(code_sources)
-    return True, imports, submodules, code_sources, None, lang_label, guarded_imports, dyn_warnings
+
+    return ExtractionResult(
+        success=True,
+        lang_label=lang_label,
+        imports=imports,
+        submodules=submodules,
+        code_sources=code_sources,
+        guarded_imports=guarded_imports,
+        dynamic_warnings=dyn_warnings
+    )
 
 
 def extract_from_active_session() -> Tuple[Set[str], Dict[str, Set[str]], List[str], Set[str], List[str]]:
@@ -445,16 +541,9 @@ def harvest_index_urls_from_sources(code_sources: List[str]) -> Set[str]:
 
 def harvest_cell_magics_and_commands(
     code_sources: List[str]
-) -> Tuple[Set[str], Set[str], Set[str], List[str], List[str]]:
+) -> HarvestResult:
     """
     Scans code sources for cell magics, index URLs, auxiliary tools, and shell commands.
-
-    Returns:
-        - harvested_packages: Set[str] (auxiliary tools installed via %pip / !pip)
-        - base_index_urls: Set[str] (--index-url / -i base index overrides)
-        - extra_index_urls: Set[str] (--extra-index-url supplemental indexes)
-        - magic_warnings: List[str] (warnings for -r requirements.txt or unresolvable scripts)
-        - magic_notices: List[str] (informational notices for conda / apt-get calls)
     """
     harvested_packages: Set[str] = set()
     base_index_urls: Set[str] = set()
@@ -468,7 +557,6 @@ def harvest_cell_magics_and_commands(
             if not clean_line or clean_line.startswith('#') or clean_line in SHELL_CELL_MAGICS:
                 continue
 
-            # 1. Harvest Index URLs (Token-aware to prevent cross-flag pollution)
             for match in EXTRA_INDEX_PATTERN.finditer(clean_line):
                 extra_index_urls.add(match.group(1).strip("'\""))
             
@@ -477,7 +565,6 @@ def harvest_cell_magics_and_commands(
                 if not full_match_str.startswith("--extra-index-url"):
                     base_index_urls.add(match.group(1).strip("'\""))
 
-            # 2. Split chained commands (&&, ;) and evaluate segments
             command_segments = SHELL_SPLIT_PATTERN.split(clean_line)
 
             for segment in command_segments:
@@ -532,8 +619,13 @@ def harvest_cell_magics_and_commands(
                             harvested_packages.add(pkg_name)
                         i += 1
 
-    return harvested_packages, base_index_urls, extra_index_urls, magic_warnings, magic_notices
-
+    return HarvestResult(
+        harvested_packages=harvested_packages,
+        base_index_urls=base_index_urls,
+        extra_index_urls=extra_index_urls,
+        magic_warnings=magic_warnings,
+        magic_notices=magic_notices
+    )
 
 # =====================================================================
 # ENVIRONMENT CORRELATION & EXTRAS PROMOTION
@@ -1097,83 +1189,56 @@ def walk_and_scan_directory(target_dir: str) -> RepoEnvironmentMap:
         for file in sorted(files):
             if file.endswith('.ipynb'):
                 full_path = Path(root) / file
-                success, imports, submodules, code_sources, err, lang_label, guarded_imports, dyn_warnings = extract_from_file(str(full_path), strict=True)
-                writefile_imports = extract_writefile_imports_from_sources(code_sources)
+                ext_res = extract_from_file(str(full_path), strict=True)
+                writefile_imports = extract_writefile_imports_from_sources(ext_res.code_sources)
                 
-                h_pkgs, base_urls, extra_urls, m_warns, m_notices = harvest_cell_magics_and_commands(code_sources)
-                harvested_urls = base_urls.union(extra_urls)
+                h_res = harvest_cell_magics_and_commands(ext_res.code_sources)
+                harvested_urls = h_res.base_index_urls.union(h_res.extra_index_urls)
 
-                parse_err = err if (not success and "Skipped non-Python notebook" not in (err or "")) else None                
+                parse_err = ext_res.error_msg if (not ext_res.success and "Skipped non-Python notebook" not in (ext_res.error_msg or "")) else None                
                 res = NotebookScanResult(
                     path=full_path,
-                    is_python=success,
-                    lang_label=lang_label,
+                    is_python=ext_res.success,
+                    lang_label=ext_res.lang_label,
                     parse_error=parse_err,
-                    imports=imports,
-                    submodules=submodules,
-                    guarded_imports=guarded_imports,
-                    dynamic_warnings=dyn_warnings,
-                    code_sources=code_sources,
+                    imports=ext_res.imports,
+                    submodules=ext_res.submodules,
+                    guarded_imports=ext_res.guarded_imports,
+                    dynamic_warnings=ext_res.dynamic_warnings,
+                    code_sources=ext_res.code_sources,
                     harvested_urls=harvested_urls,
                     writefile_imports=writefile_imports,
-                    harvested_pkgs=h_pkgs,
-                    base_index_urls=base_urls,
-                    extra_index_urls=extra_urls,
-                    magic_warnings=m_warns,
-                    magic_notices=m_notices
+                    harvested_pkgs=h_res.harvested_packages,
+                    base_index_urls=h_res.base_index_urls,
+                    extra_index_urls=h_res.extra_index_urls,
+                    magic_warnings=h_res.magic_warnings,
+                    magic_notices=h_res.magic_notices
                 )
                 repo_map.add_result(res)
 
     return repo_map
 
 
-def generate_batch_analysis_report(
+def analyze_batch_repository(
     repo_map: RepoEnvironmentMap, 
     frozen_env: Dict[str, str], 
     pkg_dist_map: Dict[str, List[str]], 
     batch_hw_cache: Optional[GpuInfo]
-) -> Tuple[str, bool]:
-    """Generates stdout report for batch analysis mode."""
-    py_count = len(repo_map.scan_results)
-    non_py_count = len(repo_map.non_python_files)
-    err_count = len(repo_map.parse_errors)
+) -> BatchAnalysisSummary:
+    """Aggregates dependency metrics, warnings, and index settings across repository notebooks."""
+    summary = BatchAnalysisSummary(
+        target_dir=repo_map.target_dir,
+        total_python_notebooks=len(repo_map.scan_results),
+        non_python_count=len(repo_map.non_python_files),
+        parse_errors=repo_map.parse_errors,
+        batch_hw_cache=batch_hw_cache
+    )
 
-    out = []
-    out.append("=" * 80)
-    out.append("BATCH ENVIRONMENT ANALYSIS REPORT")
-    out.append(f"Target Directory: {repo_map.target_dir}")
-    out.append(f"Active Interpreter: {sys.executable}")
-    out.append("=" * 80 + "\n")
-
-    out.append("📁 NOTEBOOK INVENTORY & LANGUAGE SCAN:")
-    out.append(f"  • Python (.ipynb): {py_count} files analyzed")
-    
-    if non_py_count > 0:
-        lang_counts: Dict[str, int] = {}
-        for item in repo_map.non_python_files:
-            lang_counts[item.lang_label] = lang_counts.get(item.lang_label, 0) + 1
-        lang_str = ", ".join([f"{k} ({v})" for k, v in lang_counts.items()])
-        out.append(f"  • Non-Python skipped: {non_py_count} files [{lang_str}]")
-    else:
-        out.append("  • Non-Python skipped: 0 files")
-
-    out.append(f"  • File / Parse Errors: {err_count} files")
-    out.append("")
-
-    if err_count > 0:
-        out.append("❌ FILE & PARSE ERRORS:")
-        for err_res in repo_map.parse_errors:
-            out.append(f"  • {err_res.path}")
-            out.append(f"    └─ Cause: {err_res.parse_error}")
-        out.append("")
-
-    matched_packages: Set[str] = set()
-    missing_packages: Dict[str, List[str]] = {}
-    promotions: List[str] = []
-    dynamic_warnings: List[str] = []
-    aggregated_magic_warnings: List[str] = []
-    aggregated_magic_notices: List[str] = []
-    batch_hardware_warnings: Dict[str, List[str]] = {}  # Map pkg -> list of notebook names
+    # Tally non-Python language counts
+    for item in repo_map.non_python_files:
+        summary.non_python_languages[item.lang_label] = (
+            summary.non_python_languages.get(item.lang_label, 0) + 1
+        )
 
     for res in repo_map.scan_results:
         pinned_entries, notes = build_manifest_entries(
@@ -1192,33 +1257,33 @@ def generate_batch_analysis_report(
             base_urls=res.base_index_urls
         )
         for hw_pkg in hw_warns:
-            batch_hardware_warnings.setdefault(hw_pkg, []).append(res.path.name)
+            summary.batch_hardware_warnings.setdefault(hw_pkg, []).append(res.path.name)
 
         for note in notes:
-            if note not in promotions:
-                promotions.append(note)
+            if note not in summary.promotions:
+                summary.promotions.append(note)
 
         for warn in res.dynamic_warnings:
-            if warn not in dynamic_warnings:
-                dynamic_warnings.append(warn)
+            if warn not in summary.dynamic_warnings:
+                summary.dynamic_warnings.append(warn)
 
         for warn in res.magic_warnings:
-            if warn not in aggregated_magic_warnings:
-                aggregated_magic_warnings.append(warn)
+            if warn not in summary.magic_warnings:
+                summary.magic_warnings.append(warn)
 
         for notice in res.magic_notices:
-            if notice not in aggregated_magic_notices:
-                aggregated_magic_notices.append(notice)
+            if notice not in summary.magic_notices:
+                summary.magic_notices.append(notice)
 
         for pin_entry in pinned_entries:
             if pin_entry.startswith("#"):
                 if "platform pseudo-module" in pin_entry or "local repo module" in pin_entry:
                     continue
                 pypi_name = pin_entry.split()[1]
-                missing_packages.setdefault(pypi_name, []).append(res.path.name)
+                summary.missing_packages.setdefault(pypi_name, []).append(res.path.name)
             else:
                 pkg_name = pin_entry.split("==")[0]
-                matched_packages.add(pkg_name)
+                summary.matched_packages.add(pkg_name)
 
         # Process harvested magic packages
         for pkg in res.harvested_pkgs:
@@ -1228,16 +1293,53 @@ def generate_batch_analysis_report(
             matched_pin = frozen_env.get(pypi_name.lower())
             if matched_pin:
                 pkg_name = matched_pin.split("==")[0]
-                matched_packages.add(pkg_name)
+                summary.matched_packages.add(pkg_name)
             else:
-                missing_packages.setdefault(pypi_name, []).append(res.path.name)
+                summary.missing_packages.setdefault(pypi_name, []).append(res.path.name)
 
-    out.append(f"📦 IMPORTED DEPENDENCY FOOTPRINT (Across {py_count} Python notebooks):")
-    out.append(f"  • Installed & Matched: {len(matched_packages)} packages ({', '.join(sorted(matched_packages)[:5])}{'...' if len(matched_packages) > 5 else ''})")
+    primary_url, url_reason = select_primary_index_url(repo_map.url_to_notebooks)
+    summary.primary_url = primary_url
+    summary.primary_url_reason = url_reason
+
+    return summary
+
+
+def format_batch_report(summary: BatchAnalysisSummary) -> str:
+    """Formats a BatchAnalysisSummary into a human-readable stdout report string."""
+    out = []
+    out.append("=" * 80)
+    out.append("BATCH ENVIRONMENT ANALYSIS REPORT")
+    out.append(f"Target Directory: {summary.target_dir}")
+    out.append(f"Active Interpreter: {sys.executable}")
+    out.append("=" * 80 + "\n")
+
+    out.append("📁 NOTEBOOK INVENTORY & LANGUAGE SCAN:")
+    out.append(f"  • Python (.ipynb): {summary.total_python_notebooks} files analyzed")
     
-    if missing_packages:
-        out.append(f"  • Uninstalled in active env: {len(missing_packages)} package(s)")
-        for pkg, nbs in sorted(missing_packages.items()):
+    if summary.non_python_count > 0:
+        lang_str = ", ".join([f"{k} ({v})" for k, v in summary.non_python_languages.items()])
+        out.append(f"  • Non-Python skipped: {summary.non_python_count} files [{lang_str}]")
+    else:
+        out.append("  • Non-Python skipped: 0 files")
+
+    err_count = len(summary.parse_errors)
+    out.append(f"  • File / Parse Errors: {err_count} files")
+    out.append("")
+
+    if err_count > 0:
+        out.append("❌ FILE & PARSE ERRORS:")
+        for err_res in summary.parse_errors:
+            out.append(f"  • {err_res.path}")
+            out.append(f"    └─ Cause: {err_res.parse_error}")
+        out.append("")
+
+    out.append(f"📦 IMPORTED DEPENDENCY FOOTPRINT (Across {summary.total_python_notebooks} Python notebooks):")
+    matched_list = sorted(summary.matched_packages)
+    out.append(f"  • Installed & Matched: {len(matched_list)} packages ({', '.join(matched_list[:5])}{'...' if len(matched_list) > 5 else ''})")
+    
+    if summary.missing_packages:
+        out.append(f"  • Uninstalled in active env: {len(summary.missing_packages)} package(s)")
+        for pkg, nbs in sorted(summary.missing_packages.items()):
             nb_list = ", ".join(sorted(set(nbs))[:3])
             more = f", +{len(set(nbs))-3} more" if len(set(nbs)) > 3 else ""
             out.append(f"      - {pkg} (imported in: {nb_list}{more})")
@@ -1245,43 +1347,42 @@ def generate_batch_analysis_report(
         out.append("  • Uninstalled in active env: 0 packages")
     out.append("")
 
-    if dynamic_warnings or aggregated_magic_warnings:
+    if summary.dynamic_warnings or summary.magic_warnings:
         out.append("⚠️ WARNINGS DETECTED:")
-        for warn in dynamic_warnings:
+        for warn in summary.dynamic_warnings:
             out.append(f"  • {warn}")
-        for warn in aggregated_magic_warnings:
+        for warn in summary.magic_warnings:
             out.append(f"  • {warn}")
         out.append("")
 
-    if aggregated_magic_notices:
+    if summary.magic_notices:
         out.append("ℹ️ NOTICES:")
-        for notice in aggregated_magic_notices:
+        for notice in summary.magic_notices:
             out.append(f"  • {notice}")
         out.append("")
 
-    if promotions:
+    if summary.promotions:
         out.append("💡 DYNAMIC PROMOTIONS DETECTED:")
-        for note in promotions:
+        for note in summary.promotions:
             out.append(f"  • {note}")
         out.append("")
 
     # Hardware & Index Audit
     out.append("⚡ HARDWARE & INDEX AUDIT:")
-    if batch_hw_cache and batch_hw_cache.get("has_gpu"):
-        out.append(f"  • Active Hardware Accelerator: {batch_hw_cache['device_name']}")
+    if summary.batch_hw_cache and summary.batch_hw_cache.get("has_gpu"):
+        out.append(f"  • Active Hardware Accelerator: {summary.batch_hw_cache['device_name']}")
     else:
         out.append("  • Active Hardware Accelerator: None (CPU-only execution environment)")
 
-    primary_url, url_reason = select_primary_index_url(repo_map.url_to_notebooks)
-    if primary_url:
-        out.append(f"  • Primary Index URL: {primary_url}")
-        out.append(f"    └─ Selection Rule: {url_reason}")
+    if summary.primary_url:
+        out.append(f"  • Primary Index URL: {summary.primary_url}")
+        out.append(f"    └─ Selection Rule: {summary.primary_url_reason}")
     else:
         out.append("  • Extra Index URLs Harvested: None")
 
-    if batch_hardware_warnings:
+    if summary.batch_hardware_warnings:
         out.append("  • Local / Hardware Tag Build Warnings:")
-        for pkg, nbs in sorted(batch_hardware_warnings.items()):
+        for pkg, nbs in sorted(summary.batch_hardware_warnings.items()):
             nb_list = ", ".join(sorted(set(nbs))[:3])
             more = f", +{len(set(nbs))-3} more" if len(set(nbs)) > 3 else ""
             out.append(f"      ⚠️ {pkg} (in: {nb_list}{more}) — No download URL harvested in code cells.")
@@ -1290,10 +1391,22 @@ def generate_batch_analysis_report(
     if err_count > 0:
         out.append("STATUS: ⚠️ ATTENTION REQUIRED - Parse errors present. Resolve file issues above.")
     else:
-        out.append(f"STATUS: No blocking file errors found across {py_count} Python notebooks. Output mode (--output) can be executed.")
+        out.append(f"STATUS: No blocking file errors found across {summary.total_python_notebooks} Python notebooks. Output mode (--output) can be executed.")
     out.append("=" * 80)
 
-    return "\n".join(out), err_count == 0
+    return "\n".join(out)
+
+
+def generate_batch_analysis_report(
+    repo_map: RepoEnvironmentMap, 
+    frozen_env: Dict[str, str], 
+    pkg_dist_map: Dict[str, List[str]], 
+    batch_hw_cache: Optional[GpuInfo]
+) -> Tuple[str, bool]:
+    """Orchestrates batch repository analysis and returns (report_text, is_clean)."""
+    summary = analyze_batch_repository(repo_map, frozen_env, pkg_dist_map, batch_hw_cache)
+    report_text = format_batch_report(summary)
+    return report_text, summary.is_clean
 
 
 def generate_universal_manifest(
