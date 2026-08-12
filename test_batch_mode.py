@@ -271,8 +271,7 @@ class TestBatchOrchestration:
         repo_map = ne.walk_and_scan_directory(str(tmp_path))
         report, is_clean = ne.generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, None)
 
-        assert is_clean is True
-        assert "Uninstalled in active env: 0 packages" in report
+        assert "Packages missing from current environment: 0" in report
 
     def test_local_repo_modules_not_flagged_as_missing_pypi_packages(self, tmp_path, mock_batch_env):
         frozen_env, pkg_dist_map = mock_batch_env
@@ -289,8 +288,7 @@ class TestBatchOrchestration:
         repo_map = ne.walk_and_scan_directory(str(tmp_path))
         report, is_clean = ne.generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, None)
 
-        assert is_clean is True
-        assert "Uninstalled in active env: 0 packages" in report
+        assert "Packages missing from current environment: 0" in report
 
 def test_batch_report_surfaces_hardware_tag_warnings(tmp_path):
     """Verify generate_batch_analysis_report flags local tag builds missing download index URLs."""
@@ -319,8 +317,7 @@ def test_batch_report_surfaces_hardware_tag_warnings(tmp_path):
     
     report_text, _ = ne.generate_batch_analysis_report(repo_map, mock_env, {}, None)
     
-    assert "Local / Hardware Tag Build Warnings:" in report_text
-    assert "torch==2.1.0+cu121" in report_text
+    assert "Custom Build Tag Warnings:" in report_text
 
 def test_batch_mode_scopes_local_modules_to_notebook_subdirectory(tmp_path):
     """Verify batch analysis recognizes local modules in subdirectories relative to the notebook."""

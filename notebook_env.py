@@ -412,17 +412,17 @@ def extract_from_file(
     try:
         with open(notebook_path, 'r', encoding='utf-8') as f:
             nb_data = json.load(f)
-    except json.JSONDecodeError as e:
+    except json.JSONDecodeError:
         return ExtractionResult(
             success=False,
             lang_label=StatusLabel.CORRUPTED,
-            error_msg=f"Invalid JSON structure ({e})"
+            error_msg="File is not valid JSON. Ensure the file was not truncated or saved mid-write."
         )
     except Exception as e:
         return ExtractionResult(
             success=False,
             lang_label=StatusLabel.ERROR,
-            error_msg=f"File read failure ({e})"
+            error_msg=f"Unable to read file ({type(e).__name__}). Check file permissions and path location."
         )
 
     if not isinstance(nb_data, dict) or "cells" not in nb_data or not isinstance(nb_data.get("cells"), list):
@@ -881,8 +881,8 @@ def resolve_pypi_package_and_extras(
 
     if is_guarded:
         if matched_pin:
-            return f"# {matched_pin} (optional dependency used in conditional block; not required)", None
-        return f"# {pypi_name} (optional dependency used in conditional block; not required)", None
+            return f"# {matched_pin} (optional or conditional dependency inside try/except block)", None
+        return f"# {pypi_name} (optional or conditional dependency inside try/except block)", None
 
     if not matched_pin:
         return f"# {pypi_name} (imported as '{imp}', not currently found in active env)", None
@@ -1217,7 +1217,8 @@ result = subprocess.run(
 )
 
 if result.returncode == 0:
-    print("\\n✅ Setup complete! Environment ready.")
+    print("\\n✅ Primary dependencies installed successfully!")
+    print("💡 If your notebook uses optional features or platform-specific tools, check the notes in pinned_requirements.txt.")
 else:
     print("\\n❌ Setup failed while installing required packages.\\n")
     print("Troubleshooting Steps:")
@@ -1465,7 +1466,7 @@ def format_batch_report(summary: BatchAnalysisSummary) -> str:
     """Formats a BatchAnalysisSummary into a human-readable stdout report string."""
     out = []
     out.append("=" * 80)
-    out.append("BATCH ENVIRONMENT ANALYSIS REPORT")
+    out.append("REPOSITORY REPRODUCIBILITY SUMMARY")
     out.append(f"Target Directory: {summary.target_dir}")
     out.append(f"Active Interpreter: {sys.executable}")
     out.append("=" * 80 + "\n")
@@ -1490,22 +1491,23 @@ def format_batch_report(summary: BatchAnalysisSummary) -> str:
             out.append(f"    └─ Cause: {err_res.parse_error}")
         out.append("")
 
-    out.append(f"📦 IMPORTED DEPENDENCY FOOTPRINT (Across {summary.total_python_notebooks} Python notebooks):")
+    out.append(f"📦 REPOSITORY PACKAGE SUMMARY (Across {summary.total_python_notebooks} Python notebooks):")
     matched_list = sorted(summary.matched_packages)
-    out.append(f"  • Installed & Matched: {len(matched_list)} packages ({', '.join(matched_list[:5])}{'...' if len(matched_list) > 5 else ''})")
+    out.append(f"  • Installed & Verified: {len(matched_list)} packages ({', '.join(matched_list[:5])}{'...' if len(matched_list) > 5 else ''})")
     
     if summary.missing_packages:
-        out.append(f"  • Uninstalled in active env: {len(summary.missing_packages)} package(s)")
+        out.append(f"  • Packages missing from current environment: {len(summary.missing_packages)}")
+        out.append("    (Action: Run 'pip install <package>' in active environment before generating lockfiles)")
         for pkg, nbs in sorted(summary.missing_packages.items()):
             nb_list = ", ".join(sorted(set(nbs))[:3])
             more = f", +{len(set(nbs))-3} more" if len(set(nbs)) > 3 else ""
             out.append(f"      - {pkg} (imported in: {nb_list}{more})")
     else:
-        out.append("  • Uninstalled in active env: 0 packages")
+        out.append("  • Packages missing from current environment: 0")
     out.append("")
 
     if summary.dynamic_warnings or summary.magic_warnings:
-        out.append("⚠️ WARNINGS DETECTED:")
+        out.append("⚠️ NOTICES & WARNINGS:")
         for warn in summary.dynamic_warnings:
             out.append(f"  • {warn}")
         for warn in summary.magic_warnings:
@@ -1513,18 +1515,18 @@ def format_batch_report(summary: BatchAnalysisSummary) -> str:
         out.append("")
 
     if summary.magic_notices:
-        out.append("ℹ️ NOTICES:")
+        out.append("ℹ️ SYSTEM & CONDA COMMANDS:")
         for notice in summary.magic_notices:
             out.append(f"  • {notice}")
         out.append("")
 
     if summary.promotions:
-        out.append("💡 DYNAMIC PROMOTIONS DETECTED:")
+        out.append("💡 AUTOMATIC EXTRA PROMOTIONS:")
         for note in summary.promotions:
             out.append(f"  • {note}")
         out.append("")
 
-    out.append("⚡ HARDWARE & INDEX AUDIT:")
+    out.append("⚡ ACCELERATOR & DOWNLOAD INDEX CHECK:")
     if summary.batch_hw_cache and summary.batch_hw_cache.get("has_gpu"):
         out.append(f"  • Active Hardware Accelerator: {summary.batch_hw_cache['device_name']}")
     else:
@@ -1537,7 +1539,7 @@ def format_batch_report(summary: BatchAnalysisSummary) -> str:
         out.append("  • Extra Index URLs Harvested: None")
 
     if summary.batch_hardware_warnings:
-        out.append("  • Local / Hardware Tag Build Warnings:")
+        out.append("  • Custom Build Tag Warnings:")
         for pkg, nbs in sorted(summary.batch_hardware_warnings.items()):
             nb_list = ", ".join(sorted(set(nbs))[:3])
             more = f", +{len(set(nbs))-3} more" if len(set(nbs)) > 3 else ""
@@ -1545,9 +1547,9 @@ def format_batch_report(summary: BatchAnalysisSummary) -> str:
 
     out.append("\n" + "-" * 80)
     if err_count > 0:
-        out.append("STATUS: ⚠️ ATTENTION REQUIRED - Parse errors present. Resolve file issues above.")
+        out.append("STATUS: ⚠️ ATTENTION REQUIRED - Resolve file/parse errors above before building manifests.")
     else:
-        out.append(f"STATUS: No blocking file errors found across {summary.total_python_notebooks} Python notebooks. Output mode (--output) can be executed.")
+        out.append(f"STATUS: Ready. All {summary.total_python_notebooks} Python notebooks parsed successfully.")
     out.append("=" * 80)
 
     return "\n".join(out)
