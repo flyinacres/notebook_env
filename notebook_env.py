@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-notebook_env.py (v35)
+notebook_env.py (v36)
 Headless Jupyter Notebook Dependency Scanner & Lockfile Generator.
 
 Standalone, zero-dependency utility for analyzing notebook environments,
@@ -138,18 +138,24 @@ STD_LIB: Set[str] = set(sys.stdlib_module_names) if hasattr(sys, 'stdlib_module_
 
 
 def discover_local_repo_modules(target_dir: str) -> Set[str]:
-    """Scans target_dir for local .py files and package directories containing __init__.py."""
+    """Scans target_dir for valid top-level Python modules and packages."""
     local_mods: Set[str] = set()
     target_path = Path(target_dir)
     if not target_path.exists():
         return local_mods
 
+    ignored_dirs = {".git", ".venv", "venv", "env", "__pycache__", ".ipynb_checkpoints", "build", "dist"}
+
     try:
+        # 1. Top-level .py files (directly importable as `import foo`)
         for entry in target_path.iterdir():
-            if entry.is_file() and entry.suffix == ".py":
+            if entry.is_file() and entry.suffix == ".py" and entry.stem != "__init__":
                 local_mods.add(entry.stem)
-            elif entry.is_dir() and (entry / "__init__.py").exists():
-                local_mods.add(entry.name)
+            elif entry.is_dir() and entry.name not in ignored_dirs and not entry.name.startswith('.'):
+                # 2. Top-level packages/directories (e.g. `import src` or `from src.utils import x`)
+                # Only register if it contains Python files
+                if any(entry.rglob("*.py")):
+                    local_mods.add(entry.name)
     except Exception:
         pass
 
@@ -920,6 +926,21 @@ def generate_production_blueprint(
     if full_freeze_lines:
         payload_string += "\n\n# --- FULL FREEZE FALLBACK BLOCK ---\n" + "\n".join(full_freeze_lines)
 
+    has_local_tags = any('+' in line for line in manifest_lines if not line.startswith('#'))
+
+    if has_local_tags:
+        failure_advice = """print("\\n❌ Setup failed while installing pinned dependencies.")
+print("It looks like your environment could not locate a matching wheel for local tag builds (e.g. +cu121, +cpu).\\n")
+print("Possible solutions:")
+print("1. Make sure your notebook runtime matches the required hardware (e.g. GPU vs CPU).")
+print("2. Or try installing the standard version directly in a code cell (e.g. !pip install torch).")"""
+    else:
+        failure_advice = """print("\\n❌ Setup failed while installing pinned dependencies.\\n")
+print("Possible solutions:")
+print("1. Ensure your notebook environment has active internet access to download wheels.")
+print("2. Verify that your current Python version is compatible with the required packages.")
+print("3. Try running '!pip install <package>' manually to view detailed compiler/pip error logs.")"""
+
     step2_code = f"""# =====================================================================
 # VERIFIED ENVIRONMENT DEPENDENCIES ({timestamp})
 # =====================================================================
@@ -965,11 +986,7 @@ result = subprocess.run(
 if result.returncode == 0:
     print("\\n✅ Setup complete! Environment ready.")
 else:
-    print("\\n❌ Setup failed while installing pinned dependencies.")
-    print("It looks like your environment could not locate a matching wheel for local tag builds (e.g. +cu121, +cpu).\\n")
-    print("Possible solutions:")
-    print("1. Make sure your notebook runtime matches the required hardware (e.g. GPU vs CPU).")
-    print("2. Or try installing the standard version directly in a code cell (e.g. !pip install torch).")"""
+    {failure_advice}"""
 
     return {
         "step1_markdown": step1_markdown,

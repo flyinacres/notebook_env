@@ -678,3 +678,27 @@ class TestIntegrationAndFormatting:
         assert entries[0] == "\n# --- WRITEFILE SCRIPT DEPENDENCIES ---"
         assert "# requests==2.31.0" in entries[1]
         assert "imported inside script generated via %%writefile" in entries[1]
+
+def test_discover_local_repo_modules_top_level(tmp_path):
+    """Verify discover_local_repo_modules recognizes top-level modules and package directories."""
+    src_dir = tmp_path / "src" / "utils"
+    src_dir.mkdir(parents=True)
+    (src_dir / "helpers.py").write_text("# helper module", encoding="utf-8")
+    (tmp_path / "root_script.py").write_text("# root script", encoding="utf-8")
+
+    discovered = ne.discover_local_repo_modules(str(tmp_path))
+
+    assert "src" in discovered
+    assert "root_script" in discovered
+    assert "helpers" not in discovered
+
+def test_production_blueprint_failure_message_dynamic():
+    """Verify Cell 2 failure advice adapts based on whether local build tags (+cu121) exist in manifest."""
+    # Standard manifest without local tags
+    std_blueprint = ne.generate_production_blueprint(["pandas==2.1.0", "numpy==1.25.0"])
+    assert "internet access" in std_blueprint["step2_code"]
+    assert "+cu121" not in std_blueprint["step2_code"]
+
+    # Manifest containing local tag build
+    tagged_blueprint = ne.generate_production_blueprint(["torch==2.1.0+cu121"])
+    assert "local tag builds (e.g. +cu121, +cpu)" in tagged_blueprint["step2_code"]
