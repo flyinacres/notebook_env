@@ -75,11 +75,11 @@ class StatusLabel:
 class GpuInfo(TypedDict, total=False):
     """
     Payload representing active host accelerator capabilities across PyTorch, TensorFlow, and JAX.
-    
+
     Fields:
         has_gpu: True if at least one framework verified an active GPU/accelerator.
         type: Primary hardware string (e.g., 'NVIDIA CUDA', 'Apple Silicon MPS', 'GPU', 'TPU').
-        active_framework: Human-readable display label of the primary active framework (e.g., 'PyTorch', 'TensorFlow', 'JAX').
+        active_framework: Human-readable display label of the primary active framework (e.g., 'PyTorch').
         device_name: Primary device hardware descriptor string.
         frameworks: List of canonical framework stems detected in imports (['torch', 'tensorflow', 'jax']).
         framework_devices: Map of canonical framework stem -> verified device descriptor string (or None if CPU-only).
@@ -100,7 +100,27 @@ class BlueprintResult(TypedDict):
 
 @dataclass
 class NotebookScanResult:
-    """Complete AST and metadata analysis payload for an individual notebook file."""
+    """
+    Complete AST and metadata analysis payload for an individual notebook file.
+
+    Fields:
+        path: Absolute or relative Path object pointing to the notebook file.
+        is_python: True if notebook kernelspec / metadata indicates Python language.
+        lang_label: String label of the detected kernel language (e.g. 'python', 'R').
+        parse_error: Error message string if JSON or AST parsing failed.
+        imports: Top-level imported package stems (e.g., 'torch', 'pandas').
+        submodules: Map of top-level package -> set of submodules imported (e.g. {'matplotlib': {'matplotlib.pyplot'}}).
+        guarded_imports: Imports occurring exclusively inside try/except or conditional blocks.
+        dynamic_warnings: Warnings triggered by non-literal dynamic import calls.
+        code_sources: Raw code cell string bodies extracted from notebook cells.
+        harvested_urls: Combined set of harvested base and extra index download URLs.
+        writefile_imports: Imports occurring exclusively inside %%writefile generated scripts.
+        harvested_pkgs: Packages installed via cell magics (%pip / !pip) but not imported in Python code.
+        base_index_urls: Base index URLs harvested via --index-url / -i.
+        extra_index_urls: Supplemental index URLs harvested via --extra-index-url.
+        magic_warnings: Warnings for unresolvable magics (e.g., -r requirements.txt references).
+        magic_notices: Informational notices for conda / apt-get calls outside pip manifests.
+    """
     path: Path
     is_python: bool
     lang_label: str
@@ -125,7 +145,19 @@ class NotebookScanResult:
 
 @dataclass
 class ExtractionResult:
-    """Encapsulates the raw extraction payload from reading a notebook file."""
+    """
+    Encapsulates the raw extraction payload from reading a notebook file.
+
+    Fields:
+        success: True if the file was read and parsed successfully as Python.
+        lang_label: Language metadata label detected in kernelspec/language_info.
+        imports: Top-level imported package stems.
+        submodules: Map of top-level package -> set of imported submodules.
+        code_sources: Raw code cell string bodies.
+        error_msg: Diagnostic error message if reading/parsing failed.
+        guarded_imports: Imports occurring inside conditional or try/except blocks.
+        dynamic_warnings: Warnings for non-literal dynamic import calls.
+    """
     success: bool
     lang_label: str
     imports: Set[str] = field(default_factory=set)
@@ -151,7 +183,16 @@ class ExtractionResult:
 
 @dataclass
 class HarvestResult:
-    """Encapsulates harvested packages, index URLs, warnings, and notices from cell magics."""
+    """
+    Encapsulates harvested packages, index URLs, warnings, and notices from cell magics.
+
+    Fields:
+        harvested_packages: Auxiliary CLI tool packages installed via %pip / !pip.
+        base_index_urls: Base download index URLs harvested via --index-url or -i.
+        extra_index_urls: Extra download index URLs harvested via --extra-index-url.
+        magic_warnings: Warnings for unresolvable magics (-r requirements.txt references).
+        magic_notices: Informational notices for non-pip calls (conda, apt-get).
+    """
     harvested_packages: Set[str] = field(default_factory=set)
     base_index_urls: Set[str] = field(default_factory=set)
     extra_index_urls: Set[str] = field(default_factory=set)
@@ -171,7 +212,26 @@ class HarvestResult:
 
 @dataclass
 class BatchAnalysisSummary:
-    """Aggregated analysis metrics across all notebooks in a batch repo scan."""
+    """
+    Aggregated analysis metrics across all notebooks in a batch repo scan.
+
+    Fields:
+        target_dir: Target directory path evaluated during the batch scan.
+        total_python_notebooks: Count of successfully parsed Python notebooks.
+        non_python_count: Count of non-Python notebooks skipped.
+        non_python_languages: Map of language name -> file count for skipped files.
+        parse_errors: List of NotebookScanResult objects for corrupted/unparseable files.
+        matched_packages: Set of PyPI package names successfully matched to active env.
+        missing_packages: Map of missing package name -> list of importing notebook names.
+        promotions: List of dynamic extra promotion notices generated across the batch.
+        dynamic_warnings: List of dynamic import warnings harvested across the batch.
+        magic_warnings: List of cell magic warnings harvested across the batch.
+        magic_notices: List of cell magic notices harvested across the batch.
+        batch_hardware_warnings: Map of package name with local tag -> list of notebook names missing index URLs.
+        primary_url: Deterministically selected primary download index URL for repo.
+        primary_url_reason: Selection rule explanation for primary index URL selection.
+        batch_hw_cache: Host GPU/accelerator inspection cache object.
+    """
     target_dir: str
     total_python_notebooks: int = 0
     non_python_count: int = 0
@@ -271,15 +331,14 @@ def discover_local_repo_modules(target_dir: str) -> Set[str]:
 
     return local_mods
 
+
 def get_notebook_local_modules(notebook_path: Path, root_dir: Optional[str] = None) -> Set[str]:
-    """
-    Discovers local repo modules scoped to both the notebook's immediate parent directory
-    and the overall repository root directory.
-    """
+    """Discovers local repo modules scoped to both the notebook's immediate parent directory and repository root."""
     local_mods = discover_local_repo_modules(str(notebook_path.parent))
     if root_dir and Path(root_dir).exists():
         local_mods.update(discover_local_repo_modules(root_dir))
     return local_mods
+
 
 # =====================================================================
 # CELL CLASSIFICATION & SOURCE PIPELINE
@@ -313,7 +372,16 @@ def detect_notebook_language(nb_data: Dict[str, Any], strict: bool = False) -> T
 def extract_from_file(
     notebook_path: str, strict: bool = False
 ) -> ExtractionResult:
-    """Reads a Jupyter Notebook JSON file and extracts code sources, imports, guarded state, and dynamic warnings."""
+    """
+    Reads a Jupyter Notebook JSON file and extracts code sources, imports, guarded state, and dynamic warnings.
+
+    Args:
+        notebook_path: Path string to the target .ipynb file.
+        strict: If True, rejects notebooks with missing language metadata (used in batch mode).
+
+    Returns:
+        ExtractionResult object containing extraction status, code sources, imports, and metadata.
+    """
     if not os.path.exists(notebook_path):
         return ExtractionResult(
             success=False,
@@ -610,7 +678,15 @@ def harvest_index_urls_from_sources(code_sources: List[str]) -> Set[str]:
 def harvest_cell_magics_and_commands(
     code_sources: List[str]
 ) -> HarvestResult:
-    """Scans code sources for cell magics, index URLs, auxiliary tools, and shell commands."""
+    """
+    Scans code sources for cell magics, index URLs, auxiliary tools, and shell commands.
+
+    Args:
+        code_sources: List of code cell body strings.
+
+    Returns:
+        HarvestResult containing harvested packages, index URLs, warnings, and notices.
+    """
     harvested_packages: Set[str] = set()
     base_index_urls: Set[str] = set()
     extra_index_urls: Set[str] = set()
@@ -925,6 +1001,7 @@ def process_package_requirements(
 # Probes runtime framework state for GPU/accelerator availability across 
 # PyTorch (CUDA/MPS), TensorFlow (GPU), and JAX (GPU/TPU).
 # =====================================================================
+
 def inspect_gpu_environment(imported_packages: Set[str]) -> Optional[GpuInfo]:
     """Per-framework GPU/accelerator inspection logic across PyTorch, TensorFlow, and JAX."""
     gpu_frameworks = {"torch", "tensorflow", "jax"}
@@ -1290,7 +1367,18 @@ def analyze_batch_repository(
     pkg_dist_map: Dict[str, List[str]], 
     batch_hw_cache: Optional[GpuInfo]
 ) -> BatchAnalysisSummary:
-    """Aggregates dependency metrics, warnings, and index settings across repository notebooks."""
+    """
+    Aggregates dependency metrics, warnings, and index settings across repository notebooks.
+
+    Args:
+        repo_map: Populated RepoEnvironmentMap object from scanning target directory.
+        frozen_env: Dict mapping package names to pinned freeze strings (pkg -> pkg==ver).
+        pkg_dist_map: Dict mapping import stems to distribution names from importlib metadata.
+        batch_hw_cache: Host GPU/accelerator inspection cache object.
+
+    Returns:
+        BatchAnalysisSummary containing aggregated counts, matched/missing packages, and warnings.
+    """
     summary = BatchAnalysisSummary(
         target_dir=repo_map.target_dir,
         total_python_notebooks=len(repo_map.scan_results),
@@ -1305,7 +1393,6 @@ def analyze_batch_repository(
         )
 
     for res in repo_map.scan_results:
-        # Scope local repo modules to both the notebook's parent directory and repository root
         nb_local_mods = get_notebook_local_modules(res.path, repo_map.target_dir)
 
         pinned_entries, notes = build_manifest_entries(
@@ -1351,7 +1438,6 @@ def analyze_batch_repository(
                 pkg_name = pin_entry.split("==")[0]
                 summary.matched_packages.add(pkg_name)
 
-        # Process harvested magic packages
         for pkg in res.harvested_pkgs:
             if pkg in STD_LIB or pkg in PLATFORM_PSEUDO_MODULES or pkg in nb_local_mods:
                 continue
@@ -1498,13 +1584,14 @@ def generate_universal_manifest(
 
     pinned_entries_set: Set[str] = set()
     for res in repo_map.scan_results:
+        nb_local_mods = get_notebook_local_modules(res.path, repo_map.target_dir)
         entries, _ = build_manifest_entries(
             res.imports, 
             res.submodules, 
             frozen_env, 
             pkg_dist_map, 
             guarded_imports=res.guarded_imports,
-            local_repo_modules=repo_map.local_repo_modules
+            local_repo_modules=nb_local_mods
         )
         pinned_entries_set.update(entries)
 
@@ -1529,7 +1616,22 @@ def apply_output_to_notebook(
     local_repo_modules: Optional[Set[str]] = None,
     root_dir: Optional[str] = None
 ) -> Path:
-    """Writes per-notebook locked file or replaces cells in-place."""
+    """
+    Writes per-notebook locked file or replaces setup cells in-place.
+
+    Args:
+        scan_res: NotebookScanResult for the target notebook.
+        frozen_env: Dict mapping package names to pinned freeze strings.
+        pkg_dist_map: Dict mapping import stems to distribution names.
+        batch_hw_cache: Host GPU/accelerator inspection cache object.
+        suffix: Output file suffix if in_place is False (default: '_merged').
+        in_place: If True, replaces setup cells in original notebook file.
+        local_repo_modules: Explicit local module stems set to ignore.
+        root_dir: Repository root directory string for scoped local module resolution.
+
+    Returns:
+        Path object pointing to written file.
+    """
     if local_repo_modules is None:
         local_repo_modules = get_notebook_local_modules(scan_res.path, root_dir)
 
@@ -1548,7 +1650,7 @@ def apply_output_to_notebook(
     manifest_lines, local_tagged, _ = process_package_requirements(
         pinned_manifest, scan_res.harvested_urls, base_urls=base_urls, auxiliary_entries=aux_entries, writefile_entries=writefile_entries
     )
-
+    
     gpu_info: Optional[GpuInfo] = None
     if batch_hw_cache:
         expanded_nb_imports = set(scan_res.imports)
@@ -1563,7 +1665,6 @@ def apply_output_to_notebook(
             matched_fw = None
             matched_device = None
 
-            # Check if any framework imported by this notebook has verified GPU acceleration
             for fw_stem in sorted(nb_fw):
                 if fw_devices.get(fw_stem):
                     matched_fw = fw_stem
@@ -1571,7 +1672,6 @@ def apply_output_to_notebook(
                     break
 
             if matched_device:
-                # Format canonical label back to human-readable string (e.g. torch -> PyTorch)
                 fw_display_map = {"torch": "PyTorch", "tensorflow": "TensorFlow", "jax": "JAX"}
                 active_label = fw_display_map.get(matched_fw, matched_fw.capitalize())
                 
@@ -1653,7 +1753,8 @@ def run_batch_pipeline(
                 batch_hw_cache, 
                 suffix=args.suffix, 
                 in_place=args.in_place,
-                local_repo_modules=nb_local_mods
+                local_repo_modules=nb_local_mods,
+                root_dir=repo_map.target_dir
             )
             logger.info(f"  • Updated '{written_path.name}'")
         logger.info("✅ Batch output complete.")
@@ -1724,7 +1825,6 @@ def run_single_file_pipeline(
     )
     full_freeze_lines = raw_full_freeze if args.full_freeze else None
 
-    # Diagnostic logging to stderr
     if warnings:
         logger.warning("⚠️ HARDWARE BUILD WARNINGS:")
         for pkg in warnings:
@@ -1780,12 +1880,12 @@ def run_single_file_pipeline(
             gpu_info,
             suffix=args.suffix,
             in_place=args.in_place,
-            local_repo_modules=single_file_local_modules
+            local_repo_modules=single_file_local_modules,
+            root_dir=target_single_file_dir
         )
         logger.info(f"✅ Updated '{written_path.name}'")
         sys.exit(0)
 
-    # Default single-file stdout emission
     blueprint = generate_production_blueprint(
         manifest_lines, 
         full_freeze_lines=full_freeze_lines, 
