@@ -291,3 +291,33 @@ class TestBatchOrchestration:
 
         assert is_clean is True
         assert "Uninstalled in active env: 0 packages" in report
+
+def test_batch_report_surfaces_hardware_tag_warnings(tmp_path):
+    """Verify generate_batch_analysis_report flags local tag builds missing download index URLs."""
+    nb_path = tmp_path / "test_hw_tag.ipynb"
+    nb_data = {
+        "cells": [{"cell_type": "code", "execution_count": 1, "metadata": {}, "outputs": [], "source": ["import torch"]}],
+        "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"}},
+        "nbformat": 4,
+        "nbformat_minor": 5
+    }
+    with open(nb_path, "w", encoding="utf-8") as f:
+        json.dump(nb_data, f)
+
+    mock_env = {"torch": "torch==2.1.0+cu121"}
+    
+    scan_res = ne.NotebookScanResult(
+        path=nb_path,
+        is_python=True,
+        lang_label="python",
+        imports={"torch"},
+        code_sources=["import torch"]
+    )
+    
+    repo_map = ne.RepoEnvironmentMap(str(tmp_path))
+    repo_map.add_result(scan_res)
+    
+    report_text, _ = ne.generate_batch_analysis_report(repo_map, mock_env, {}, None)
+    
+    assert "Local / Hardware Tag Build Warnings:" in report_text
+    assert "torch==2.1.0+cu121" in report_text

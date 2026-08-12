@@ -1156,6 +1156,7 @@ def generate_batch_analysis_report(
     dynamic_warnings: List[str] = []
     aggregated_magic_warnings: List[str] = []
     aggregated_magic_notices: List[str] = []
+    batch_hardware_warnings: Dict[str, List[str]] = {}  # Map pkg -> list of notebook names
 
     for res in repo_map.scan_results:
         pinned_entries, notes = build_manifest_entries(
@@ -1166,6 +1167,16 @@ def generate_batch_analysis_report(
             guarded_imports=res.guarded_imports,
             local_repo_modules=repo_map.local_repo_modules
         )
+
+        # Check for local tag build warnings (+cu121, +cpu, etc.)
+        _, _, hw_warns = process_package_requirements(
+            pinned_entries, 
+            res.harvested_urls, 
+            base_urls=res.base_index_urls
+        )
+        for hw_pkg in hw_warns:
+            batch_hardware_warnings.setdefault(hw_pkg, []).append(res.path.name)
+
         for note in notes:
             if note not in promotions:
                 promotions.append(note)
@@ -1250,6 +1261,13 @@ def generate_batch_analysis_report(
         out.append(f"    └─ Selection Rule: {url_reason}")
     else:
         out.append("  • Extra Index URLs Harvested: None")
+
+    if batch_hardware_warnings:
+        out.append("  • Local / Hardware Tag Build Warnings:")
+        for pkg, nbs in sorted(batch_hardware_warnings.items()):
+            nb_list = ", ".join(sorted(set(nbs))[:3])
+            more = f", +{len(set(nbs))-3} more" if len(set(nbs)) > 3 else ""
+            out.append(f"      ⚠️ {pkg} (in: {nb_list}{more}) — No download URL harvested in code cells.")
 
     out.append("\n" + "-" * 80)
     if err_count > 0:
