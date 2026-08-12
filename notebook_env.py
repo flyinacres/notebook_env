@@ -1,18 +1,30 @@
 #!/usr/bin/env python3
 """
-notebook_env.py (v36)
+notebook_env.py (v37)
 Headless Jupyter Notebook Dependency Scanner & Lockfile Generator.
 
 Standalone, zero-dependency utility for analyzing notebook environments,
 detecting GPU/accelerator requirements, harvesting index URLs, and emitting
 reproducible lockfile manifests (`pinned_requirements.txt`).
 
+=====================================================================
+🚀 QUICKSTART FOR JUPYTER / COLAB / DATABRICKS USERS
+=====================================================================
+If you are running inside a Jupyter notebook cell:
+  1. Paste this entire file into a notebook cell.
+  2. Run:
+       import notebook_env as ne
+       ne.main()
+  3. Copy the output setup cells into the top of your notebook.
+
+For full CLI documentation, batch directory workflows, and detailed instructions, 
+see the repository README:
+👉 https://github.com/flyinacres/notebook_env/blob/main/README.md
+
 Execution Modes:
   1. Single Notebook CLI:  python notebook_env.py notebook.ipynb [--output | --in-place]
   2. Batch Repo Directory: python notebook_env.py --batch ./repo --universal [--output | --in-place]
   3. Live IPython Kernel:   import notebook_env as ne; ne.main()
-
-For full usage, CLI flag documentation, and architectural details, see README.md.
 """
 
 # =====================================================================
@@ -52,6 +64,7 @@ logger.addHandler(console_handler)
 
 
 class StatusLabel:
+    """Standardized metadata and language classification status labels."""
     PYTHON = "python"
     CORRUPTED = "corrupted"
     ERROR = "error"
@@ -60,6 +73,7 @@ class StatusLabel:
 
 
 class GpuInfo(TypedDict, total=False):
+    """Payload representing active host accelerator capabilities."""
     has_gpu: bool
     type: Optional[str]
     active_framework: Optional[str]
@@ -68,12 +82,14 @@ class GpuInfo(TypedDict, total=False):
 
 
 class BlueprintResult(TypedDict):
+    """Cell blueprint output strings for Cell 1 (Markdown) and Cell 2 (Python script)."""
     step1_markdown: str
     step2_code: str
 
 
 @dataclass
 class NotebookScanResult:
+    """Complete AST and metadata analysis payload for an individual notebook file."""
     path: Path
     is_python: bool
     lang_label: str
@@ -94,6 +110,8 @@ class NotebookScanResult:
     def __post_init__(self):
         if self.code_sources and not self.harvested_urls:
             self.harvested_urls = harvest_index_urls_from_sources(self.code_sources)
+
+
 @dataclass
 class ExtractionResult:
     """Encapsulates the raw extraction payload from reading a notebook file."""
@@ -139,6 +157,7 @@ class HarvestResult:
             self.magic_notices,
         ))
 
+
 @dataclass
 class BatchAnalysisSummary:
     """Aggregated analysis metrics across all notebooks in a batch repo scan."""
@@ -163,7 +182,14 @@ class BatchAnalysisSummary:
         """Returns True if no blocking parse/file errors exist in the batch."""
         return len(self.parse_errors) == 0
 
-# Mappings, Platform Injections & Stdlib lookup
+
+# =====================================================================
+# MAPPINGS, PLATFORM INJECTIONS & STDLIB LOOKUP
+# Data structures for import-to-PyPI resolution, platform pseudo-modules,
+# transitive framework relationships, and Python standard library filtering.
+# =====================================================================
+
+# Maps Python import top-level stems (e.g. `import cv2`) to their standard PyPI package names (`opencv-python`).
 IMPORT_TO_PYPI_MAP: Dict[str, str] = {
     "cv2": "opencv-python",
     "sklearn": "scikit-learn",
@@ -176,6 +202,8 @@ IMPORT_TO_PYPI_MAP: Dict[str, str] = {
     "mpl_toolkits": "matplotlib"
 }
 
+# Injected cloud platform modules provided natively by runtimes (Databricks, Colab, Kaggle).
+# These modules have no PyPI equivalent and are excluded from uninstalled-package warnings.
 PLATFORM_PSEUDO_MODULES: Set[str] = {
     "dbutils",
     "kaggle_secrets",
@@ -183,6 +211,8 @@ PLATFORM_PSEUDO_MODULES: Set[str] = {
     "pyspark.dbutils"
 }
 
+# Maps high-level framework wrappers to their core underlying GPU acceleration framework.
+# (e.g., importing `fastai` requires `torch` acceleration checks).
 TRANSITIVE_FRAMEWORK_MAP: Dict[str, str] = {
     "fastai": "torch",
     "torchvision": "torch",
@@ -192,12 +222,14 @@ TRANSITIVE_FRAMEWORK_MAP: Dict[str, str] = {
     "flax": "jax",
 }
 
+# Maps human-readable active framework labels from hardware inspection back to canonical import stems.
 FRAMEWORK_NAME_TO_CANONICAL: Dict[str, str] = {
     "PyTorch": "torch",
     "TensorFlow": "tensorflow",
     "JAX": "jax",
 }
 
+# Python standard library module stems. Used to filter built-in modules out of PyPI lockfile manifests.
 STD_LIB: Set[str] = set(sys.stdlib_module_names) if hasattr(sys, 'stdlib_module_names') else {
     "os", "sys", "re", "json", "ast", "subprocess", "datetime", "math", "random", 
     "time", "pathlib", "typing", "collections", "itertools", "functools", "shutil"
@@ -205,7 +237,7 @@ STD_LIB: Set[str] = set(sys.stdlib_module_names) if hasattr(sys, 'stdlib_module_
 
 
 def discover_local_repo_modules(target_dir: str) -> Set[str]:
-    """Scans target_dir for valid top-level Python modules and packages."""
+    """Scans target_dir for valid top-level Python modules and packages to prevent false-positive PyPI warnings."""
     local_mods: Set[str] = set()
     target_path = Path(target_dir)
     if not target_path.exists():
@@ -324,6 +356,7 @@ def extract_from_active_session() -> Tuple[Set[str], Dict[str, Set[str]], List[s
 
 
 def extract_from_active_session_internal(code_sources: List[str]) -> Tuple[Set[str], Dict[str, Set[str]], List[str], Set[str], List[str]]:
+    """Internal helper to parse IPython history lists via extract_imports_from_sources."""
     imports, submodules, guarded_imports, dyn_warnings = extract_imports_from_sources(code_sources)
     return imports, submodules, code_sources, guarded_imports, dyn_warnings
 
@@ -335,6 +368,7 @@ def extract_from_active_session_internal(code_sources: List[str]) -> Tuple[Set[s
 # =====================================================================
 
 class NotebookImportVisitor(ast.NodeVisitor):
+    """AST visitor traversing Python code to record imports, guarded states, and dynamic calls."""
     def __init__(self) -> None:
         self.imports: Set[str] = set()
         self.writefile_imports: Set[str] = set()
@@ -426,6 +460,7 @@ class NotebookImportVisitor(ast.NodeVisitor):
 def extract_imports_from_sources(
     code_sources: List[str]
 ) -> Tuple[Set[str], Dict[str, Set[str]], Set[str], List[str]]:
+    """Executes AST traversal over code sources, stripping IPython line magics."""
     visitor = NotebookImportVisitor()
     for source in code_sources:
         cell_type, clean_body = classify_cell_source(source)
@@ -457,6 +492,7 @@ def extract_imports_from_sources(
         visitor.dynamic_import_warnings
     )
 
+
 def extract_writefile_imports_from_sources(code_sources: List[str]) -> Set[str]:
     """Dedicated helper to extract writefile imports without altering extract_imports_from_sources signature."""
     visitor = NotebookImportVisitor()
@@ -484,29 +520,44 @@ def extract_writefile_imports_from_sources(code_sources: List[str]) -> Set[str]:
 # base/extra PyPI index URLs (--index-url), and non-Python shell commands.
 # =====================================================================
 
+# Standalone pip boolean flags that do not take arguments.
 PIP_SINGLE_FLAGS: Set[str] = {
     "-u", "--upgrade", "-q", "--quiet", "--user", "--no-cache-dir",
     "--force-reinstall", "--no-deps", "--pre", "--break-system-packages"
 }
 
+# Pip flags expecting an immediate value parameter token.
 PIP_VALUE_FLAGS: Set[str] = {
     "--extra-index-url", "--index-url", "-i", "-f", "--find-links", 
     "-t", "--target", "-e", "--editable", "-r", "--requirement"
 }
 
+# Non-Python IPython cell magic headers that mark shell script cells.
 SHELL_CELL_MAGICS: Set[str] = {
     "%%bash", "%%sh", "%%zsh", "%%script", "%%cmd", "%%powershell"
 }
 
-# --- COMPILED REGEX PATTERNS (Section-Level Constants) ---
+# --- COMPILED REGEX PATTERNS ---
+
+# Matches `--extra-index-url <url>` in pip install magic calls. Capture group 1 extracts the URL string.
 EXTRA_INDEX_PATTERN = re.compile(r'--extra-index-url\s+([^\s]+)')
+
+# Matches `--index-url <url>` or `-i <url>` base index overrides. Capture group 1 extracts the URL string.
 BASE_INDEX_PATTERN = re.compile(r'(?:--index-url|-i)\s+([^\s]+)')
+
+# Splits chained shell commands separated by ;, &&, ||, or |.
 SHELL_SPLIT_PATTERN = re.compile(r'\s*(?:&&|;|\||\|\|)\s*')
 
+# Matches `%pip install`, `!pip install`, or `pip install` commands. Capture group 1 extracts arguments.
 PIP_INSTALL_PATTERN = re.compile(r'^\s*(?:%pip|!pip|pip3?)\s+install\s+(.+)$')
+
+# Matches system package manager calls (`apt-get install`, `brew install`, `yum install`).
 SYSTEM_PKG_PATTERN = re.compile(r'^\s*(?:!|%%bash|%%sh)?\s*(?:apt-get|brew|yum)\s+install\s+(.+)$')
+
+# Matches `%conda install` or `!conda install` calls.
 CONDA_INSTALL_PATTERN = re.compile(r'^\s*(?:%conda|!conda|conda)\s+install\s+(.+)$')
 
+# Prefixes signaling local path wheels or direct VCS repository installs (e.g., git+https://...).
 VCS_OR_PATH_PREFIXES: Tuple[str, ...] = (
     ".", "/", "\\", "git+", "hg+", "svn+", "bzr+", "http://", "https://"
 )
@@ -531,20 +582,15 @@ def classify_cell_source(source: str) -> Tuple[str, str]:
 
 
 def harvest_index_urls_from_sources(code_sources: List[str]) -> Set[str]:
-    """
-    Scans code sources for index URLs and returns a combined set of all harvested URLs.
-    Preserves signature compatibility for batch runners and existing test suites.
-    """
-    _, base_urls, extra_urls, _, _ = harvest_cell_magics_and_commands(code_sources)
-    return base_urls.union(extra_urls)
+    """Scans code sources for index URLs and returns a combined set of all harvested URLs."""
+    h_res = harvest_cell_magics_and_commands(code_sources)
+    return h_res.base_index_urls.union(h_res.extra_index_urls)
 
 
 def harvest_cell_magics_and_commands(
     code_sources: List[str]
 ) -> HarvestResult:
-    """
-    Scans code sources for cell magics, index URLs, auxiliary tools, and shell commands.
-    """
+    """Scans code sources for cell magics, index URLs, auxiliary tools, and shell commands."""
     harvested_packages: Set[str] = set()
     base_index_urls: Set[str] = set()
     extra_index_urls: Set[str] = set()
@@ -627,6 +673,7 @@ def harvest_cell_magics_and_commands(
         magic_notices=magic_notices
     )
 
+
 # =====================================================================
 # ENVIRONMENT CORRELATION & EXTRAS PROMOTION
 # Maps extracted import names to active runtime versions via `pip freeze` 
@@ -638,10 +685,7 @@ def build_auxiliary_tool_entries(
     imported_packages: Set[str],
     frozen_env: Dict[str, str]
 ) -> List[str]:
-    """
-    Builds commented-out manifest lines for CLI tools installed via cell magics
-    that are not directly imported in Python code.
-    """
+    """Builds commented-out manifest lines for CLI tools installed via cell magics not imported directly."""
     aux_entries: List[str] = []
     unimported_tools = sorted([
         pkg for pkg in harvested_packages 
@@ -667,10 +711,7 @@ def build_writefile_tool_entries(
     primary_imports: Set[str],
     frozen_env: Dict[str, str]
 ) -> List[str]:
-    """
-    Builds commented-out manifest lines for dependencies imported exclusively
-    inside %%writefile generated scripts.
-    """
+    """Builds commented-out manifest lines for dependencies imported exclusively inside %%writefile generated scripts."""
     entries: List[str] = []
     script_only = sorted([
         pkg for pkg in writefile_imports 
@@ -787,7 +828,7 @@ def build_manifest_entries(
 
 
 def resolve_opencv_variant(submodules: Optional[Set[str]] = None) -> str:
-    """Determines the appropriate OpenCV package variant installed in the environment."""
+    """Determines the appropriate OpenCV package variant installed in the active environment."""
     has_contrib = any('contrib' in s.lower() or 'aruco' in s.lower() for s in submodules) if submodules else False
     try:
         res = subprocess.run([sys.executable, "-m", "pip", "list"], capture_output=True, text=True)
@@ -806,7 +847,7 @@ def resolve_opencv_variant(submodules: Optional[Set[str]] = None) -> str:
 
 
 def get_installed_environment() -> Tuple[Dict[str, str], List[str]]:
-    """Runs pip freeze to get precise version snapshots."""
+    """Runs pip freeze to get precise version snapshots of the active runtime."""
     res = subprocess.run([sys.executable, "-m", "pip", "freeze"], capture_output=True, text=True)
     frozen: Dict[str, str] = {}
     for line in res.stdout.splitlines():
@@ -823,7 +864,7 @@ def process_package_requirements(
     auxiliary_entries: Optional[List[str]] = None,
     writefile_entries: Optional[List[str]] = None
 ) -> Tuple[List[str], List[Tuple[str, List[str]]], List[str]]:
-    """Correlates pinned packages with harvested base/extra index URLs, auxiliary tool entries, and writefile script dependencies."""
+    """Correlates pinned packages with harvested base/extra index URLs, auxiliary tool entries, and writefile dependencies."""
     manifest_output: List[str] = []
     local_tagged_info: List[Tuple[str, List[str]]] = []
     warnings: List[str] = []
@@ -869,14 +910,12 @@ def inspect_gpu_environment(imported_packages: Set[str]) -> Optional[GpuInfo]:
     """Per-framework GPU/accelerator inspection logic including transitive wrapper resolution."""
     gpu_frameworks = {"torch", "tensorflow", "jax"}
     
-    # Expand imported packages with transitive framework dependencies
     expanded_imports = set(imported_packages)
     for pkg in imported_packages:
         base_fw = TRANSITIVE_FRAMEWORK_MAP.get(pkg)
         if base_fw:
             expanded_imports.add(base_fw)
         else:
-            # Dynamic fallback via importlib metadata if installed in host environment
             try:
                 reqs = importlib.metadata.requires(pkg) or []
                 for req in reqs:
@@ -1120,6 +1159,7 @@ def create_managed_cells(blueprint: BlueprintResult) -> List[Dict[str, Any]]:
 # =====================================================================
 
 class RepoEnvironmentMap:
+    """Aggregates notebook scan results across a repository directory."""
     def __init__(self, target_dir: str) -> None:
         self.target_dir = target_dir
         self.scan_results: List[NotebookScanResult] = []
@@ -1155,7 +1195,7 @@ class RepoEnvironmentMap:
 
 
 def select_primary_index_url(url_to_notebooks: Dict[str, List[Path]]) -> Tuple[Optional[str], Optional[str]]:
-    """Deterministically selects primary index URL."""
+    """Deterministically selects primary index URL based on repository frequency."""
     if not url_to_notebooks:
         return None, None
 
@@ -1234,7 +1274,6 @@ def analyze_batch_repository(
         batch_hw_cache=batch_hw_cache
     )
 
-    # Tally non-Python language counts
     for item in repo_map.non_python_files:
         summary.non_python_languages[item.lang_label] = (
             summary.non_python_languages.get(item.lang_label, 0) + 1
@@ -1250,7 +1289,6 @@ def analyze_batch_repository(
             local_repo_modules=repo_map.local_repo_modules
         )
 
-        # Check for local tag build warnings (+cu121, +cpu, etc.)
         _, _, hw_warns = process_package_requirements(
             pinned_entries, 
             res.harvested_urls, 
@@ -1285,7 +1323,6 @@ def analyze_batch_repository(
                 pkg_name = pin_entry.split("==")[0]
                 summary.matched_packages.add(pkg_name)
 
-        # Process harvested magic packages
         for pkg in res.harvested_pkgs:
             if pkg in STD_LIB or pkg in PLATFORM_PSEUDO_MODULES or pkg in repo_map.local_repo_modules:
                 continue
@@ -1367,7 +1404,6 @@ def format_batch_report(summary: BatchAnalysisSummary) -> str:
             out.append(f"  • {note}")
         out.append("")
 
-    # Hardware & Index Audit
     out.append("⚡ HARDWARE & INDEX AUDIT:")
     if summary.batch_hw_cache and summary.batch_hw_cache.get("has_gpu"):
         out.append(f"  • Active Hardware Accelerator: {summary.batch_hw_cache['device_name']}")
@@ -1482,7 +1518,6 @@ def apply_output_to_notebook(
     
     gpu_info: Optional[GpuInfo] = None
     if batch_hw_cache:
-        # Expand notebook imports transitively (e.g. fastai -> torch, keras -> tensorflow)
         expanded_nb_imports = set(scan_res.imports)
         for imp in scan_res.imports:
             base_fw = TRANSITIVE_FRAMEWORK_MAP.get(imp)
@@ -1492,7 +1527,6 @@ def apply_output_to_notebook(
         nb_fw = set(batch_hw_cache.get("frameworks", [])).intersection(expanded_nb_imports)
         if nb_fw:
             active_fw_name = batch_hw_cache.get("active_framework")
-            # Map human-readable active framework back to canonical set
             canonical_active_fw = FRAMEWORK_NAME_TO_CANONICAL.get(active_fw_name, "").lower()
 
             if batch_hw_cache.get("has_gpu") and canonical_active_fw in nb_fw:
@@ -1536,6 +1570,7 @@ def apply_output_to_notebook(
         json.dump(nb_data, f, indent=1)
 
     return target_path
+
 
 def run_batch_pipeline(
     target_batch_dir: str, 
@@ -1720,6 +1755,7 @@ def run_single_file_pipeline(
 
 
 def main() -> None:
+    """CLI entrypoint and dispatch router for single notebook or batch analysis modes."""
     parser = argparse.ArgumentParser(description="Generate environment lockfiles for Jupyter Notebooks.")
     parser.add_argument("notebook", nargs="?", help="Path to target .ipynb file or directory (when using --batch).")
     parser.add_argument("--full-freeze", action="store_true", help="Append full environment pip freeze after targeted manifest.")
@@ -1764,6 +1800,7 @@ def main() -> None:
         run_batch_pipeline(target_batch_dir, args, frozen_env, pkg_dist_map, batch_hw_cache)
     else:
         run_single_file_pipeline(args, frozen_env, raw_full_freeze, pkg_dist_map)
+
 
 if __name__ == "__main__":
     main()
