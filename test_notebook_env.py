@@ -716,3 +716,208 @@ def test_production_blueprint_failure_message_dynamic():
     tagged_blueprint = ne.generate_production_blueprint(["torch==2.1.0+cu121"])
     assert "Troubleshooting Steps:" in tagged_blueprint["step2_code"]
     assert ne.HELP_URL in tagged_blueprint["step2_code"]
+
+
+class TestMemoizeForRun:
+    """
+    Tests for the _memoize_for_run decorator and its use on
+    get_notebook_local_modules / build_manifest_entries.
+
+    Covers the three properties that matter for a shared, mutable-return-type
+    cache: (1) repeated identical calls actually skip recomputation,
+    (2) distinct inputs are never conflated into the same cache entry, and
+    (3) callers can't corrupt the cache by mutating a returned value.
+    """
+
+    def test_local_modules_dedupes_identical_calls(self, tmp_path, monkeypatch):
+        nb_path = tmp_path / "nb.ipynb"
+        nb_path.touch()
+
+        call_count = {"n": 0}
+        real_discover = ne.discover_local_repo_modules
+
+        def counting_discover(*args, **kwargs):
+            call_count["n"] += 1
+            return real_discover(*args, **kwargs)
+
+        monkeypatch.setattr(ne, "discover_local_repo_modules", counting_discover)
+        ne.get_notebook_local_modules.cache_clear()
+
+        r1 = ne.get_notebook_local_modules(nb_path, str(tmp_path))
+        calls_after_first = call_count["n"]
+        r2 = ne.get_notebook_local_modules(nb_path, str(tmp_path))
+
+        assert r1 == r2
+        assert call_count["n"] == calls_after_first, "second identical call should not re-scan the filesystem"
+
+    def test_local_modules_different_notebooks_not_conflated(self, tmp_path):
+        """Distinct (path, root_dir) inputs must never share a cache entry, even
+        under the id()-keying scheme — each notebook has its own Path object."""
+        dir_a, dir_b = tmp_path / "a", tmp_path / "b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        (dir_a / "helper_a.py").write_text("# a", encoding="utf-8")
+        (dir_b / "helper_b.py").write_text("# b", encoding="utf-8")
+
+        ne.get_notebook_local_modules.cache_clear()
+        result_a = ne.get_notebook_local_modules(dir_a / "nb.ipynb", str(dir_a))
+        result_b = ne.get_notebook_local_modules(dir_b / "nb.ipynb", str(dir_b))
+
+        assert "helper_a" in result_a and "helper_a" not in result_b
+        assert "helper_b" in result_b and "helper_b" not in result_a
+
+    def test_local_modules_returns_defensive_copy(self, tmp_path):
+        nb_path = tmp_path / "nb.ipynb"
+        nb_path.touch()
+        ne.get_notebook_local_modules.cache_clear()
+
+        r1 = ne.get_notebook_local_modules(nb_path, str(tmp_path))
+        r1.add("INJECTED_BY_TEST")
+        r2 = ne.get_notebook_local_modules(nb_path, str(tmp_path))
+
+        assert "INJECTED_BY_TEST" not in r2, "mutating one caller's result must not corrupt the cached value"
+
+    def test_local_modules_cache_clear_forces_recompute(self, tmp_path, monkeypatch):
+        nb_path = tmp_path / "nb.ipynb"
+        nb_path.touch()
+
+        call_count = {"n": 0}
+        real_discover = ne.discover_local_repo_modules
+
+        def counting_discover(*args, **kwargs):
+            call_count["n"] += 1
+            return real_discover(*args, **kwargs)
+
+        monkeypatch.setattr(ne, "discover_local_repo_modules", counting_discover)
+        ne.get_notebook_local_modules.cache_clear()
+
+        ne.get_notebook_local_modules(nb_path, str(tmp_path))
+        calls_before_clear = call_count["n"]
+        ne.get_notebook_local_modules.cache_clear()
+        ne.get_notebook_local_modules(nb_path, str(tmp_path))
+
+        assert call_count["n"] == calls_before_clear * 2, "cache_clear() must force a real recompute, not return stale data"
+
+    def test_build_manifest_entries_dedupes_identical_calls(self, monkeypatch):
+        call_count = {"n": 0}
+        real_resolve = ne.resolve_pypi_package_and_extras
+
+        def counting_resolve(*args, **kwargs):
+            call_count["n"] += 1
+            return real_resolve(*args, **kwargs)
+
+        monkeypatch.setattr(ne, "resolve_pypi_package_and_extras", counting_resolve)
+        ne.build_manifest_entries.cache_clear()
+
+        imports = {"pandas", "numpy"}
+        # Same dict object passed to both calls, matching every real call site
+        # (analyze_batch_repository / generate_universal_manifest / apply_output_to_notebook
+        # all read the same res.submodules attribute repeatedly, never rebuild it) —
+        # see build_manifest_entries's memoization docstring: dict args are keyed
+        # by id(), not content, so two *different* dict objects (even empty,
+        # equal ones) would correctly miss the cache. See the dedicated test
+        # below for that case.
+        submodules: Dict[str, Set[str]] = {}
+        frozen_env = {"pandas": "pandas==2.2.0", "numpy": "numpy==1.26.0"}
+
+        r1 = ne.build_manifest_entries(imports, submodules, frozen_env)
+        calls_after_first = call_count["n"]
+        r2 = ne.build_manifest_entries(imports, submodules, frozen_env)
+
+        assert r1 == r2
+        assert call_count["n"] == calls_after_first, "second identical call (same object refs) should not re-resolve every import"
+
+    def test_build_manifest_entries_distinct_equal_dicts_not_treated_as_cache_hit(self, monkeypatch):
+        """
+        Documents an intentional limitation, not a bug: dict arguments are keyed
+        by id() rather than content (see _memoize_for_run docstring — re-hashing
+        a potentially large frozen_env/pkg_dist_map on every call would cost more
+        than caching saves). So two distinct dict objects with equal content are
+        correctly treated as a cache MISS, not a false-positive hit. This is the
+        safe direction to fail in: the worst case is a missed optimization, never
+        a wrong answer served from an unrelated dict.
+        """
+        call_count = {"n": 0}
+        real_resolve = ne.resolve_pypi_package_and_extras
+
+        def counting_resolve(*args, **kwargs):
+            call_count["n"] += 1
+            return real_resolve(*args, **kwargs)
+
+        monkeypatch.setattr(ne, "resolve_pypi_package_and_extras", counting_resolve)
+        ne.build_manifest_entries.cache_clear()
+
+        imports = {"pandas"}
+        frozen_env = {"pandas": "pandas==2.2.0"}
+
+        r1 = ne.build_manifest_entries(imports, {}, frozen_env)
+        calls_after_first = call_count["n"]
+        r2 = ne.build_manifest_entries(imports, {}, frozen_env)  # a *different* {} object, same content
+
+        assert r1 == r2, "results must still be correct even without a cache hit"
+        assert call_count["n"] == calls_after_first * 2, "distinct dict objects must not be conflated into one cache entry"
+
+    def test_build_manifest_entries_different_imports_not_conflated(self):
+        ne.build_manifest_entries.cache_clear()
+        frozen_env = {"pandas": "pandas==2.2.0", "numpy": "numpy==1.26.0"}
+
+        entries_pandas, _ = ne.build_manifest_entries({"pandas"}, {}, frozen_env)
+        entries_numpy, _ = ne.build_manifest_entries({"numpy"}, {}, frozen_env)
+
+        assert any("pandas" in line for line in entries_pandas)
+        assert not any("pandas" in line for line in entries_numpy)
+        assert any("numpy" in line for line in entries_numpy)
+        assert not any("numpy" in line for line in entries_pandas)
+
+    def test_build_manifest_entries_different_frozen_env_not_conflated(self):
+        """Two distinct frozen_env dict objects (even if built independently)
+        must resolve independently — id()-keying must not accidentally treat
+        an unrelated dict as a cache hit."""
+        ne.build_manifest_entries.cache_clear()
+        imports = {"pandas"}
+
+        entries_v1, _ = ne.build_manifest_entries(imports, {}, {"pandas": "pandas==2.2.0"})
+        entries_v2, _ = ne.build_manifest_entries(imports, {}, {"pandas": "pandas==1.5.0"})
+
+        assert any("2.2.0" in line for line in entries_v1)
+        assert any("1.5.0" in line for line in entries_v2)
+
+    def test_build_manifest_entries_returns_defensive_copy(self):
+        ne.build_manifest_entries.cache_clear()
+        imports = {"pandas"}
+        submodules: Dict[str, Set[str]] = {}  # same object both calls — see dedup test above for why
+        frozen_env = {"pandas": "pandas==2.2.0"}
+
+        entries1, notes1 = ne.build_manifest_entries(imports, submodules, frozen_env)
+        entries1.append("INJECTED_BY_TEST")
+        notes1.append("INJECTED_NOTE")
+        entries2, notes2 = ne.build_manifest_entries(imports, submodules, frozen_env)
+
+        assert "INJECTED_BY_TEST" not in entries2
+        assert "INJECTED_NOTE" not in notes2
+
+    def test_main_clears_memoization_caches_before_anything_else(self, monkeypatch):
+        """main() is the single documented entrypoint for both CLI and live-kernel
+        usage (`import notebook_env as ne; ne.main()`). It must clear both memoized
+        caches unconditionally, before argument parsing even happens, so a
+        long-lived kernel session never returns stale results after the user
+        edits files on disk between calls to ne.main()."""
+        cleared = {"local_modules": False, "manifest": False}
+        monkeypatch.setattr(ne.get_notebook_local_modules, "cache_clear", lambda: cleared.__setitem__("local_modules", True))
+        monkeypatch.setattr(ne.build_manifest_entries, "cache_clear", lambda: cleared.__setitem__("manifest", True))
+
+        # --output with no notebook/--batch target hits main()'s validation
+        # sys.exit(1) — a real, guaranteed-early exit path that fires *after*
+        # the cache_clear() calls at the top of main() but *before* the
+        # expensive get_installed_environment() subprocess call, so this
+        # verifies clearing happens unconditionally without needing to run
+        # the full pipeline. (main() uses parse_known_args(), which silently
+        # ignores unrecognized flags rather than erroring, so an invalid-flag
+        # approach wouldn't reliably exit here.)
+        monkeypatch.setattr(sys, "argv", ["notebook_env.py", "--output"])
+
+        with pytest.raises(SystemExit):
+            ne.main()
+
+        assert cleared["local_modules"] is True
+        assert cleared["manifest"] is True
