@@ -139,6 +139,13 @@ class NotebookScanResult:
         dynamic_warnings: Warnings triggered by non-literal dynamic import calls.
         code_sources: Raw code cell string bodies extracted from notebook cells.
         harvested_urls: Combined set of harvested base and extra index download URLs.
+            Defaults to None (not str's empty-set) so __post_init__ can distinguish
+            "caller hasn't computed this yet, please derive it" from "caller already
+            ran the harvest and confirmed there are none" — an empty set is a
+            perfectly valid, common result (most notebooks reference no custom
+            index), and re-deriving it in that case would silently repeat a full
+            harvest_cell_magics_and_commands() pass for no benefit. Always a concrete
+            Set[str] (never None) once __post_init__ has run.
         writefile_imports: Imports occurring exclusively inside %%writefile generated scripts.
         harvested_pkgs: Packages installed via cell magics (%pip / !pip) but not imported in Python code.
         base_index_urls: Base index URLs harvested via --index-url / -i.
@@ -155,7 +162,7 @@ class NotebookScanResult:
     guarded_imports: Set[str] = field(default_factory=set)
     dynamic_warnings: List[str] = field(default_factory=list)
     code_sources: List[str] = field(default_factory=list)
-    harvested_urls: Set[str] = field(default_factory=set)
+    harvested_urls: Optional[Set[str]] = None
     writefile_imports: Set[str] = field(default_factory=set)
     harvested_pkgs: Set[str] = field(default_factory=set)
     base_index_urls: Set[str] = field(default_factory=set)
@@ -164,8 +171,20 @@ class NotebookScanResult:
     magic_notices: List[str] = field(default_factory=list)
 
     def __post_init__(self):
-        if self.code_sources and not self.harvested_urls:
-            self.harvested_urls = harvest_index_urls_from_sources(self.code_sources)
+        # Only auto-derive when harvested_urls was never supplied at all (None).
+        # An explicitly-passed empty set means the caller already harvested and
+        # confirmed there are no index URLs — that's the common case and must
+        # NOT trigger a second full harvest pass. See field docstring above.
+        if self.harvested_urls is None:
+            if self.code_sources:
+                logger.debug(
+                    f"NotebookScanResult for '{self.path.name}' constructed without "
+                    "harvested_urls; auto-deriving via a fresh harvest_cell_magics_and_commands() "
+                    "pass. Pass harvested_urls explicitly (even if empty) to skip this."
+                )
+                self.harvested_urls = harvest_index_urls_from_sources(self.code_sources)
+            else:
+                self.harvested_urls = set()
 
 
 @dataclass
@@ -1705,12 +1724,22 @@ def apply_output_to_notebook(
         guarded_imports=scan_res.guarded_imports,
         local_repo_modules=local_repo_modules
     )
-    harvested_pkgs, base_urls, extra_urls, _, _ = harvest_cell_magics_and_commands(scan_res.code_sources)
-    aux_entries = build_auxiliary_tool_entries(harvested_pkgs, scan_res.imports, frozen_env)
+    # scan_res.harvested_pkgs / base_index_urls / extra_index_urls were already
+    # populated by harvest_cell_magics_and_commands() during the initial scan
+    # (walk_and_scan_directory for batch mode, run_single_file_pipeline for
+    # single-file mode) — reuse them rather than re-running the same
+    # regex/tokenize pass over every code cell a second time.
+    logger.debug(
+        f"apply_output_to_notebook for '{scan_res.path.name}': reusing "
+        f"{len(scan_res.harvested_pkgs)} pre-harvested package(s) and "
+        f"{len(scan_res.base_index_urls) + len(scan_res.extra_index_urls)} index URL(s) "
+        "from the initial scan (no re-harvest)."
+    )
+    aux_entries = build_auxiliary_tool_entries(scan_res.harvested_pkgs, scan_res.imports, frozen_env)
     writefile_entries = build_writefile_tool_entries(scan_res.writefile_imports, scan_res.imports, frozen_env)
     
     manifest_lines, local_tagged, _ = process_package_requirements(
-        pinned_manifest, scan_res.harvested_urls, base_urls=base_urls, auxiliary_entries=aux_entries, writefile_entries=writefile_entries
+        pinned_manifest, scan_res.harvested_urls, base_urls=scan_res.base_index_urls, auxiliary_entries=aux_entries, writefile_entries=writefile_entries
     )
     
     gpu_info: Optional[GpuInfo] = None
