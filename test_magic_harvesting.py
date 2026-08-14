@@ -173,6 +173,34 @@ class TestScopedFlagAssociation:
         # v38 Contract: imports must preserve ['zstandard', 'astroid', 'pandas'] rather than sorting alphabetically
         assert list(imports) == ["zstandard", "astroid", "pandas"]
 
+    def test_duplicate_flags_deduplicated_cleanly(self) -> None:
+        """Repeated identical flags for the same package do not accumulate duplicates."""
+        sources = [
+            "!pip install torch --extra-index-url https://download.pytorch.org/whl/cu121\n",
+            "!pip install torch --extra-index-url https://download.pytorch.org/whl/cu121\n"
+        ]
+        scoped = ne.harvest_scoped_cell_flags(sources)
+        assert scoped["torch"] == ["--extra-index-url", "https://download.pytorch.org/whl/cu121"]
+
+    def test_conflicting_base_index_url_last_wins(self) -> None:
+        """Conflicting base --index-url flags resolve with last-encountered URL winning without accumulation."""
+        sources = [
+            "!pip install pkg --index-url https://first.index/simple\n",
+            "!pip install pkg --index-url https://second.index/simple\n"
+        ]
+        scoped = ne.harvest_scoped_cell_flags(sources)
+        assert scoped["pkg"] == ["--index-url", "https://second.index/simple"]
+
+    def test_distinct_packages_maintain_independent_urls(self) -> None:
+        """Different packages keep their own distinct index URLs."""
+        sources = [
+            "!pip install torch --extra-index-url https://download.pytorch.org/whl/cu121\n",
+            "!pip install torchvision --extra-index-url https://vision.example.org/whl\n"
+        ]
+        scoped = ne.harvest_scoped_cell_flags(sources)
+        assert scoped["torch"] == ["--extra-index-url", "https://download.pytorch.org/whl/cu121"]
+        assert scoped["torchvision"] == ["--extra-index-url", "https://vision.example.org/whl"]
+
 class TestIndexUrlWrapperCompatibility:
     """
     harvest_index_urls_from_sources() is the older, single-set compatibility shim
@@ -224,6 +252,17 @@ class TestCellClassification:
         cell_type, clean = ne.classify_cell_source("")
         assert cell_type == "PYTHON"
         assert clean == ""
+
+    def test_writefile_pip_commands_not_harvested(self) -> None:
+        """Pip commands written inside %%writefile cells must not leak into harvested packages or scoped flags."""
+        sources = [
+            "%%writefile setup.py\n# Setup script\npip install dummy-pkg --extra-index-url https://writefile.example.com\n",
+            "import pandas as pd\n"
+        ]
+        h_res = ne.harvest_cell_magics_and_commands(sources)
+        assert "dummy-pkg" not in h_res.harvested_packages
+        assert "https://writefile.example.com" not in h_res.extra_index_urls
+        assert "dummy-pkg" not in h_res.scoped_flags
 
 
 # =====================================================================

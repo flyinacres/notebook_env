@@ -662,6 +662,41 @@ def harvest_index_urls_from_sources(code_sources: List[str]) -> Set[str]:
     return h_res.base_index_urls.union(h_res.extra_index_urls)
 
 
+def _merge_scoped_flags(existing_flags: List[str], new_flags: List[str]) -> List[str]:
+    """
+    Merges new CLI flags into an existing flag list for a package:
+    - Base index flags (--index-url, -i) replace previous base index values ('last wins').
+    - Multi-value flags (--extra-index-url, -f, --find-links) are appended and deduplicated in order.
+    """
+    merged: List[str] = []
+    seen_extras: Set[Tuple[str, str]] = set()
+    latest_base_index: Optional[Tuple[str, str]] = None
+
+    # Process existing, then new flags in order
+    all_flag_pairs: List[Tuple[str, str]] = []
+    for flag_list in (existing_flags, new_flags):
+        i = 0
+        while i < len(flag_list):
+            flag = flag_list[i]
+            val = flag_list[i + 1] if i + 1 < len(flag_list) else ""
+            all_flag_pairs.append((flag, val))
+            i += 2
+
+    for flag, val in all_flag_pairs:
+        if flag in {"--index-url", "-i"}:
+            latest_base_index = (flag, val)
+        else:
+            pair = (flag, val)
+            if pair not in seen_extras:
+                seen_extras.add(pair)
+                merged.extend([flag, val])
+
+    if latest_base_index:
+        merged = [latest_base_index[0], latest_base_index[1]] + merged
+
+    return merged
+
+
 def harvest_cell_magics_and_commands(
     code_sources: List[str]
 ) -> HarvestResult:
@@ -674,7 +709,13 @@ def harvest_cell_magics_and_commands(
     scoped_flags: Dict[str, List[str]] = {}
 
     for cell_idx, source in enumerate(code_sources, start=1):
-        for line in source.splitlines():
+        cell_type, clean_body = classify_cell_source(source)
+
+        # Do not harvest install commands generated inside scripts written via %%writefile
+        if cell_type == "WRITEFILE":
+            continue
+
+        for line in clean_body.splitlines():
             clean_line = line.strip()
             if not clean_line or clean_line.startswith('#') or clean_line in SHELL_CELL_MAGICS:
                 continue
@@ -746,7 +787,17 @@ def harvest_cell_magics_and_commands(
                         i += 1
 
                     for pkg in line_pkgs:
-                        scoped_flags.setdefault(pkg, []).extend(line_flags)
+                        current = scoped_flags.get(pkg, [])
+                        scoped_flags[pkg] = _merge_scoped_flags(current, line_flags)
+
+    return HarvestResult(
+        harvested_packages=harvested_packages,
+        base_index_urls=base_index_urls,
+        extra_index_urls=extra_index_urls,
+        magic_warnings=magic_warnings,
+        magic_notices=magic_notices,
+        scoped_flags=scoped_flags
+    )
 
     return HarvestResult(
         harvested_packages=harvested_packages,
