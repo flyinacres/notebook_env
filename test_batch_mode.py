@@ -352,3 +352,24 @@ def test_batch_mode_scopes_local_modules_to_notebook_subdirectory(tmp_path):
 
     # Assert 'cookbook' is recognized as a local repo module and NOT flagged as missing PyPI package
     assert "cookbook" not in summary.missing_packages
+
+def test_batch_hardware_tag_warnings_use_unified_dependency_pipeline(tmp_path: Path) -> None:
+    """Batch analysis catches custom build tag warnings via unified build_dependency_entries pipeline."""
+    nb_path = tmp_path / "hw_test.ipynb"
+    nb_data = {
+        "cells": [
+            {"cell_type": "code", "execution_count": 1, "source": ["import torch\n"]}
+        ],
+        "metadata": {"kernelspec": {"language": "python"}}
+    }
+    with open(nb_path, "w", encoding="utf-8") as f:
+        json.dump(nb_data, f)
+
+    repo_map = ne.walk_and_scan_directory(str(tmp_path))
+    # Active environment has local build tag +cu121 with no harvested download URL
+    frozen_env = {"torch": "torch==2.3.1+cu121"}
+    
+    summary = ne.analyze_batch_repository(repo_map, frozen_env=frozen_env, pkg_dist_map={}, batch_hw_cache=None)
+    
+    assert "torch==2.3.1+cu121" in summary.batch_hardware_warnings
+    assert summary.batch_hardware_warnings["torch==2.3.1+cu121"] == ["hw_test.ipynb"]

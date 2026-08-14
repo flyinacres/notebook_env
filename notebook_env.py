@@ -57,6 +57,7 @@ if hasattr(sys.stderr, "reconfigure"):
 # Setup logging stream for diagnostic messages (directed to stderr)
 logger = logging.getLogger("notebook_env")
 logger.setLevel(logging.INFO)
+logger.propagate = True
 console_handler = logging.StreamHandler(sys.stderr)
 console_handler.setFormatter(logging.Formatter("%(message)s"))
 logger.addHandler(console_handler)
@@ -740,8 +741,6 @@ SHELL_CELL_MAGICS: Set[str] = {
     "%%bash", "%%sh", "%%zsh", "%%script", "%%cmd", "%%powershell"
 }
 
-EXTRA_INDEX_PATTERN = re.compile(r'--extra-index-url\s+([^\s]+)')
-BASE_INDEX_PATTERN = re.compile(r'(?:--index-url|-i)\s+([^\s]+)')
 SHELL_SPLIT_PATTERN = re.compile(r'\s*(?:&&|;|\||\|\|)\s*')
 PIP_INSTALL_PATTERN = re.compile(r'^\s*(?:%pip|!pip|pip3?)\s+install\s+(.+)$')
 SYSTEM_PKG_PATTERN = re.compile(r'^\s*(?:!|%%bash|%%sh)?\s*(?:apt-get|brew|yum)\s+install\s+(.+)$')
@@ -878,6 +877,14 @@ def resolve_pip_occurrences(
                     f"Resolving to '{winning_occ.name}{winning_occ.version_spec}' ({time_qualifier})."
                 )
 
+            flags_history = [tuple(h.flags) for h in history]
+            if len(set(flags_history)) > 1:
+                flags_display = " ".join(winning_occ.flags) if winning_occ.flags else "default index (no flags)"
+                conflict_warnings.append(
+                    f"⚠️ Conflicting Scoped Flags for '{winning_occ.name}': "
+                    f"Overwriting earlier flags with '{flags_display}' ({time_qualifier})."
+                )
+
     return resolved, conflict_warnings
 
 
@@ -931,14 +938,6 @@ def harvest_cell_magics_and_commands(
             clean_line = line.strip()
             if not clean_line or clean_line.startswith('#') or clean_line in SHELL_CELL_MAGICS:
                 continue
-
-            for match in EXTRA_INDEX_PATTERN.finditer(clean_line):
-                extra_index_urls.add(match.group(1).strip("'\""))
-            
-            for match in BASE_INDEX_PATTERN.finditer(clean_line):
-                full_match_str = match.group(0)
-                if not full_match_str.startswith("--extra-index-url"):
-                    base_index_urls.add(match.group(1).strip("'\""))
 
             command_segments = SHELL_SPLIT_PATTERN.split(clean_line)
             for segment in command_segments:
@@ -1045,6 +1044,15 @@ def build_unified_timeline(
             if occ.version_spec and not dep_entry.is_comment:
                 v_clean = occ.version_spec.lstrip("=<>!~")
                 dep_entry.version = v_clean
+                
+                # Rule 3: Log active-env discrepancy at DEBUG level
+                host_match = frozen_env.get(norm_name)
+                if host_match and "==" in host_match:
+                    host_ver = host_match.split("==", 1)[1]
+                    if host_ver != v_clean:
+                        logger.debug(
+                            f"[Timeline] Explicit notebook pin '{pkg_name}=={v_clean}' preferred over active host version '{host_ver}'."
+                        )
             dep_entry.flags = list(occ.flags)
             dependencies.append(dep_entry)
             if notice and notice not in promotion_notices:
@@ -1269,7 +1277,6 @@ def get_installed_environment() -> Tuple[Dict[str, str], List[str]]:
             
     return frozen, res.stdout.splitlines()
 
-
 def process_package_requirements(
     pinned_list: List[str], 
     harvested_urls: Set[str],
@@ -1306,7 +1313,6 @@ def process_package_requirements(
         manifest_output.extend(writefile_entries)
             
     return manifest_output, local_tagged_info, warnings
-
 
 def build_dependency_entries(
     dependencies: List[DependencyEntry],
@@ -1808,6 +1814,22 @@ def analyze_batch_repository(
     for res in repo_map.scan_results:
         nb_local_mods = get_notebook_local_modules(res.path, repo_map.target_dir)
 
+        timeline_res = build_unified_timeline(
+            res.code_sources,
+            frozen_env=frozen_env,
+            pkg_dist_map=pkg_dist_map,
+            is_execution_ordered=False,
+            local_repo_modules=nb_local_mods
+        )
+
+        _, local_tagged, _ = build_dependency_entries(
+            timeline_res.dependencies,
+            scoped_flags=res.scoped_flags
+        )
+        for spec, flags in local_tagged:
+            if not flags:
+                summary.batch_hardware_warnings.setdefault(spec, []).append(res.path.name)
+
         pinned_entries, notes = build_manifest_entries(
             res.imports, 
             res.submodules, 
@@ -1816,14 +1838,6 @@ def analyze_batch_repository(
             guarded_imports=res.guarded_imports,
             local_repo_modules=nb_local_mods
         )
-
-        _, _, hw_warns = process_package_requirements(
-            pinned_entries, 
-            res.harvested_urls, 
-            base_urls=res.base_index_urls
-        )
-        for hw_pkg in hw_warns:
-            summary.batch_hardware_warnings.setdefault(hw_pkg, []).append(res.path.name)
 
         for note in notes:
             if note not in summary.promotions:

@@ -691,6 +691,23 @@ class TestSequentialExecutionEngine:
         assert ne.get_timeline_context_label(True) == "in execution sequence"
         assert ne.get_timeline_context_label(False) == "in document order (execution counts unavailable or inconsistent)"
 
+    def test_active_env_discrepancy_logged_at_debug(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Explicit notebook pin differing from host frozen_env logs a DEBUG trace, preferring notebook pin."""
+        import logging
+        caplog.set_level(logging.DEBUG, logger="notebook_env")
+        ne.logger.setLevel(logging.DEBUG)
+        
+        sources = ["!pip install pandas==2.0.0\n"]
+        frozen_env = {"pandas": "pandas==2.2.1"}  # Host has 2.2.1, notebook explicitly asked for 2.0.0
+        
+        res = ne.build_unified_timeline(sources, frozen_env=frozen_env)
+        
+        assert res.dependencies[0].version == "2.0.0"
+        assert any(
+            "Explicit notebook pin 'pandas==2.0.0' preferred over active host version '2.2.1'" in record.message 
+            for record in caplog.records
+        )
+        
 class TestCellClassificationAndMagicHarvesting:
     """Tests Phase 2 cell classification and magic/shell command harvesting."""
 

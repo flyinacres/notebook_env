@@ -229,8 +229,37 @@ class TestScopedFlagAssociation:
         assert winning.name == "foo"
         assert winning.version_spec == "==2.0"
         assert winning.flags == []  # Earlier --index-url is discarded!
+        assert len(conflict_warnings) == 2
+        assert any("Conflicting Explicit Pins" in w for w in conflict_warnings)
+        assert any("Conflicting Scoped Flags" in w for w in conflict_warnings)
+        assert all("in execution sequence" in w for w in conflict_warnings)
+
+    def test_scoped_flag_conflict_emits_warning(self) -> None:
+        """Conflicting flags across occurrences emit a confidence-hedged overwrite warning."""
+        sources = [
+            "!pip install torch --index-url https://download.pytorch.org/whl/cu118\n",
+            "!pip install torch --index-url https://download.pytorch.org/whl/cu121\n"
+        ]
+        occurrences = ne.harvest_pip_install_occurrences(sources)
+        resolved_map, conflict_warnings = ne.resolve_pip_occurrences(
+            occurrences, is_execution_ordered=True
+        )
         assert len(conflict_warnings) == 1
+        assert "Conflicting Scoped Flags for 'torch'" in conflict_warnings[0]
+        assert "https://download.pytorch.org/whl/cu121" in conflict_warnings[0]
         assert "in execution sequence" in conflict_warnings[0]
+
+    def test_commented_or_raw_index_urls_do_not_leak_into_harvested_urls(self) -> None:
+        """Non-pip lines containing index URL patterns must not be harvested into base/extra index sets."""
+        sources = [
+            "# Note: we used to use --extra-index-url https://old-index.org/whl\n",
+            "print('See --index-url https://fake-index.org/simple')\n",
+            "!pip install torch --extra-index-url https://download.pytorch.org/whl/cu121\n"
+        ]
+        h_res = ne.harvest_cell_magics_and_commands(sources)
+        assert "https://old-index.org/whl" not in h_res.extra_index_urls
+        assert "https://fake-index.org/simple" not in h_res.base_index_urls
+        assert h_res.extra_index_urls == {"https://download.pytorch.org/whl/cu121"}
 
 class TestIndexUrlWrapperCompatibility:
     """
