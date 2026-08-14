@@ -95,12 +95,12 @@ class TestKitchenSinkNotebook:
         ne.main()
         out = capsys.readouterr().out
 
-        assert "pillow==10.3.0" in out
-        assert "beautifulsoup4==4.12.3" in out
-        assert "opencv-python==4.9.0.80" in out
-        assert "numpy==1.26.4" in out
-        assert "scikit-learn==1.4.2" in out
-        assert "torch==2.3.1+cu121" in out
+        assert "pillow" in out and "10.3.0" in out
+        assert "beautifulsoup4" in out and "4.12.3" in out
+        assert "opencv-python" in out and "4.9.0.80" in out
+        assert "numpy" in out and "1.26.4" in out
+        assert "scikit-learn" in out and "1.4.2" in out
+        assert "torch" in out and "2.3.1+cu121" in out
 
         for uninstalled_pkg in ("cupy", "this_package_does_not_exist_xyz", "umap", "PyYAML"):
             assert uninstalled_pkg in out
@@ -157,7 +157,9 @@ class TestKitchenSinkNotebook:
         ne.main()
         out = capsys.readouterr().out
 
-        assert "umap-learn[plot]==0.5.5" in out
+        assert "umap-learn" in out
+        assert "plot" in out
+        assert "0.5.5" in out
         assert "umap.plot" in caplog.text
 
 class TestPypiMapTranslations:

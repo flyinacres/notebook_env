@@ -374,39 +374,6 @@ def discover_local_repo_modules(target_dir: str) -> Set[str]:
 
 
 def _memoize_for_run(func: Callable) -> Callable:
-    """
-    Memoizes a function whose arguments may include mutable Set/Dict values
-    that functools.lru_cache can't hash directly (it hashes raw arguments,
-    and sets/dicts aren't hashable).
-
-    Cache-key handling:
-      - dict arguments are keyed by id(), not content. Within a single run,
-        the same dict object (e.g. frozen_env, pkg_dist_map, or a given
-        notebook's own res.submodules) is passed by reference to every call
-        site that needs it, so identity is a correct and far cheaper stand-in
-        than re-hashing potentially hundreds of entries (e.g. a full `pip
-        freeze` map) on every call. This assumes callers don't rebuild an
-        equal-but-distinct dict between calls for what should be a cache hit;
-        that holds for every current call site in this file.
-      - set arguments are converted to frozenset for hashing (small,
-        per-notebook sets — cheap to convert).
-      - Path/str/None/etc. pass through unchanged; already hashable.
-
-    Returned Set/List/tuple-of-those values are shallow-copied on every call
-    so callers never receive a shared reference to the cached object — an
-    in-place mutation by one caller (e.g. `.add(...)`) can't corrupt the
-    value seen by the next caller.
-
-    IMPORTANT — cache lifetime: this tool can run repeatedly inside a single
-    long-lived process (a live IPython kernel — see "Live IPython Kernel" in
-    the module docstring: `import notebook_env as ne; ne.main()`), where the
-    notebook's own files may legitimately change between calls to main().
-    An uncleared cache would silently keep returning pre-change results.
-    main() unconditionally clears every memoized function's cache via
-    .cache_clear() at the top of every call, so caching is scoped to a
-    single logical run and never crosses runs. Do not rely on this decorator
-    for correctness without that call.
-    """
     cache: Dict[Tuple[Any, ...], Any] = {}
 
     def _cache_key_part(value: Any) -> Any:
@@ -414,6 +381,8 @@ def _memoize_for_run(func: Callable) -> Callable:
             return id(value)
         if isinstance(value, set):
             return frozenset(value)
+        if isinstance(value, list):
+            return tuple(_cache_key_part(item) for item in value)
         return value
 
     def _defensive_copy(value: Any) -> Any:
@@ -1340,24 +1309,21 @@ def generate_production_blueprint(
     py_major, py_minor = sys.version_info.major, sys.version_info.minor
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Normalize manifest_items to list of structured dicts if strings were passed
     normalized_items: List[Dict[str, Any]] = []
-    manifest_display_lines: List[str] = []
+    comment_lines: List[str] = []
 
     for item in manifest_items:
         if isinstance(item, dict):
             normalized_items.append(item)
-            flag_str = f" ({' '.join(item['flags'])})" if item.get("flags") else ""
-            manifest_display_lines.append(f"{item['name']}=={item['version']}{flag_str}")
         elif isinstance(item, str):
-            if item.startswith("#") or item.startswith("--"):
-                manifest_display_lines.append(item)
+            clean_item = item.strip()
+            if clean_item.startswith("#") or clean_item.startswith("--"):
+                comment_lines.append(clean_item)
                 continue
-            parts = item.split("==")
+            parts = clean_item.split("==")
             name = parts[0]
             ver = parts[1] if len(parts) > 1 else ""
             normalized_items.append({"name": name, "version": ver, "flags": []})
-            manifest_display_lines.append(item)
 
     gpu_markdown_section = ""
     if gpu_info and gpu_info.has_gpu:
@@ -1395,6 +1361,10 @@ def generate_production_blueprint(
 
     step1_markdown = "\n".join(markdown_lines)
     
+    comments_block = ""
+    if comment_lines:
+        comments_block = "\n# Informational notes & uninstalled fallbacks:\n" + "\n".join(comment_lines) + "\n"
+
     freeze_block_code = ""
     if full_freeze_lines:
         freeze_lines_repr = repr(full_freeze_lines)
@@ -1427,7 +1397,7 @@ if CURRENT_PYTHON[1] != REQUIRED_PYTHON[1]:
 
 # Dependency Specification with Scoped Flags
 DEPENDENCIES = {repr(normalized_items)}
-{freeze_block_code}
+{comments_block}{freeze_block_code}
 print(f"Applying verified environment dependencies [{timestamp}]...")
 print("💡 Note: Dependencies are installed sequentially to prevent index conflicts.\\n")
 
@@ -1462,8 +1432,9 @@ if not failed_packages:
 else:
     print(f"⚠️ Setup completed with issues: {{passed_count}}/{{total_deps}} packages installed.")
     print("Troubleshooting Steps:")
-    print("1. Review failed libraries above and test unpinned installs: '!pip install <pkg>'")
-    print(f"2. For detailed setup guides, see: {HELP_URL}")
+    print("1. Internet Access: Ensure your runtime has an active network connection.")
+    print("2. Unpinned Installs: Test installing failed libraries manually: '!pip install <pkg>'")
+    print(f"3. Help & Troubleshooting Guide: {HELP_URL}")
 print("=" * 60)"""
 
     return {

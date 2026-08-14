@@ -286,4 +286,4 @@ class TestCellConsumingMagics:
         for src in sources:
             cell_type, clean_body = ne.classify_cell_source(src)
             imports, submodules, guarded, warnings = ne.extract_imports_from_sources([src])
-            assert imports == set()
+            assert imports == []

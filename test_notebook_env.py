@@ -11,6 +11,7 @@ import json
 import sys
 import types
 import warnings
+import subprocess
 import importlib.metadata
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Any
@@ -67,7 +68,7 @@ class TestImportExtraction:
 
     def test_empty_and_non_code_sources_return_empty(self) -> None:
         imports, submodules, guarded, dyn_warns = ne.extract_imports_from_sources([])
-        assert imports == set()
+        assert imports == []
         assert submodules == {}
         assert guarded == set()
         assert dyn_warns == []
@@ -383,7 +384,7 @@ class TestDualPathIngestion:
         monkeypatch.setitem(sys.modules, "__main__", fake_main)
 
         imports, submodules, code_sources, guarded, dyn_warns = ne.extract_from_active_session()
-        assert imports == set()
+        assert imports == []
         assert code_sources == []
 
 
@@ -598,14 +599,14 @@ class TestSequentialExecutionEngine:
         ]
         blueprint = ne.generate_production_blueprint(manifest_items)
         
-        # Mock subprocess.run inside Cell 2 to simulate a failed installation
-        fake_subprocess_code = (
-            "import types\n"
-            "subprocess.run = lambda *args, **kwargs: types.SimpleNamespace(returncode=1, stderr='Mocked pip error: Could not find wheel', stdout='')\n"
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *args, **kwargs: types.SimpleNamespace(returncode=1, stderr="Mocked pip error: Could not find wheel", stdout="")
         )
         
         exec_scope: Dict[str, Any] = {"__builtins__": __builtins__}
-        compiled_code = compile(fake_subprocess_code + blueprint["step2_code"], "<string>", "exec")
+        compiled_code = compile(blueprint["step2_code"], "<string>", "exec")
         exec(compiled_code, exec_scope)
         
         captured = capsys.readouterr().out
@@ -614,7 +615,7 @@ class TestSequentialExecutionEngine:
         assert "Mocked pip error" in captured
 
     def test_best_effort_execution_continues_on_failure(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """A failure on package 1 does not abort execution for package 2."""
         manifest_items = [
@@ -623,8 +624,34 @@ class TestSequentialExecutionEngine:
         ]
         blueprint = ne.generate_production_blueprint(manifest_items)
         
-        # Mock subprocess.run: fail on package 1, succeed on package 2
+        def mock_run(cmd, *args, **kwargs):
+            if "fail_pkg" in " ".join(cmd):
+                return types.SimpleNamespace(returncode=1, stderr="Failed", stdout="")
+            return types.SimpleNamespace(returncode=0, stderr="", stdout="")
+            
+        monkeypatch.setattr(subprocess, "run", mock_run)
+        
+        exec_scope: Dict[str, Any] = {"__builtins__": __builtins__}
+        compiled_code = compile(blueprint["step2_code"], "<string>", "exec")
+        exec(compiled_code, exec_scope)
+        
+        captured = capsys.readouterr().out
+        assert "❌" in captured and "fail_pkg" in captured
+        assert "✅" in captured and "pass_pkg" in captured
+        assert "[1/2]" in captured
+        assert "[2/2]" in captured
+
+    def test_best_effort_execution_continues_on_failure(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        manifest_items = [
+            {"name": "fail_pkg", "version": "1.0.0", "flags": []},
+            {"name": "pass_pkg", "version": "2.0.0", "flags": []}
+        ]
+        blueprint = ne.generate_production_blueprint(manifest_items)
+        
         fake_runner = (
+            "import subprocess\n"
             "import types\n"
             "def mock_run(cmd, *args, **kwargs):\n"
             "    if 'fail_pkg' in ' '.join(cmd):\n"
@@ -642,6 +669,7 @@ class TestSequentialExecutionEngine:
         assert "✅" in captured and "pass_pkg" in captured
         assert "[1/2]" in captured
         assert "[2/2]" in captured
+
 
 class TestCellClassificationAndMagicHarvesting:
     """Tests Phase 2 cell classification and magic/shell command harvesting."""
