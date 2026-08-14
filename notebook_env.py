@@ -169,6 +169,25 @@ class DependencyEntry:
 
 
 @dataclass
+class TimelineResult:
+    """
+    Encapsulates the resolved dependency timeline and associated promotion and conflict notices.
+
+    Fields:
+        dependencies: Ordered list of DependencyEntry objects.
+        promotion_notices: Informational messages for extras promotions (e.g., umap -> umap-learn[plot]).
+        conflict_warnings: Warnings regarding overwritten pins or conflicting flags.
+    """
+    dependencies: List[DependencyEntry] = field(default_factory=list)
+    promotion_notices: List[str] = field(default_factory=list)
+    conflict_warnings: List[str] = field(default_factory=list)
+
+    def __iter__(self):
+        """Unpacking fallback allowing `deps, notices = timeline_result` in tests."""
+        return iter((self.dependencies, self.promotion_notices))
+
+
+@dataclass
 class GpuInfo:
     """Payload representing active host accelerator capabilities across PyTorch, TensorFlow, and JAX."""
     has_gpu: bool = False
@@ -961,14 +980,15 @@ def build_unified_timeline(
     pkg_dist_map: Optional[Dict[str, List[str]]] = None,
     is_execution_ordered: bool = True,
     local_repo_modules: Optional[Set[str]] = None
-) -> List[DependencyEntry]:
+) -> TimelineResult:
     """
     Constructs the master sequence of DependencyEntry objects:
     - Explicit pip install occurrences anchor timeline coordinates.
     - Bare AST imports only anchor position if no explicit install was found anywhere in the notebook.
+    Returns a structured TimelineResult payload.
     """
     pip_occs = harvest_pip_install_occurrences(code_sources)
-    resolved_pips, _ = resolve_pip_occurrences(pip_occs, is_execution_ordered=is_execution_ordered)
+    resolved_pips, conflict_warnings = resolve_pip_occurrences(pip_occs, is_execution_ordered=is_execution_ordered)
 
     all_import_occs: List[ImportOccurrence] = []
     submodules_map: Dict[str, Set[str]] = {}
@@ -1009,6 +1029,8 @@ def build_unified_timeline(
     timeline_events.sort(key=lambda t: t[0])
 
     dependencies: List[DependencyEntry] = []
+    promotion_notices: List[str] = []
+
     for coord, kind, pkg_name in timeline_events:
         norm_name = pkg_name.lower()
         submods = submodules_map.get(pkg_name, set())
@@ -1016,7 +1038,7 @@ def build_unified_timeline(
 
         if kind == "PIP":
             occ = resolved_pips[norm_name]
-            dep_entry, _ = resolve_pypi_package_and_extras(
+            dep_entry, notice = resolve_pypi_package_and_extras(
                 occ.name, submods, frozen_env, pkg_dist_map=pkg_dist_map, is_guarded=is_guarded, local_repo_modules=local_repo_modules
             )
             # If explicit pin provided in token, prefer that over frozen_env
@@ -1025,13 +1047,21 @@ def build_unified_timeline(
                 dep_entry.version = v_clean
             dep_entry.flags = list(occ.flags)
             dependencies.append(dep_entry)
+            if notice and notice not in promotion_notices:
+                promotion_notices.append(notice)
         else:
-            dep_entry, _ = resolve_pypi_package_and_extras(
+            dep_entry, notice = resolve_pypi_package_and_extras(
                 pkg_name, submods, frozen_env, pkg_dist_map=pkg_dist_map, is_guarded=is_guarded, local_repo_modules=local_repo_modules
             )
             dependencies.append(dep_entry)
+            if notice and notice not in promotion_notices:
+                promotion_notices.append(notice)
 
-    return dependencies
+    return TimelineResult(
+        dependencies=dependencies,
+        promotion_notices=promotion_notices,
+        conflict_warnings=conflict_warnings
+    )
 
 
 # =====================================================================
@@ -2004,7 +2034,7 @@ def apply_output_to_notebook(
     if local_repo_modules is None:
         local_repo_modules = get_notebook_local_modules(scan_res.path, root_dir)
 
-    timeline_deps = build_unified_timeline(
+    timeline_res = build_unified_timeline(
         scan_res.code_sources,
         frozen_env=frozen_env,
         pkg_dist_map=pkg_dist_map,
@@ -2015,7 +2045,7 @@ def apply_output_to_notebook(
     writefile_entries = build_writefile_tool_entries(scan_res.writefile_imports, scan_res.imports, frozen_env)
     
     all_dep_entries, local_tagged, _ = build_dependency_entries(
-        timeline_deps, 
+        timeline_res.dependencies, 
         scoped_flags=scan_res.scoped_flags, 
         auxiliary_entries=aux_entries, 
         writefile_entries=writefile_entries
@@ -2176,12 +2206,14 @@ def run_single_file_pipeline(
 
     all_warnings = dyn_warnings + magic_warns
 
-    timeline_deps = build_unified_timeline(
+    timeline_res = build_unified_timeline(
         code_sources,
         frozen_env=frozen_env,
         pkg_dist_map=pkg_dist_map,
         local_repo_modules=single_file_local_modules
     )
+    timeline_deps = timeline_res.dependencies
+    promotion_notices = timeline_res.promotion_notices
     
     aux_entries = build_auxiliary_tool_entries(harvested_pkgs, imports, frozen_env)
     writefile_entries = build_writefile_tool_entries(writefile_imports, imports, frozen_env)
@@ -2216,6 +2248,11 @@ def run_single_file_pipeline(
         elif gpu_info.frameworks:
             fw_list = ", ".join(gpu_info.frameworks)
             logger.warning(f"⚠️ Acceleration Framework ({fw_list}) imported, but NO active accelerator detected in host runtime.\n")
+
+    if promotion_notices:
+        for note in promotion_notices:
+            logger.info(note)
+        logger.info("")
 
     single_res = NotebookScanResult(
         path=Path(args.notebook) if args.notebook and not os.path.isdir(args.notebook) else Path("session.ipynb"),

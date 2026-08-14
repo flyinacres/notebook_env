@@ -677,14 +677,15 @@ class TestSequentialExecutionEngine:
             "import pandas as pd\n",                                     # cell 1
             "!pip install torch==2.3.1 --extra-index-url https://whl\n" # cell 2
         ]
-        timeline_deps = ne.build_unified_timeline(
+        timeline_res = ne.build_unified_timeline(
             code_cells, 
             frozen_env={"torch": "torch==2.3.1", "pandas": "pandas==2.2.1"}
         )
         
-        dep_names = [d.name for d in timeline_deps if not d.is_comment]
+        # Access .dependencies directly on the TimelineResult dataclass
+        dep_names = [d.name for d in timeline_res.dependencies if not d.is_comment]
         assert dep_names == ["pandas", "torch"]
-        assert timeline_deps[1].flags == ["--extra-index-url", "https://whl"]
+        assert timeline_res.dependencies[1].flags == ["--extra-index-url", "https://whl"]
 
     def test_timeline_context_label_execution_vs_document(self) -> None:
         assert ne.get_timeline_context_label(True) == "in execution sequence"
