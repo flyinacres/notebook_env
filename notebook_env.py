@@ -562,12 +562,11 @@ def extract_from_active_session_internal(code_sources: List[str]) -> Tuple[Set[s
 # Python AST traversal engine. Inspects import statements, submodules,
 # guarded try/except blocks, and importlib/literal dynamic import calls.
 # =====================================================================
-
 class NotebookImportVisitor(ast.NodeVisitor):
     """AST visitor traversing Python code to record imports, guarded states, and dynamic calls."""
     def __init__(self) -> None:
-        self.imports: Set[str] = set()
-        self.writefile_imports: Set[str] = set()
+        self.imports: List[str] = []
+        self.writefile_imports: List[str] = []
         self.submodules: Dict[str, Set[str]] = {}
         self.unconditional_imports: Set[str] = set()
         self.raw_guarded_imports: Set[str] = set()
@@ -585,10 +584,13 @@ class NotebookImportVisitor(ast.NodeVisitor):
 
     def _record_import(self, base_pkg: str, full_name: Optional[str] = None) -> None:
         if self._in_writefile:
-            self.writefile_imports.add(base_pkg)
+            if base_pkg not in self.writefile_imports:
+                self.writefile_imports.append(base_pkg)
             return
 
-        self.imports.add(base_pkg)
+        if base_pkg not in self.imports:
+            self.imports.append(base_pkg)
+
         if self._guarded_depth > 0:
             self.raw_guarded_imports.add(base_pkg)
         else:
@@ -655,8 +657,8 @@ class NotebookImportVisitor(ast.NodeVisitor):
 
 def extract_imports_from_sources(
     code_sources: List[str]
-) -> Tuple[Set[str], Dict[str, Set[str]], Set[str], List[str]]:
-    """Executes AST traversal over code sources, stripping IPython line magics."""
+) -> Tuple[List[str], Dict[str, Set[str]], Set[str], List[str]]:
+    """Executes AST traversal over code sources in order, stripping IPython line magics."""
     visitor = NotebookImportVisitor()
     for source in code_sources:
         cell_type, clean_body = classify_cell_source(source)
@@ -678,8 +680,7 @@ def extract_imports_from_sources(
         except SyntaxError:
             continue
 
-    # Subtract writefile-only imports from primary imports
-    primary_imports = visitor.imports - visitor.writefile_imports
+    primary_imports = [imp for imp in visitor.imports if imp not in visitor.writefile_imports]
 
     return (
         primary_imports, 
@@ -687,7 +688,6 @@ def extract_imports_from_sources(
         visitor.guarded_imports, 
         visitor.dynamic_import_warnings
     )
-
 
 def extract_writefile_imports_from_sources(code_sources: List[str]) -> Set[str]:
     """Dedicated helper to extract writefile imports without altering extract_imports_from_sources signature."""
@@ -874,6 +874,58 @@ def harvest_cell_magics_and_commands(
         magic_notices=magic_notices
     )
 
+def harvest_scoped_cell_flags(code_sources: List[str]) -> Dict[str, List[str]]:
+    """
+    Parses cell sources and maps custom flags (--extra-index-url, --index-url, -i, -f, --find-links)
+    strictly to the packages declared on that specific command line.
+    """
+    scoped_flags: Dict[str, List[str]] = {}
+
+    for source in code_sources:
+        for line in source.splitlines():
+            clean_line = line.strip()
+            if not clean_line or clean_line.startswith('#'):
+                continue
+
+            command_segments = SHELL_SPLIT_PATTERN.split(clean_line)
+            for segment in command_segments:
+                seg = segment.strip()
+                pip_match = PIP_INSTALL_PATTERN.match(seg)
+                if not pip_match:
+                    continue
+
+                args_str = pip_match.group(1)
+                tokens = args_str.split()
+                line_flags: List[str] = []
+                line_pkgs: List[str] = []
+
+                i = 0
+                while i < len(tokens):
+                    token = tokens[i]
+                    if token in {"--extra-index-url", "--index-url", "-i", "-f", "--find-links"}:
+                        if i + 1 < len(tokens):
+                            line_flags.extend([token, tokens[i+1].strip("'\"")])
+                            i += 2
+                            continue
+                    elif token in PIP_VALUE_FLAGS:
+                        i += 2
+                        continue
+                    elif token.startswith('-') or token.lower() in PIP_SINGLE_FLAGS:
+                        i += 1
+                        continue
+                    elif any(token.lower().startswith(p) for p in VCS_OR_PATH_PREFIXES):
+                        i += 1
+                        continue
+
+                    pkg_name = re.split(r'[<>=!~;\[#]', token)[0].strip("'\"")
+                    if pkg_name:
+                        line_pkgs.append(pkg_name)
+                    i += 1
+
+                for pkg in line_pkgs:
+                    scoped_flags.setdefault(pkg, []).extend(line_flags)
+
+    return scoped_flags
 
 # =====================================================================
 # ENVIRONMENT CORRELATION & EXTRAS PROMOTION
@@ -1279,14 +1331,33 @@ def inspect_gpu_environment(imported_packages: Set[str]) -> Optional[GpuInfo]:
 # =====================================================================
 
 def generate_production_blueprint(
-    manifest_lines: List[str], 
+    manifest_items: List[Any], 
     full_freeze_lines: Optional[List[str]] = None, 
     local_tagged_info: Optional[List[Tuple[str, List[str]]]] = None, 
     gpu_info: Optional[GpuInfo] = None
 ) -> BlueprintResult:
-    """Assembles Cell 1 Markdown and Cell 2 Python code dictionary."""
+    """Assembles Cell 1 Markdown and Cell 2 Python code with the isolated sequential execution engine."""
     py_major, py_minor = sys.version_info.major, sys.version_info.minor
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Normalize manifest_items to list of structured dicts if strings were passed
+    normalized_items: List[Dict[str, Any]] = []
+    manifest_display_lines: List[str] = []
+
+    for item in manifest_items:
+        if isinstance(item, dict):
+            normalized_items.append(item)
+            flag_str = f" ({' '.join(item['flags'])})" if item.get("flags") else ""
+            manifest_display_lines.append(f"{item['name']}=={item['version']}{flag_str}")
+        elif isinstance(item, str):
+            if item.startswith("#") or item.startswith("--"):
+                manifest_display_lines.append(item)
+                continue
+            parts = item.split("==")
+            name = parts[0]
+            ver = parts[1] if len(parts) > 1 else ""
+            normalized_items.append({"name": name, "version": ver, "flags": []})
+            manifest_display_lines.append(item)
 
     gpu_markdown_section = ""
     if gpu_info and gpu_info.has_gpu:
@@ -1311,8 +1382,8 @@ def generate_production_blueprint(
 
     markdown_lines = [
         "### 🛠️ Environment Setup & Dependency Verification",
-        f"This notebook includes a pinned dependency list (`{DEFAULT_PINNED_MANIFEST_NAME}`) to ensure reproducible execution.\n",
-        "- **Automatic Setup:** Cell 2 will verify your Python version and apply the exact package versions used by the author."
+        f"This notebook includes verified dependencies to ensure reproducible execution.\n",
+        "- **Automatic Setup:** Cell 2 verifies Python version compatibility and installs verified package versions sequentially."
     ]
     
     if gpu_markdown_section:
@@ -1323,9 +1394,11 @@ def generate_production_blueprint(
     markdown_lines.append("- **Network Notice:** Active internet access is required to download uncached packages.")
 
     step1_markdown = "\n".join(markdown_lines)
-    payload_string = "\n".join(manifest_lines).strip()
+    
+    freeze_block_code = ""
     if full_freeze_lines:
-        payload_string += "\n\n# --- FULL FREEZE FALLBACK BLOCK ---\n" + "\n".join(full_freeze_lines)
+        freeze_lines_repr = repr(full_freeze_lines)
+        freeze_block_code = f"\n# --- FULL FREEZE FALLBACK BLOCK ---\nFULL_FREEZE_FALLBACK = {freeze_lines_repr}\n"
 
     step2_code = f"""# =====================================================================
 # VERIFIED ENVIRONMENT DEPENDENCIES ({timestamp})
@@ -1352,39 +1425,51 @@ if CURRENT_PYTHON[1] != REQUIRED_PYTHON[1]:
     print(f"⚠️ This code was created with Python {{req_ver}}. You are trying to run it with {{curr_ver}}.")
     print(f"If installation fails, consider changing your runtime Python version back to {{req_ver}}.\\n")
 
-# Write explicit library requirements to a local file
-requirements_content = \"\"\"# Tested top-level packages for this notebook
-{payload_string}
-\"\"\"
+# Dependency Specification with Scoped Flags
+DEPENDENCIES = {repr(normalized_items)}
+{freeze_block_code}
+print(f"Applying verified environment dependencies [{timestamp}]...")
+print("💡 Note: Dependencies are installed sequentially to prevent index conflicts.\\n")
 
-with open("{DEFAULT_PINNED_MANIFEST_NAME}", "w") as f:
-    f.write(requirements_content.strip())
+passed_count = 0
+failed_packages = []
+total_deps = len(DEPENDENCIES)
 
-print(f"Applying pinned environment manifest [{timestamp}]...")
-print("💡 Note: If installation pauses while offline, enable Internet access and re-run this cell.\\n")
+for idx, item in enumerate(DEPENDENCIES, start=1):
+    name = item["name"]
+    ver = item.get("version", "")
+    flags = item.get("flags", [])
+    specifier = f"{{name}}=={{ver}}" if ver else name
 
-# Run single-pass installation natively via pip
-result = subprocess.run(
-    [sys.executable, "-m", "pip", "install", "-r", "{DEFAULT_PINNED_MANIFEST_NAME}"],
-    capture_output=False
-)
+    cmd = [sys.executable, "-m", "pip", "install", specifier] + flags
+    result = subprocess.run(cmd, capture_output=True, text=True)
 
-if result.returncode == 0:
-    print("\\n✅ Primary dependencies installed successfully!")
-    print("💡 If your notebook uses optional features or platform-specific tools, check the notes in pinned_requirements.txt.")
+    if result.returncode == 0:
+        passed_count += 1
+        print(f"[{{idx}}/{{total_deps}}] ✅ {{specifier}} installed successfully")
+    else:
+        failed_packages.append((specifier, ver, flags, result.stderr))
+        print(f"[{{idx}}/{{total_deps}}] ❌ {{specifier}} failed to install")
+        print(f"   ├─ Author Verified Version: {{ver or 'unspecified'}}")
+        if flags:
+            print(f"   ├─ Scoped Flags: {{' '.join(flags)}}")
+        err_snippet = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "Unknown pip error"
+        print(f"   └─ Error: {{err_snippet}}\\n")
+
+print("\\n" + "=" * 60)
+if not failed_packages:
+    print(f"✅ Setup complete! All {{passed_count}}/{{total_deps}} dependencies verified.")
 else:
-    print("\\n❌ Setup failed while installing required packages.\\n")
+    print(f"⚠️ Setup completed with issues: {{passed_count}}/{{total_deps}} packages installed.")
     print("Troubleshooting Steps:")
-    print("1. Internet Access: Ensure your notebook environment has active internet access.")
-    print("2. GPU / Hardware: If using PyTorch or TensorFlow, check that GPU acceleration is enabled.")
-    print("3. Detailed Error: Scroll up above this line to inspect detailed pip error logs.")
-    print(f"\\n👉 For a detailed guide on resolving setup errors, see: {HELP_URL}")"""
+    print("1. Review failed libraries above and test unpinned installs: '!pip install <pkg>'")
+    print(f"2. For detailed setup guides, see: {HELP_URL}")
+print("=" * 60)"""
 
     return {
         "step1_markdown": step1_markdown,
         "step2_code": step2_code
     }
-
 
 def create_managed_cells(blueprint: BlueprintResult) -> List[Dict[str, Any]]:
     """Creates cell dicts stamped with notebook_env managed metadata."""

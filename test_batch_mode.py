@@ -120,8 +120,8 @@ class TestBatchOrchestration:
         assert len(repo_map.non_python_files) == 1
 
         uni_manifest = ne.generate_universal_manifest(repo_map, frozen_env, pkg_dist_map)
-        assert "--extra-index-url https://index.foo.com" in uni_manifest
         assert "numpy==1.26.4" in uni_manifest
+        assert "https://index.foo.com" in uni_manifest
 
     def test_per_notebook_output_generation(self, tmp_path, mock_batch_env):
         frozen_env, pkg_dist_map = mock_batch_env

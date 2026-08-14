@@ -530,12 +530,14 @@ class TestPackageRequirements:
 
 class TestBlueprintGeneration:
     def test_returns_both_sections(self) -> None:
-        blueprint: BlueprintResult = ne.generate_production_blueprint(["numpy==1.26.0"])
+        manifest_items = [{"name": "numpy", "version": "1.26.0", "flags": []}]
+        blueprint: BlueprintResult = ne.generate_production_blueprint(manifest_items)
         assert "step1_markdown" in blueprint
         assert "step2_code" in blueprint
 
     def test_python_version_guard_matches_runtime(self) -> None:
-        blueprint: BlueprintResult = ne.generate_production_blueprint(["numpy==1.26.0"])
+        manifest_items = [{"name": "numpy", "version": "1.26.0", "flags": []}]
+        blueprint: BlueprintResult = ne.generate_production_blueprint(manifest_items)
         expected_guard: str = f"REQUIRED_PYTHON = ({sys.version_info.major}, {sys.version_info.minor})"
         assert expected_guard in blueprint["step2_code"]
 
@@ -546,54 +548,100 @@ class TestBlueprintGeneration:
             device_name="NVIDIA GeForce RTX 3090 (via PyTorch)",
             frameworks=["torch"],
         )
-        blueprint: BlueprintResult = ne.generate_production_blueprint(["torch==2.3.1"], gpu_info=gpu_info)
+        manifest_items = [{"name": "torch", "version": "2.3.1", "flags": []}]
+        blueprint: BlueprintResult = ne.generate_production_blueprint(manifest_items, gpu_info=gpu_info)
         assert "RTX 3090" in blueprint["step1_markdown"]
 
     def test_gpu_section_omitted_when_no_gpu(self) -> None:
-        blueprint: BlueprintResult = ne.generate_production_blueprint(["numpy==1.26.0"], gpu_info=None)
+        manifest_items = [{"name": "numpy", "version": "1.26.0", "flags": []}]
+        blueprint: BlueprintResult = ne.generate_production_blueprint(manifest_items, gpu_info=None)
         assert "Hardware Acceleration" not in blueprint["step1_markdown"]
 
     def test_full_freeze_appended_after_manifest(self) -> None:
+        manifest_items = [{"name": "numpy", "version": "1.26.0", "flags": []}]
         blueprint: BlueprintResult = ne.generate_production_blueprint(
-            ["numpy==1.26.0"], full_freeze_lines=["# certifi==2024.2.2"]
+            manifest_items, full_freeze_lines=["# certifi==2024.2.2"]
         )
         code: str = blueprint["step2_code"]
-        manifest_pos: int = code.find("numpy==1.26.0")
+        manifest_pos: int = code.find("numpy")
         freeze_pos: int = code.find("certifi==2024.2.2")
         assert manifest_pos != -1 and freeze_pos != -1
         assert manifest_pos < freeze_pos
 
-
 # =====================================================================
-# 7. RUNTIME SANDBOX EXECUTION
+# 7. RUNTIME SANDBOX EXECUTION & SEQUENTIAL ENGINE
 # =====================================================================
 
-class TestRuntimeExecution:
-    def test_generated_step2_code_executes_and_writes_file(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+class TestSequentialExecutionEngine:
+    """Tests generated Cell 2 code structure, sequential execution loop, and diagnostics."""
+
+    def test_cell2_contains_inline_dependency_structure(self) -> None:
+        """Cell 2 embeds dependencies and scoped flags as an inline Python list/dict."""
+        manifest_items = [
+            {"name": "torch", "version": "2.3.1+cu121", "flags": ["--extra-index-url", "https://download.pytorch.org/whl/cu121"]},
+            {"name": "pandas", "version": "2.2.1", "flags": []}
+        ]
+        blueprint = ne.generate_production_blueprint(manifest_items)
+        code = blueprint["step2_code"]
+
+        # Must contain structured iterable data, not just raw text block
+        assert "DEPENDENCIES =" in code or "REQUIREMENTS =" in code
+        assert "2.3.1+cu121" in code
+        assert "https://download.pytorch.org/whl/cu121" in code
+
+    def test_failure_diagnostics_contain_verified_version(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        manifest: List[str] = ["numpy==1.26.4", "pandas==2.2.1"]
-        blueprint: BlueprintResult = ne.generate_production_blueprint(manifest)
+        """When a package install fails, Cell 2 prints author-verified version and captures stderr."""
+        manifest_items = [
+            {"name": "broken_pkg", "version": "1.0.0", "flags": []}
+        ]
+        blueprint = ne.generate_production_blueprint(manifest_items)
         
-        monkeypatch.chdir(tmp_path)
-        
-        import subprocess
-        monkeypatch.setattr(
-            subprocess, 
-            "run", 
-            lambda *args, **kwargs: types.SimpleNamespace(returncode=0)
+        # Mock subprocess.run inside Cell 2 to simulate a failed installation
+        fake_subprocess_code = (
+            "import types\n"
+            "subprocess.run = lambda *args, **kwargs: types.SimpleNamespace(returncode=1, stderr='Mocked pip error: Could not find wheel', stdout='')\n"
         )
         
-        compiled_code = compile(blueprint["step2_code"], "<string>", "exec")
         exec_scope: Dict[str, Any] = {"__builtins__": __builtins__}
+        compiled_code = compile(fake_subprocess_code + blueprint["step2_code"], "<string>", "exec")
         exec(compiled_code, exec_scope)
         
-        req_file: Path = tmp_path / "pinned_requirements.txt"
-        assert req_file.exists()
+        captured = capsys.readouterr().out
+        assert "❌" in captured
+        assert "broken_pkg==1.0.0" in captured
+        assert "Mocked pip error" in captured
+
+    def test_best_effort_execution_continues_on_failure(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A failure on package 1 does not abort execution for package 2."""
+        manifest_items = [
+            {"name": "fail_pkg", "version": "1.0.0", "flags": []},
+            {"name": "pass_pkg", "version": "2.0.0", "flags": []}
+        ]
+        blueprint = ne.generate_production_blueprint(manifest_items)
         
-        content: str = req_file.read_text(encoding="utf-8")
-        assert "numpy==1.26.4" in content
-        assert "pandas==2.2.1" in content
+        # Mock subprocess.run: fail on package 1, succeed on package 2
+        fake_runner = (
+            "import types\n"
+            "def mock_run(cmd, *args, **kwargs):\n"
+            "    if 'fail_pkg' in ' '.join(cmd):\n"
+            "        return types.SimpleNamespace(returncode=1, stderr='Failed', stdout='')\n"
+            "    return types.SimpleNamespace(returncode=0, stderr='', stdout='')\n"
+            "subprocess.run = mock_run\n"
+        )
+        
+        exec_scope: Dict[str, Any] = {"__builtins__": __builtins__}
+        compiled_code = compile(fake_runner + blueprint["step2_code"], "<string>", "exec")
+        exec(compiled_code, exec_scope)
+        
+        captured = capsys.readouterr().out
+        assert "❌" in captured and "fail_pkg" in captured
+        assert "✅" in captured and "pass_pkg" in captured
+        assert "[1/2]" in captured
+        assert "[2/2]" in captured
 
 class TestCellClassificationAndMagicHarvesting:
     """Tests Phase 2 cell classification and magic/shell command harvesting."""

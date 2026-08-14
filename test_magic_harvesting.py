@@ -136,6 +136,42 @@ class TestIndexUrlSeparation:
         assert base == {"https://custom.internal/simple"}
         assert extra == {"https://download.pytorch.org/whl/cu121"}
 
+# =====================================================================
+# SCOPED FLAG ASSOCIATION & ORDER PRESERVATION
+# =====================================================================
+
+class TestScopedFlagAssociation:
+    """Tests that pip flags are scoped strictly to specific command lines and document order is preserved."""
+
+    def test_scoped_extra_index_url_association(self) -> None:
+        """--extra-index-url attaches only to the package on that specific line."""
+        sources = [
+            "!pip install torch --extra-index-url https://download.pytorch.org/whl/cu121\n",
+            "import pandas as pd\n",
+            "import numpy as np\n"
+        ]
+        # v38 Contract: harvest returns packages paired with scoped flags
+        pkg_flags_map = ne.harvest_scoped_cell_flags(sources)
+
+        assert "torch" in pkg_flags_map
+        assert "--extra-index-url" in pkg_flags_map["torch"]
+        assert "https://download.pytorch.org/whl/cu121" in pkg_flags_map["torch"]
+
+        # Standard imports must NOT inherit global index flags
+        assert pkg_flags_map.get("pandas", []) == []
+        assert pkg_flags_map.get("numpy", []) == []
+
+    def test_first_encountered_order_preserved(self) -> None:
+        """Packages maintain the chronological order they were encountered in code cells."""
+        sources = [
+            "import zstandard\n",
+            "import astroid\n",
+            "import pandas\n"
+        ]
+        imports, _, _, _ = ne.extract_imports_from_sources(sources)
+        
+        # v38 Contract: imports must preserve ['zstandard', 'astroid', 'pandas'] rather than sorting alphabetically
+        assert list(imports) == ["zstandard", "astroid", "pandas"]
 
 class TestIndexUrlWrapperCompatibility:
     """
