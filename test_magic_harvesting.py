@@ -201,6 +201,37 @@ class TestScopedFlagAssociation:
         assert scoped["torch"] == ["--extra-index-url", "https://download.pytorch.org/whl/cu121"]
         assert scoped["torchvision"] == ["--extra-index-url", "https://vision.example.org/whl"]
 
+    def test_pip_occurrence_retains_version_and_flags(self) -> None:
+        """Pip installs retain cell, line, raw token, version specifier, and scoped flags."""
+        sources = [
+            "!pip install torch==2.3.1+cu121 --extra-index-url https://download.pytorch.org/whl/cu121\n"
+        ]
+        occurrences = ne.harvest_pip_install_occurrences(sources)
+        assert len(occurrences) == 1
+        occ = occurrences[0]
+        assert occ.name == "torch"
+        assert occ.version_spec == "==2.3.1+cu121"
+        assert occ.flags == ["--extra-index-url", "https://download.pytorch.org/whl/cu121"]
+        assert occ.cell_idx == 0
+        assert occ.line_idx == 0
+
+    def test_atomic_last_wins_replaces_all_fields_indivisibly(self) -> None:
+        """Later occurrence replaces version AND flags atomically without unioning earlier flags."""
+        cell_0 = "!pip install foo==1.0 --index-url https://custom.repo/simple\n"
+        cell_1 = "!pip install foo==2.0\n"  # No index url!
+        
+        occurrences = ne.harvest_pip_install_occurrences([cell_0, cell_1])
+        resolved_map, conflict_warnings = ne.resolve_pip_occurrences(
+            occurrences, is_execution_ordered=True
+        )
+        
+        winning = resolved_map["foo"]
+        assert winning.name == "foo"
+        assert winning.version_spec == "==2.0"
+        assert winning.flags == []  # Earlier --index-url is discarded!
+        assert len(conflict_warnings) == 1
+        assert "in execution sequence" in conflict_warnings[0]
+
 class TestIndexUrlWrapperCompatibility:
     """
     harvest_index_urls_from_sources() is the older, single-set compatibility shim
@@ -263,6 +294,19 @@ class TestCellClassification:
         assert "dummy-pkg" not in h_res.harvested_packages
         assert "https://writefile.example.com" not in h_res.extra_index_urls
         assert "dummy-pkg" not in h_res.scoped_flags
+
+    def test_blank_line_padding_aligns_ast_lineno(self) -> None:
+        """Replacing magics with blank lines ensures AST import line numbers match raw source lines."""
+        cell_source = (
+            "# Header comment (line 0)\n"
+            "!pip install torch\n"          # line 1 (magic)
+            "# Another comment (line 2)\n"
+            "import torch\n"                 # line 3 (import)
+        )
+        import_occs = ne.extract_import_occurrences_from_source(cell_source, cell_idx=0)
+        assert len(import_occs) == 1
+        assert import_occs[0].module == "torch"
+        assert import_occs[0].line_idx == 3
 
 
 # =====================================================================

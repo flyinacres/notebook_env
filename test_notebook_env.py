@@ -670,6 +670,25 @@ class TestSequentialExecutionEngine:
         assert "[1/2]" in captured
         assert "[2/2]" in captured
 
+    def test_explicit_install_anchors_position_over_earlier_bare_import(self) -> None:
+        """An explicit pip install at cell 2 anchors timeline position over a bare import at cell 0."""
+        code_cells = [
+            "import torch\n",                                            # cell 0
+            "import pandas as pd\n",                                     # cell 1
+            "!pip install torch==2.3.1 --extra-index-url https://whl\n" # cell 2
+        ]
+        timeline_deps = ne.build_unified_timeline(
+            code_cells, 
+            frozen_env={"torch": "torch==2.3.1", "pandas": "pandas==2.2.1"}
+        )
+        
+        dep_names = [d.name for d in timeline_deps if not d.is_comment]
+        assert dep_names == ["pandas", "torch"]
+        assert timeline_deps[1].flags == ["--extra-index-url", "https://whl"]
+
+    def test_timeline_context_label_execution_vs_document(self) -> None:
+        assert ne.get_timeline_context_label(True) == "in execution sequence"
+        assert ne.get_timeline_context_label(False) == "in document order (execution counts unavailable or inconsistent)"
 
 class TestCellClassificationAndMagicHarvesting:
     """Tests Phase 2 cell classification and magic/shell command harvesting."""
@@ -997,3 +1016,41 @@ class TestMemoizeForRun:
 
         assert cleared["local_modules"] is True
         assert cleared["manifest"] is True
+
+
+class TestExecutionChronology:
+    """Tests all-or-nothing execution_count validation and cell ranking."""
+
+    def test_all_valid_unique_execution_counts_sorted_by_count(self) -> None:
+        """When 100% of code cells have valid unique counts, order strictly by execution_count."""
+        cells = [
+            {"cell_type": "code", "execution_count": 5, "source": ["# Fifth\n"]},
+            {"cell_type": "markdown", "source": ["# Doc\n"]},
+            {"cell_type": "code", "execution_count": 2, "source": ["# Second\n"]},
+            {"cell_type": "code", "execution_count": 1, "source": ["# First\n"]},
+        ]
+        ordered_cells, is_exec_ordered = ne.get_ordered_code_cells(cells)
+        assert is_exec_ordered is True
+        assert [c["execution_count"] for _, c in ordered_cells] == [1, 2, 5]
+
+    def test_null_execution_count_triggers_all_or_nothing_fallback(self) -> None:
+        """If any code cell has execution_count=None, fall back 100% to document order."""
+        cells = [
+            {"cell_type": "code", "execution_count": 10, "source": ["# Cell 0\n"]},
+            {"cell_type": "code", "execution_count": None, "source": ["# Cell 1 unexecuted\n"]},
+            {"cell_type": "code", "execution_count": 2, "source": ["# Cell 2\n"]},
+        ]
+        ordered_cells, is_exec_ordered = ne.get_ordered_code_cells(cells)
+        assert is_exec_ordered is False
+        assert [idx for idx, _ in ordered_cells] == [0, 1, 2]
+
+    def test_duplicate_execution_counts_trigger_fallback(self) -> None:
+        """If two code cells share the same execution_count, fall back 100% to document order."""
+        cells = [
+            {"cell_type": "code", "execution_count": 3, "source": ["# First copy\n"]},
+            {"cell_type": "code", "execution_count": 3, "source": ["# Re-run copy\n"]},
+            {"cell_type": "code", "execution_count": 1, "source": ["# First\n"]},
+        ]
+        ordered_cells, is_exec_ordered = ne.get_ordered_code_cells(cells)
+        assert is_exec_ordered is False
+        assert [idx for idx, _ in ordered_cells] == [0, 1, 2]
