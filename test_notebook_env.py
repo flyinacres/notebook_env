@@ -286,7 +286,7 @@ class TestDynamicResolution:
 
         pin, notice = ne.resolve_pypi_package_and_extras("umap", submodules_set, frozen_env)
 
-        assert pin == "umap-learn[plot]==0.5.5"
+        assert pin.specifier == "umap-learn[plot]==0.5.5"
         assert notice is not None
         assert "umap-learn[plot]==0.5.5" in notice
 
@@ -298,9 +298,9 @@ class TestDynamicResolution:
 
         pin, notice = ne.resolve_pypi_package_and_extras("sklearn", set(), frozen_env)
 
-        assert pin.startswith("#")
-        assert "scikit-learn" in pin
-        assert "sklearn" in pin
+        assert pin.specifier.startswith("#")
+        assert "scikit-learn" in pin.specifier
+        assert "sklearn" in pin.specifier
         assert notice is None
 
 
@@ -733,40 +733,40 @@ class TestIntegrationAndFormatting:
 
     def test_auxiliary_tools_rendered_in_separate_commented_block(self) -> None:
         """Unimported auxiliary packages harvested from magics are rendered in a dedicated commented block."""
-        imports = {"pandas"}
+        imports = ["pandas"]
         harvested_pkgs = {"gdown", "pandas"}  # pandas is already imported, gdown is aux-only
         frozen_env = {"pandas": "pandas==2.2.0", "gdown": "gdown==5.1.0"}
 
         aux_entries = ne.build_auxiliary_tool_entries(harvested_pkgs, imports, frozen_env)
 
         assert len(aux_entries) == 2
-        assert aux_entries[0] == "\n# --- AUXILIARY TOOL INSTALLS (harvested from cell magics) ---"
-        assert "# gdown==5.1.0" in aux_entries[1]
-        assert "installed via cell command" in aux_entries[1]
-
+        assert aux_entries[0].comment_text == "\n# --- AUXILIARY TOOL INSTALLS (harvested from cell magics) ---"
+        assert "gdown==5.1.0" in aux_entries[1].comment_text
+        assert "installed via cell command" in aux_entries[1].comment_text
 
     def test_uninstalled_auxiliary_tools_rendered_as_unpinned_comment(self) -> None:
         """Auxiliary tools not found in the active environment render as unpinned commented entries."""
-        imports = set()
+        imports = []
         harvested_pkgs = {"awscli"}
         frozen_env = {}
 
         aux_entries = ne.build_auxiliary_tool_entries(harvested_pkgs, imports, frozen_env)
 
         assert len(aux_entries) == 2
-        assert "# awscli  (installed via cell command; not found in active env)" in aux_entries[1]
+        assert "# awscli  (installed via cell command; not found in active env)" in aux_entries[1].comment_text
+
     def test_writefile_script_dependencies_rendered_in_separate_section(self) -> None:
         """Dependencies imported exclusively inside %%writefile cells render in a dedicated block."""
-        primary_imports = {"pandas"}
-        writefile_imports = {"requests", "pandas"}  # pandas is in primary, requests is script-only
+        primary_imports = ["pandas"]
+        writefile_imports = ["requests", "pandas"]  # pandas is in primary, requests is script-only
         frozen_env = {"pandas": "pandas==2.30.0", "requests": "requests==2.31.0"}
 
         entries = ne.build_writefile_tool_entries(writefile_imports, primary_imports, frozen_env)
 
         assert len(entries) == 2
-        assert entries[0] == "\n# --- WRITEFILE SCRIPT DEPENDENCIES ---"
-        assert "# requests==2.31.0" in entries[1]
-        assert "imported inside script generated via %%writefile" in entries[1]
+        assert entries[0].comment_text == "\n# --- WRITEFILE SCRIPT DEPENDENCIES ---"
+        assert "requests==2.31.0" in entries[1].comment_text
+        assert "imported inside script generated via %%writefile" in entries[1].comment_text
 
 def test_discover_local_repo_modules_top_level(tmp_path):
     """Verify discover_local_repo_modules recognizes top-level modules and package directories."""

@@ -108,7 +108,7 @@ class TestKitchenSinkNotebook:
         for absent in ("collections==", "xml==", "os==", "nonexistent_fake_package", "fake_package_in_a_string"):
             assert absent not in out
 
-        assert "--extra-index-url https://download.pytorch.org/whl/cu121" in out
+        assert "https://download.pytorch.org/whl/cu121" in out
 
     def test_relative_import_is_silently_invisible(self, kitchen_sink_notebook):
         success, imports, submodules, code_sources, error_msg, lang_label, guarded, dyn_warns = ne.extract_from_file(str(kitchen_sink_notebook))
@@ -170,7 +170,7 @@ class TestPypiMapTranslations:
         frozen_env = {}
         
         pin_dotenv, _ = ne.resolve_pypi_package_and_extras("dotenv", set(), frozen_env)
-        assert "python-dotenv" in pin_dotenv
+        assert "python-dotenv" in pin_dotenv.specifier
 
         pin_mpl, _ = ne.resolve_pypi_package_and_extras("mpl_toolkits", set(), frozen_env)
-        assert "matplotlib" in pin_mpl
+        assert "matplotlib" in pin_mpl.specifier

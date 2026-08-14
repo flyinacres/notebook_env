@@ -29,8 +29,8 @@ Execution Modes:
 
 # =====================================================================
 # CONSTANTS, LOGGING & TYPE DEFINITIONS
-# Core data structures (ScanResult, GpuInfo), logging setup directed to 
-# stderr, status labels, and static mapping dicts (IMPORT_TO_PYPI_MAP, STD_LIB).
+# Core data structures (DependencyEntry, ScanResult, GpuInfo), logging setup
+# directed to stderr, status labels, and static mapping dicts.
 # =====================================================================
 
 import ast
@@ -47,7 +47,7 @@ import importlib.metadata
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field
-from typing import Set, Dict, List, Tuple, Optional, Any, TypedDict, Callable, NamedTuple
+from typing import Set, Dict, List, Tuple, Optional, Any, TypedDict, Callable, NamedTuple, Union
 
 
 # Force UTF-8 encoding for stdout and stderr on Windows/redirected environments
@@ -98,6 +98,40 @@ class StatusLabel:
 
 
 @dataclass
+class DependencyEntry:
+    """
+    Represents a single dependency requirement with scoped flags or an informational comment.
+
+    Fields:
+        name: Distribution / PyPI package name (e.g., 'torch', 'pandas').
+        version: Pinned version string (e.g., '2.3.1+cu121', '2.2.1') or empty if unversioned.
+        flags: Scoped CLI flags to pass to pip install (e.g., ['--extra-index-url', 'https://...']).
+        is_comment: True if this entry represents a comment, platform pseudo-module, or uninstalled fallback.
+        comment_text: Full string representation when is_comment is True.
+    """
+    name: str = ""
+    version: str = ""
+    flags: List[str] = field(default_factory=list)
+    is_comment: bool = False
+    comment_text: str = ""
+
+    @property
+    def specifier(self) -> str:
+        """Returns the pip install specifier (e.g. 'pandas==2.2.1')."""
+        if self.is_comment:
+            return self.comment_text
+        return f"{self.name}=={self.version}" if self.version else self.name
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Converts to a dictionary representation for Cell 2 inline execution metadata."""
+        return {
+            "name": self.name,
+            "version": self.version,
+            "flags": self.flags
+        }
+
+
+@dataclass
 class GpuInfo:
     """
     Payload representing active host accelerator capabilities across PyTorch, TensorFlow, and JAX.
@@ -135,7 +169,7 @@ class NotebookScanResult:
         lang_label: String label of the detected kernel language (e.g. 'python', 'R').
         parse_error: Error message string if JSON or AST parsing failed.
         imports: Top-level imported package stems in first-encountered order.
-        submodules: Map of top-level package -> set of submodules imported (e.g. {'matplotlib': {'matplotlib.pyplot'}}).
+        submodules: Map of top-level package -> set of submodules imported.
         guarded_imports: Imports occurring exclusively inside try/except or conditional blocks.
         dynamic_warnings: Warnings triggered by non-literal dynamic import calls.
         code_sources: Raw code cell string bodies extracted from notebook cells.
@@ -144,7 +178,7 @@ class NotebookScanResult:
         harvested_pkgs: Packages installed via cell magics (%pip / !pip) but not imported in Python code.
         base_index_urls: Base index URLs harvested via --index-url / -i.
         extra_index_urls: Supplemental index URLs harvested via --extra-index-url.
-        scoped_flags: Scoped flags mapped to specific package stems.
+        scoped_flags: Scoped CLI flags mapped to specific package stems.
         magic_warnings: Warnings for unresolvable magics (e.g., -r requirements.txt references).
         magic_notices: Informational notices for conda / apt-get calls outside pip manifests.
     """
@@ -171,8 +205,7 @@ class NotebookScanResult:
             if self.code_sources:
                 logger.debug(
                     f"NotebookScanResult for '{self.path.name}' constructed without "
-                    "harvested_urls; auto-deriving via a fresh harvest_cell_magics_and_commands() "
-                    "pass."
+                    "harvested_urls; auto-deriving via harvest_cell_magics_and_commands()."
                 )
                 self.harvested_urls = harvest_index_urls_from_sources(self.code_sources)
             else:
@@ -183,16 +216,6 @@ class NotebookScanResult:
 class ExtractionResult:
     """
     Encapsulates the raw extraction payload from reading a notebook file.
-
-    Fields:
-        success: True if the file was read and parsed successfully as Python.
-        lang_label: Language metadata label detected in kernelspec/language_info.
-        imports: Top-level imported package stems in order.
-        submodules: Map of top-level package -> set of imported submodules.
-        code_sources: Raw code cell string bodies.
-        error_msg: Diagnostic error message if reading/parsing failed.
-        guarded_imports: Imports occurring inside conditional or try/except blocks.
-        dynamic_warnings: Warnings for non-literal dynamic import calls.
     """
     success: bool
     lang_label: str
@@ -221,14 +244,6 @@ class ExtractionResult:
 class HarvestResult:
     """
     Encapsulates harvested packages, index URLs, scoped flags, warnings, and notices from cell magics.
-
-    Fields:
-        harvested_packages: Auxiliary CLI tool packages installed via %pip / !pip.
-        base_index_urls: Base download index URLs harvested via --index-url or -i.
-        extra_index_urls: Extra download index URLs harvested via --extra-index-url.
-        magic_warnings: Warnings for unresolvable magics (-r requirements.txt references).
-        magic_notices: Informational notices for non-pip calls (conda, apt-get).
-        scoped_flags: Scoped CLI flags mapped to specific packages.
     """
     harvested_packages: Set[str] = field(default_factory=set)
     base_index_urls: Set[str] = field(default_factory=set)
@@ -250,26 +265,7 @@ class HarvestResult:
 
 @dataclass
 class BatchAnalysisSummary:
-    """
-    Aggregated analysis metrics across all notebooks in a batch repo scan.
-
-    Fields:
-        target_dir: Target directory path evaluated during the batch scan.
-        total_python_notebooks: Count of successfully parsed Python notebooks.
-        non_python_count: Count of non-python notebooks skipped.
-        non_python_languages: Map of language name -> file count for skipped files.
-        parse_errors: List of NotebookScanResult objects for corrupted/unparseable files.
-        matched_packages: Set of PyPI package names successfully matched to active env.
-        missing_packages: Map of missing package name -> list of importing notebook names.
-        promotions: List of dynamic extra promotion notices generated across the batch.
-        dynamic_warnings: List of dynamic import warnings harvested across the batch.
-        magic_warnings: List of cell magic warnings harvested across the batch.
-        magic_notices: List of cell magic notices harvested across the batch.
-        batch_hardware_warnings: Map of package name with local tag -> list of notebook names missing index URLs.
-        primary_url: Deterministically selected primary download index URL for repo.
-        primary_url_reason: Selection rule explanation for primary index URL selection.
-        batch_hw_cache: Host GPU/accelerator inspection cache object.
-    """
+    """Aggregated analysis metrics across all notebooks in a batch repo scan."""
     target_dir: str
     total_python_notebooks: int = 0
     non_python_count: int = 0
@@ -288,14 +284,11 @@ class BatchAnalysisSummary:
 
     @property
     def is_clean(self) -> bool:
-        """Returns True if no blocking parse/file errors exist in the batch."""
         return len(self.parse_errors) == 0
 
 
 # =====================================================================
 # MAPPINGS, PLATFORM INJECTIONS & STDLIB LOOKUP
-# Data structures for import-to-PyPI resolution, platform pseudo-modules,
-# transitive framework relationships, and Python standard library filtering.
 # =====================================================================
 
 IMPORT_TO_PYPI_MAP: Dict[str, str] = {
@@ -405,16 +398,10 @@ def get_notebook_local_modules(notebook_path: Path, root_dir: Optional[str] = No
 
 # =====================================================================
 # CELL CLASSIFICATION & SOURCE PIPELINE
-# Ingestion entrypoints (extract_from_file for saved notebooks, 
-# extract_from_active_session for live kernels) and kernel language metadata checks.
 # =====================================================================
 
 def detect_notebook_language(nb_data: Dict[str, Any], strict: bool = False) -> Tuple[bool, str]:
-    """
-    Inspects kernelspec and language_info metadata.
-    If strict=True (batch mode), missing metadata is rejected as unknown.
-    If strict=False (single-file mode), missing metadata assumes Python.
-    """
+    """Inspects kernelspec and language_info metadata."""
     metadata = nb_data.get("metadata", {})
     ks_lang = metadata.get("kernelspec", {}).get("language", "").lower()
     li_lang = metadata.get("language_info", {}).get("name", "").lower()
@@ -435,9 +422,7 @@ def detect_notebook_language(nb_data: Dict[str, Any], strict: bool = False) -> T
 def extract_from_file(
     notebook_path: str, strict: bool = False
 ) -> ExtractionResult:
-    """
-    Reads a Jupyter Notebook JSON file and extracts code sources, imports, guarded state, and dynamic warnings.
-    """
+    """Reads a Jupyter Notebook JSON file and extracts code sources, imports, guarded state, and dynamic warnings."""
     if not os.path.exists(notebook_path):
         logger.debug(f"[FileIngest] Target notebook file '{notebook_path}' does not exist on disk.")
         return ExtractionResult(
@@ -514,7 +499,6 @@ def extract_from_active_session_internal(code_sources: List[str]) -> Tuple[List[
 
 # =====================================================================
 # AST VISITOR & DYNAMIC IMPORT PARSER
-# Python AST traversal engine preserving narrative document order.
 # =====================================================================
 
 class NotebookImportVisitor(ast.NodeVisitor):
@@ -669,7 +653,6 @@ def extract_writefile_imports_from_sources(code_sources: List[str]) -> List[str]
 
 # =====================================================================
 # CELL MAGIC & SCOPED FLAG HARVESTER
-# Scans %pip, !pip commands and attaches scoped flags strictly to target libraries.
 # =====================================================================
 
 PIP_SINGLE_FLAGS: Set[str] = {
@@ -780,9 +763,7 @@ def harvest_scoped_cell_flags(code_sources: List[str]) -> Dict[str, List[str]]:
 def harvest_cell_magics_and_commands(
     code_sources: List[str]
 ) -> HarvestResult:
-    """
-    Scans code sources for cell magics, index URLs, auxiliary tools, and shell commands.
-    """
+    """Scans code sources for cell magics, index URLs, auxiliary tools, and shell commands."""
     harvested_packages: Set[str] = set()
     base_index_urls: Set[str] = set()
     extra_index_urls: Set[str] = set()
@@ -877,16 +858,15 @@ def harvest_cell_magics_and_commands(
 
 # =====================================================================
 # ENVIRONMENT CORRELATION & EXTRAS PROMOTION
-# Maps extracted import names to active runtime versions via pip freeze.
 # =====================================================================
 
 def build_auxiliary_tool_entries(
     harvested_packages: Set[str],
     imported_packages: Any,
     frozen_env: Dict[str, str]
-) -> List[str]:
-    """Builds commented-out manifest lines for CLI tools installed via cell magics not imported directly."""
-    aux_entries: List[str] = []
+) -> List[DependencyEntry]:
+    """Builds commented DependencyEntry instances for CLI tools installed via cell magics."""
+    aux_entries: List[DependencyEntry] = []
     imported_set = {imp.lower() for imp in imported_packages}
     unimported_tools = sorted([
         pkg for pkg in harvested_packages 
@@ -896,13 +876,13 @@ def build_auxiliary_tool_entries(
     if not unimported_tools:
         return aux_entries
 
-    aux_entries.append("\n# --- AUXILIARY TOOL INSTALLS (harvested from cell magics) ---")
+    aux_entries.append(DependencyEntry(is_comment=True, comment_text="\n# --- AUXILIARY TOOL INSTALLS (harvested from cell magics) ---"))
     for tool in unimported_tools:
         matched_pin = frozen_env.get(tool.lower())
         if matched_pin:
-            aux_entries.append(f"# {matched_pin}  (installed via cell command; not directly imported in Python code)")
+            aux_entries.append(DependencyEntry(is_comment=True, comment_text=f"# {matched_pin}  (installed via cell command; not directly imported in Python code)"))
         else:
-            aux_entries.append(f"# {tool}  (installed via cell command; not found in active env)")
+            aux_entries.append(DependencyEntry(is_comment=True, comment_text=f"# {tool}  (installed via cell command; not found in active env)"))
 
     return aux_entries
 
@@ -911,9 +891,9 @@ def build_writefile_tool_entries(
     writefile_imports: Any,
     primary_imports: Any,
     frozen_env: Dict[str, str]
-) -> List[str]:
-    """Builds commented-out manifest lines for dependencies imported exclusively inside %%writefile generated scripts."""
-    entries: List[str] = []
+) -> List[DependencyEntry]:
+    """Builds commented DependencyEntry instances for dependencies inside %%writefile scripts."""
+    entries: List[DependencyEntry] = []
     primary_set = {imp.lower() for imp in primary_imports}
     script_only = sorted([
         pkg for pkg in writefile_imports 
@@ -923,14 +903,14 @@ def build_writefile_tool_entries(
     if not script_only:
         return entries
 
-    entries.append("\n# --- WRITEFILE SCRIPT DEPENDENCIES ---")
+    entries.append(DependencyEntry(is_comment=True, comment_text="\n# --- WRITEFILE SCRIPT DEPENDENCIES ---"))
     for pkg in script_only:
         pypi_name = IMPORT_TO_PYPI_MAP.get(pkg, pkg)
         matched_pin = frozen_env.get(pypi_name.lower())
         if matched_pin:
-            entries.append(f"# {matched_pin}  (imported inside script generated via %%writefile)")
+            entries.append(DependencyEntry(is_comment=True, comment_text=f"# {matched_pin}  (imported inside script generated via %%writefile)"))
         else:
-            entries.append(f"# {pypi_name}  (imported inside script generated via %%writefile; not found in active env)")
+            entries.append(DependencyEntry(is_comment=True, comment_text=f"# {pypi_name}  (imported inside script generated via %%writefile; not found in active env)"))
 
     return entries
 
@@ -942,15 +922,15 @@ def resolve_pypi_package_and_extras(
     pkg_dist_map: Optional[Dict[str, List[str]]] = None,
     is_guarded: bool = False,
     local_repo_modules: Optional[Set[str]] = None
-) -> Tuple[str, Optional[str]]:
-    """Resolves top-level import to PyPI package name, platform pseudo-module, or local repo module."""
+) -> Tuple[DependencyEntry, Optional[str]]:
+    """Resolves top-level import to a DependencyEntry."""
     if imp in PLATFORM_PSEUDO_MODULES:
         logger.debug(f"[Resolve] '{imp}' is a platform pseudo-module (skipping pip install).")
-        return f"# {imp} (provided automatically by platform like Colab/Databricks; no install needed)", None
+        return DependencyEntry(is_comment=True, comment_text=f"# {imp} (provided automatically by platform like Colab/Databricks; no install needed)"), None
 
     if local_repo_modules and imp in local_repo_modules:
         logger.debug(f"[Resolve] '{imp}' matched to local file/folder (skipping PyPI requirement).")
-        return f"# {imp} (local folder/file next to notebook; ensure sibling files were shared)", None
+        return DependencyEntry(is_comment=True, comment_text=f"# {imp} (local folder/file next to notebook; ensure sibling files were shared)"), None
 
     pypi_name = None
     if pkg_dist_map is None and hasattr(importlib.metadata, "packages_distributions"):
@@ -973,12 +953,12 @@ def resolve_pypi_package_and_extras(
 
     if is_guarded:
         if matched_pin:
-            return f"# {matched_pin} (optional or conditional dependency inside try/except block)", None
-        return f"# {pypi_name} (optional or conditional dependency inside try/except block)", None
+            return DependencyEntry(is_comment=True, comment_text=f"# {matched_pin} (optional or conditional dependency inside try/except block)"), None
+        return DependencyEntry(is_comment=True, comment_text=f"# {pypi_name} (optional or conditional dependency inside try/except block)"), None
 
     if not matched_pin:
         logger.debug(f"[Resolve] Package '{pypi_name}' (imported as '{imp}') not found in active pip freeze.")
-        return f"# {pypi_name} (imported as '{imp}', not currently found in active env)", None
+        return DependencyEntry(is_comment=True, comment_text=f"# {pypi_name} (imported as '{imp}', not currently found in active env)"), None
 
     pkg_part, ver_part = matched_pin.split("==", 1)
 
@@ -998,12 +978,13 @@ def resolve_pypi_package_and_extras(
             logger.debug(f"[Resolve/Extras] Error querying distribution metadata for '{pkg_part}': {e}")
 
     if extra_tag:
-        promoted_pin = f"{pkg_part}[{extra_tag}]=={ver_part}"
-        notice = f"💡 Extra Dependency Promotion: importing '{imp}.{extra_tag}' automatically promoted requirement to '{pkg_part}[{extra_tag}]=={ver_part}'"
+        promoted_name = f"{pkg_part}[{extra_tag}]"
+        promoted_pin = f"{promoted_name}=={ver_part}"
+        notice = f"💡 Extra Dependency Promotion: importing '{imp}.{extra_tag}' automatically promoted requirement to '{promoted_pin}'"
         logger.debug(f"[Resolve/Extras] {notice}")
-        return promoted_pin, notice
+        return DependencyEntry(name=promoted_name, version=ver_part), notice
 
-    return matched_pin, None
+    return DependencyEntry(name=pkg_part, version=ver_part), None
 
 
 @_memoize_for_run
@@ -1016,10 +997,25 @@ def build_manifest_entries(
     local_repo_modules: Optional[Set[str]] = None
 ) -> Tuple[List[str], List[str]]:
     """
-    Single shared helper for generating correlated pinned manifest entries.
-    Preserves input list order.
+    Builds string-formatted manifest lines for legacy/batch consumers while preserving order.
     """
-    pinned_manifest: List[str] = []
+    entries, notices = build_dependency_objects(
+        imports, submodules, frozen_env, pkg_dist_map, guarded_imports, local_repo_modules
+    )
+    pinned_manifest = [e.specifier for e in entries]
+    return pinned_manifest, notices
+
+
+def build_dependency_objects(
+    imports: Any, 
+    submodules: Dict[str, Set[str]], 
+    frozen_env: Dict[str, str], 
+    pkg_dist_map: Optional[Dict[str, List[str]]] = None,
+    guarded_imports: Optional[Set[str]] = None,
+    local_repo_modules: Optional[Set[str]] = None
+) -> Tuple[List[DependencyEntry], List[str]]:
+    """Generates typed DependencyEntry instances in first-encountered order."""
+    entries: List[DependencyEntry] = []
     promotion_notices: List[str] = []
     guarded_set = guarded_imports or set()
 
@@ -1028,14 +1024,14 @@ def build_manifest_entries(
             continue
         submods = submodules.get(imp, set())
         is_guarded = imp in guarded_set
-        pin_entry, notice = resolve_pypi_package_and_extras(
+        dep_entry, notice = resolve_pypi_package_and_extras(
             imp, submods, frozen_env, pkg_dist_map=pkg_dist_map, is_guarded=is_guarded, local_repo_modules=local_repo_modules
         )
-        pinned_manifest.append(pin_entry)
+        entries.append(dep_entry)
         if notice and notice not in promotion_notices:
             promotion_notices.append(notice)
 
-    return pinned_manifest, promotion_notices
+    return entries, promotion_notices
 
 
 def resolve_opencv_variant(submodules: Optional[Set[str]] = None) -> str:
@@ -1062,7 +1058,6 @@ def get_installed_environment() -> Tuple[Dict[str, str], List[str]]:
     res = subprocess.run([sys.executable, "-m", "pip", "freeze"], capture_output=True, text=True)
     if res.returncode != 0:
         logger.warning(f"⚠️ 'pip freeze' execution failed (exit code {res.returncode}). Active environment versions could not be captured.")
-        logger.debug(f"[PipFreeze] Stderr: {res.stderr}")
         return {}, []
 
     frozen: Dict[str, str] = {}
@@ -1082,23 +1077,20 @@ def process_package_requirements(
     auxiliary_entries: Optional[List[str]] = None,
     writefile_entries: Optional[List[str]] = None
 ) -> Tuple[List[str], List[Tuple[str, List[str]]], List[str]]:
-    """Correlates pinned packages with harvested base/extra index URLs, auxiliary tool entries, and writefile dependencies."""
+    """Legacy compatibility helper: correlates pinned packages with index URLs and auxiliary entries."""
     manifest_output: List[str] = []
     local_tagged_info: List[Tuple[str, List[str]]] = []
     warnings: List[str] = []
     
-    # 1. Base index URL overrides (--index-url)
     if base_urls:
         for url in sorted(base_urls):
             manifest_output.append(f"--index-url {url}")
 
-    # 2. Extra index URLs (--extra-index-url)
     extra_urls = harvested_urls - (base_urls or set())
     if extra_urls:
         for url in sorted(extra_urls):
             manifest_output.append(f"--extra-index-url {url}")
 
-    # 3. Primary imported dependencies (preserving order)
     for item in pinned_list:
         manifest_output.append(item)
         if '+' in item:
@@ -1107,21 +1099,55 @@ def process_package_requirements(
             if not all_urls:
                 warnings.append(item)
 
-    # 4. Auxiliary tool section
     if auxiliary_entries:
         manifest_output.extend(auxiliary_entries)
 
-    # 5. Writefile script dependency section
     if writefile_entries:
         manifest_output.extend(writefile_entries)
             
     return manifest_output, local_tagged_info, warnings
 
 
+def build_dependency_entries(
+    dependencies: List[DependencyEntry],
+    scoped_flags: Optional[Dict[str, List[str]]] = None,
+    auxiliary_entries: Optional[List[DependencyEntry]] = None,
+    writefile_entries: Optional[List[DependencyEntry]] = None
+) -> Tuple[List[DependencyEntry], List[Tuple[str, List[str]]], List[str]]:
+    """Attaches scoped flags to DependencyEntry objects and identifies local hardware tags."""
+    flags_map = scoped_flags or {}
+    local_tagged_info: List[Tuple[str, List[str]]] = []
+    warnings: List[str] = []
+    all_entries: List[DependencyEntry] = []
+
+    for dep in dependencies:
+        if not dep.is_comment and dep.name:
+            # Check normalized names for flag association
+            matched_flags: List[str] = []
+            for candidate in (dep.name.lower(), dep.name.replace("-", "_").lower(), dep.name.replace("_", "-").lower()):
+                if candidate in flags_map:
+                    matched_flags = flags_map[candidate]
+                    break
+            dep.flags = matched_flags
+
+            if '+' in dep.version:
+                local_tagged_info.append((dep.specifier, dep.flags))
+                if not dep.flags:
+                    warnings.append(dep.specifier)
+
+        all_entries.append(dep)
+
+    if auxiliary_entries:
+        all_entries.extend(auxiliary_entries)
+
+    if writefile_entries:
+        all_entries.extend(writefile_entries)
+
+    return all_entries, local_tagged_info, warnings
+
+
 # =====================================================================
 # HARDWARE ACCELERATION INSPECTION
-# Probes runtime framework state for GPU/accelerator availability across 
-# PyTorch (CUDA/MPS), TensorFlow (GPU), and JAX (GPU/TPU).
 # =====================================================================
 
 def expand_transitive_frameworks(imports: Any) -> Set[str]:
@@ -1258,16 +1284,15 @@ def inspect_gpu_environment(imported_packages: Any) -> Optional[GpuInfo]:
 
 # =====================================================================
 # BLUEPRINT & SEQUENTIAL INSTALL SETUP GENERATOR
-# Constructs Cell 1 (Markdown setup guide) and Cell 2 (Sequential Python script).
 # =====================================================================
 
 def generate_production_blueprint(
-    manifest_items: List[Any], 
+    manifest_items: List[Union[DependencyEntry, Dict[str, Any], str]], 
     full_freeze_lines: Optional[List[str]] = None, 
     local_tagged_info: Optional[List[Tuple[str, List[str]]]] = None, 
     gpu_info: Optional[GpuInfo] = None
 ) -> BlueprintResult:
-    """Assembles Cell 1 Markdown and Cell 2 Python code with the isolated sequential execution engine."""
+    """Assembles Cell 1 Markdown and Cell 2 Python code using structured DependencyEntry objects."""
     py_major, py_minor = sys.version_info.major, sys.version_info.minor
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1275,7 +1300,12 @@ def generate_production_blueprint(
     comment_lines: List[str] = []
 
     for item in manifest_items:
-        if isinstance(item, dict):
+        if isinstance(item, DependencyEntry):
+            if item.is_comment:
+                comment_lines.append(item.comment_text)
+            else:
+                normalized_items.append(item.to_dict())
+        elif isinstance(item, dict):
             normalized_items.append(item)
         elif isinstance(item, str):
             clean_item = item.strip()
@@ -1434,7 +1464,6 @@ def create_managed_cells(blueprint: BlueprintResult) -> List[Dict[str, Any]]:
 
 # =====================================================================
 # BATCH ORCHESTRATION & CLI DISPATCH
-# Directory walking engine for multi-notebook repo analysis and universal manifests.
 # =====================================================================
 
 class RepoEnvironmentMap:
@@ -1539,8 +1568,6 @@ def walk_and_scan_directory(target_dir: str) -> RepoEnvironmentMap:
                 )
                 repo_map.add_result(res)
 
-    logger.debug(f"[Batch/Walk] Completed scan: {len(repo_map.scan_results)} valid Python nb(s), "
-                 f"{len(repo_map.non_python_files)} non-Python, {len(repo_map.parse_errors)} parse error(s).")
     return repo_map
 
 
@@ -1770,8 +1797,8 @@ def generate_universal_manifest(
 
         aux_entries = build_auxiliary_tool_entries(res.harvested_pkgs, res.imports, frozen_env)
         for aux in aux_entries:
-            if not aux.startswith("\n# ---"):
-                pinned_entries_set.add(aux)
+            if not aux.comment_text.startswith("\n# ---"):
+                pinned_entries_set.add(aux.comment_text)
 
     for entry in sorted(pinned_entries_set):
         lines.append(entry)
@@ -1793,7 +1820,7 @@ def apply_output_to_notebook(
     if local_repo_modules is None:
         local_repo_modules = get_notebook_local_modules(scan_res.path, root_dir)
 
-    pinned_manifest, _ = build_manifest_entries(
+    dep_objects, _ = build_dependency_objects(
         scan_res.imports, 
         scan_res.submodules, 
         frozen_env, 
@@ -1805,8 +1832,11 @@ def apply_output_to_notebook(
     aux_entries = build_auxiliary_tool_entries(scan_res.harvested_pkgs, scan_res.imports, frozen_env)
     writefile_entries = build_writefile_tool_entries(scan_res.writefile_imports, scan_res.imports, frozen_env)
     
-    manifest_lines, local_tagged, _ = process_package_requirements(
-        pinned_manifest, scan_res.harvested_urls, base_urls=scan_res.base_index_urls, auxiliary_entries=aux_entries, writefile_entries=writefile_entries
+    all_dep_entries, local_tagged, _ = build_dependency_entries(
+        dep_objects, 
+        scoped_flags=scan_res.scoped_flags, 
+        auxiliary_entries=aux_entries, 
+        writefile_entries=writefile_entries
     )
     
     gpu_info: Optional[GpuInfo] = None
@@ -1845,7 +1875,7 @@ def apply_output_to_notebook(
                     framework_devices=fw_devices
                 )
 
-    blueprint = generate_production_blueprint(manifest_lines, local_tagged_info=local_tagged, gpu_info=gpu_info)
+    blueprint = generate_production_blueprint(all_dep_entries, local_tagged_info=local_tagged, gpu_info=gpu_info)
     managed_cells = create_managed_cells(blueprint)
 
     with open(scan_res.path, 'r', encoding='utf-8') as f:
@@ -1963,7 +1993,7 @@ def run_single_file_pipeline(
 
     all_warnings = dyn_warnings + magic_warns
 
-    pinned_manifest, promotion_notices = build_manifest_entries(
+    dep_objects, promotion_notices = build_dependency_objects(
         imports, 
         submodules, 
         frozen_env, 
@@ -1975,8 +2005,11 @@ def run_single_file_pipeline(
     aux_entries = build_auxiliary_tool_entries(harvested_pkgs, imports, frozen_env)
     writefile_entries = build_writefile_tool_entries(writefile_imports, imports, frozen_env)
 
-    manifest_lines, local_tagged_info, warnings = process_package_requirements(
-        pinned_manifest, harvested_urls, base_urls=base_urls, auxiliary_entries=aux_entries, writefile_entries=writefile_entries
+    all_dep_entries, local_tagged_info, warnings = build_dependency_entries(
+        dep_objects,
+        scoped_flags=h_res.scoped_flags,
+        auxiliary_entries=aux_entries,
+        writefile_entries=writefile_entries
     )
     full_freeze_lines = raw_full_freeze if args.full_freeze else None
 
@@ -2043,7 +2076,7 @@ def run_single_file_pipeline(
         sys.exit(0)
 
     blueprint = generate_production_blueprint(
-        manifest_lines, 
+        all_dep_entries, 
         full_freeze_lines=full_freeze_lines, 
         local_tagged_info=local_tagged_info,
         gpu_info=gpu_info
