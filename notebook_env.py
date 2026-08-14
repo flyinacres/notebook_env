@@ -29,8 +29,6 @@ Execution Modes:
 
 # =====================================================================
 # CONSTANTS, LOGGING & TYPE DEFINITIONS
-# Core data structures (DependencyEntry, ScanResult, GpuInfo), logging setup
-# directed to stderr, status labels, and static mapping dicts.
 # =====================================================================
 
 import ast
@@ -66,7 +64,6 @@ logger.addHandler(console_handler)
 
 # =====================================================================
 # SYSTEM CONSTANTS & CONFIGURATION DEFAULTS
-# Configurable manifest filenames, documentation URLs, directory ignores, and hardware targets.
 # =====================================================================
 
 DEFAULT_PINNED_MANIFEST_NAME: str = "pinned_requirements.txt"
@@ -133,17 +130,7 @@ class DependencyEntry:
 
 @dataclass
 class GpuInfo:
-    """
-    Payload representing active host accelerator capabilities across PyTorch, TensorFlow, and JAX.
-
-    Fields:
-        has_gpu: True if at least one framework verified an active GPU/accelerator.
-        type: Primary hardware string (e.g., 'NVIDIA CUDA', 'Apple Silicon MPS', 'GPU', 'TPU').
-        active_framework: Human-readable display label of the primary active framework (e.g., 'PyTorch').
-        device_name: Primary device hardware descriptor string.
-        frameworks: List of canonical framework stems detected in imports (['torch', 'tensorflow', 'jax']).
-        framework_devices: Map of canonical framework stem -> verified device descriptor string (or None if CPU-only).
-    """
+    """Payload representing active host accelerator capabilities across PyTorch, TensorFlow, and JAX."""
     has_gpu: bool = False
     type: Optional[str] = None
     active_framework: Optional[str] = None
@@ -160,28 +147,7 @@ class BlueprintResult(TypedDict):
 
 @dataclass
 class NotebookScanResult:
-    """
-    Complete AST and metadata analysis payload for an individual notebook file.
-
-    Fields:
-        path: Absolute or relative Path object pointing to the notebook file.
-        is_python: True if notebook kernelspec / metadata indicates Python language.
-        lang_label: String label of the detected kernel language (e.g. 'python', 'R').
-        parse_error: Error message string if JSON or AST parsing failed.
-        imports: Top-level imported package stems in first-encountered order.
-        submodules: Map of top-level package -> set of submodules imported.
-        guarded_imports: Imports occurring exclusively inside try/except or conditional blocks.
-        dynamic_warnings: Warnings triggered by non-literal dynamic import calls.
-        code_sources: Raw code cell string bodies extracted from notebook cells.
-        harvested_urls: Combined set of harvested base and extra index download URLs.
-        writefile_imports: Imports occurring exclusively inside %%writefile generated scripts.
-        harvested_pkgs: Packages installed via cell magics (%pip / !pip) but not imported in Python code.
-        base_index_urls: Base index URLs harvested via --index-url / -i.
-        extra_index_urls: Supplemental index URLs harvested via --extra-index-url.
-        scoped_flags: Scoped CLI flags mapped to specific package stems.
-        magic_warnings: Warnings for unresolvable magics (e.g., -r requirements.txt references).
-        magic_notices: Informational notices for conda / apt-get calls outside pip manifests.
-    """
+    """Complete AST and metadata analysis payload for an individual notebook file."""
     path: Path
     is_python: bool
     lang_label: str
@@ -214,9 +180,7 @@ class NotebookScanResult:
 
 @dataclass
 class ExtractionResult:
-    """
-    Encapsulates the raw extraction payload from reading a notebook file.
-    """
+    """Encapsulates the raw extraction payload from reading a notebook file."""
     success: bool
     lang_label: str
     imports: List[str] = field(default_factory=list)
@@ -225,6 +189,7 @@ class ExtractionResult:
     error_msg: Optional[str] = None
     guarded_imports: Set[str] = field(default_factory=set)
     dynamic_warnings: List[str] = field(default_factory=list)
+    writefile_imports: List[str] = field(default_factory=list)
 
     def __iter__(self):
         """Legacy tuple-unpacking fallback for backward compatibility."""
@@ -242,9 +207,7 @@ class ExtractionResult:
 
 @dataclass
 class HarvestResult:
-    """
-    Encapsulates harvested packages, index URLs, scoped flags, warnings, and notices from cell magics.
-    """
+    """Encapsulates harvested packages, index URLs, scoped flags, warnings, and notices from cell magics."""
     harvested_packages: Set[str] = field(default_factory=set)
     base_index_urls: Set[str] = field(default_factory=set)
     extra_index_urls: Set[str] = field(default_factory=set)
@@ -469,7 +432,7 @@ def extract_from_file(
     cells = nb_data.get("cells", [])
     code_sources = ["".join(c.get("source", [])) for c in cells if c.get("cell_type") == "code"]
     logger.debug(f"[FileIngest] Extracted {len(code_sources)} code cell(s) from '{notebook_path}'.")
-    imports, submodules, guarded_imports, dyn_warnings = extract_imports_from_sources(code_sources)
+    imports, submodules, guarded_imports, dyn_warnings, writefile_imports = extract_imports_from_sources_full(code_sources)
 
     return ExtractionResult(
         success=True,
@@ -478,7 +441,8 @@ def extract_from_file(
         submodules=submodules,
         code_sources=code_sources,
         guarded_imports=guarded_imports,
-        dynamic_warnings=dyn_warnings
+        dynamic_warnings=dyn_warnings,
+        writefile_imports=writefile_imports
     )
 
 
@@ -487,12 +451,6 @@ def extract_from_active_session() -> Tuple[List[str], Dict[str, Set[str]], List[
     import __main__
     code_sources = [src for src in getattr(__main__, 'In', []) if src and isinstance(src, str)]
     logger.debug(f"[PathB/Session] Found {len(code_sources)} executed cell history item(s) in active kernel.")
-    imports, submodules, code_sources, guarded_imports, dyn_warnings = extract_from_active_session_internal(code_sources)
-    return imports, submodules, code_sources, guarded_imports, dyn_warnings
-
-
-def extract_from_active_session_internal(code_sources: List[str]) -> Tuple[List[str], Dict[str, Set[str]], List[str], Set[str], List[str]]:
-    """Internal helper to parse IPython history lists via extract_imports_from_sources."""
     imports, submodules, guarded_imports, dyn_warnings = extract_imports_from_sources(code_sources)
     return imports, submodules, code_sources, guarded_imports, dyn_warnings
 
@@ -593,10 +551,10 @@ class NotebookImportVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def extract_imports_from_sources(
+def extract_imports_from_sources_full(
     code_sources: List[str]
-) -> Tuple[List[str], Dict[str, Set[str]], Set[str], List[str]]:
-    """Executes AST traversal over code sources in order, stripping IPython line magics."""
+) -> Tuple[List[str], Dict[str, Set[str]], Set[str], List[str], List[str]]:
+    """Executes single-pass AST traversal returning primary and writefile imports."""
     visitor = NotebookImportVisitor()
     for source in code_sources:
         cell_type, clean_body = classify_cell_source(source)
@@ -620,35 +578,29 @@ def extract_imports_from_sources(
             continue
 
     primary_imports = [imp for imp in visitor.imports if imp not in visitor.writefile_imports]
-    logger.debug(f"[AST/Extraction] Extracted {len(primary_imports)} primary imports in order: {primary_imports}")
+    logger.debug(f"[AST/Extraction] Extracted {len(primary_imports)} primary imports: {primary_imports}")
 
     return (
         primary_imports, 
         visitor.submodules, 
         visitor.guarded_imports, 
-        visitor.dynamic_import_warnings
+        visitor.dynamic_import_warnings,
+        visitor.writefile_imports
     )
 
 
+def extract_imports_from_sources(
+    code_sources: List[str]
+) -> Tuple[List[str], Dict[str, Set[str]], Set[str], List[str]]:
+    """Standard 4-tuple extractor for primary imports in order."""
+    primary_imports, submodules, guarded, dyn_warns, _ = extract_imports_from_sources_full(code_sources)
+    return primary_imports, submodules, guarded, dyn_warns
+
+
 def extract_writefile_imports_from_sources(code_sources: List[str]) -> List[str]:
-    """Dedicated helper to extract writefile imports in order."""
-    visitor = NotebookImportVisitor()
-    for source in code_sources:
-        cell_type, clean_body = classify_cell_source(source)
-        if cell_type == "WRITEFILE":
-            visitor._in_writefile = True
-            clean_source = "\n".join([
-                line for line in clean_body.splitlines() 
-                if not line.strip().startswith('%') and not line.strip().startswith('!')
-            ])
-            try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", category=SyntaxWarning)
-                    tree = ast.parse(clean_source)
-                visitor.visit(tree)
-            except SyntaxError:
-                continue
-    return visitor.writefile_imports
+    """Extracts writefile script imports."""
+    _, _, _, _, writefile_imports = extract_imports_from_sources_full(code_sources)
+    return writefile_imports
 
 
 # =====================================================================
@@ -699,65 +651,15 @@ def classify_cell_source(source: str) -> Tuple[str, str]:
     return "PYTHON", source
 
 
+def harvest_scoped_cell_flags(code_sources: List[str]) -> Dict[str, List[str]]:
+    """Convenience delegate returning harvested scoped flags map directly."""
+    return harvest_cell_magics_and_commands(code_sources).scoped_flags
+
+
 def harvest_index_urls_from_sources(code_sources: List[str]) -> Set[str]:
     """Scans code sources for index URLs and returns a combined set of all harvested URLs."""
     h_res = harvest_cell_magics_and_commands(code_sources)
     return h_res.base_index_urls.union(h_res.extra_index_urls)
-
-
-def harvest_scoped_cell_flags(code_sources: List[str]) -> Dict[str, List[str]]:
-    """
-    Parses cell sources and maps custom flags (--extra-index-url, --index-url, -i, -f, --find-links)
-    strictly to the packages declared on that specific command line.
-    """
-    scoped_flags: Dict[str, List[str]] = {}
-
-    for source in code_sources:
-        for line in source.splitlines():
-            clean_line = line.strip()
-            if not clean_line or clean_line.startswith('#'):
-                continue
-
-            command_segments = SHELL_SPLIT_PATTERN.split(clean_line)
-            for segment in command_segments:
-                seg = segment.strip()
-                pip_match = PIP_INSTALL_PATTERN.match(seg)
-                if not pip_match:
-                    continue
-
-                args_str = pip_match.group(1)
-                tokens = args_str.split()
-                line_flags: List[str] = []
-                line_pkgs: List[str] = []
-
-                i = 0
-                while i < len(tokens):
-                    token = tokens[i]
-                    if token in {"--extra-index-url", "--index-url", "-i", "-f", "--find-links"}:
-                        if i + 1 < len(tokens):
-                            line_flags.extend([token, tokens[i+1].strip("'\"")])
-                            i += 2
-                            continue
-                    elif token in PIP_VALUE_FLAGS:
-                        i += 2
-                        continue
-                    elif token.startswith('-') or token.lower() in PIP_SINGLE_FLAGS:
-                        i += 1
-                        continue
-                    elif any(token.lower().startswith(p) for p in VCS_OR_PATH_PREFIXES):
-                        i += 1
-                        continue
-
-                    pkg_name = re.split(r'[<>=!~;\[#]', token)[0].strip("'\"")
-                    if pkg_name:
-                        line_pkgs.append(pkg_name)
-                    i += 1
-
-                for pkg in line_pkgs:
-                    scoped_flags.setdefault(pkg, []).extend(line_flags)
-                    logger.debug(f"[Magic/ScopedFlags] Attached flags to '{pkg}': {line_flags}")
-
-    return scoped_flags
 
 
 def harvest_cell_magics_and_commands(
@@ -996,9 +898,7 @@ def build_manifest_entries(
     guarded_imports: Optional[Set[str]] = None,
     local_repo_modules: Optional[Set[str]] = None
 ) -> Tuple[List[str], List[str]]:
-    """
-    Builds string-formatted manifest lines for legacy/batch consumers while preserving order.
-    """
+    """Builds string-formatted manifest lines for legacy/batch consumers while preserving order."""
     entries, notices = build_dependency_objects(
         imports, submodules, frozen_env, pkg_dist_map, guarded_imports, local_repo_modules
     )
@@ -1122,7 +1022,6 @@ def build_dependency_entries(
 
     for dep in dependencies:
         if not dep.is_comment and dep.name:
-            # Check normalized names for flag association
             matched_flags: List[str] = []
             for candidate in (dep.name.lower(), dep.name.replace("-", "_").lower(), dep.name.replace("_", "-").lower()):
                 if candidate in flags_map:
@@ -1541,7 +1440,6 @@ def walk_and_scan_directory(target_dir: str) -> RepoEnvironmentMap:
             if file.endswith('.ipynb'):
                 full_path = Path(root) / file
                 ext_res = extract_from_file(str(full_path), strict=True)
-                writefile_imports = extract_writefile_imports_from_sources(ext_res.code_sources)
                 
                 h_res = harvest_cell_magics_and_commands(ext_res.code_sources)
                 harvested_urls = h_res.base_index_urls.union(h_res.extra_index_urls)
@@ -1558,7 +1456,7 @@ def walk_and_scan_directory(target_dir: str) -> RepoEnvironmentMap:
                     dynamic_warnings=ext_res.dynamic_warnings,
                     code_sources=ext_res.code_sources,
                     harvested_urls=harvested_urls,
-                    writefile_imports=writefile_imports,
+                    writefile_imports=ext_res.writefile_imports,
                     harvested_pkgs=h_res.harvested_packages,
                     base_index_urls=h_res.base_index_urls,
                     extra_index_urls=h_res.extra_index_urls,
@@ -1906,10 +1804,11 @@ def run_batch_pipeline(
     args: argparse.Namespace, 
     frozen_env: Dict[str, str], 
     pkg_dist_map: Dict[str, List[str]], 
-    batch_hw_cache: Optional[GpuInfo]
+    batch_hw_cache: Optional[GpuInfo],
+    precomputed_repo_map: Optional[RepoEnvironmentMap] = None
 ) -> None:
     """Executes the batch processing pipeline across a directory of notebooks."""
-    repo_map = walk_and_scan_directory(target_batch_dir)
+    repo_map = precomputed_repo_map or walk_and_scan_directory(target_batch_dir)
     report_text, is_clean = generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, batch_hw_cache)
     print(report_text)
 
@@ -1975,7 +1874,7 @@ def run_single_file_pipeline(
             
         imports, submodules, code_sources = ext_res.imports, ext_res.submodules, ext_res.code_sources
         guarded_imports, dyn_warnings = ext_res.guarded_imports, ext_res.dynamic_warnings
-        writefile_imports = extract_writefile_imports_from_sources(code_sources)
+        writefile_imports = ext_res.writefile_imports
         gpu_info = precomputed_gpu_info
     elif in_live_ipython:
         logger.info("🔍 [Path B] Analyzing live IPython session kernel history via AST...")
@@ -2133,6 +2032,7 @@ def main() -> None:
     
     target_batch_dir = args.batch or (args.notebook if args.notebook and os.path.isdir(args.notebook) else None)
     initial_imports: List[str] = []
+    repo_map_pre: Optional[RepoEnvironmentMap] = None
 
     if target_batch_dir:
         repo_map_pre = walk_and_scan_directory(target_batch_dir)
@@ -2148,7 +2048,7 @@ def main() -> None:
     batch_hw_cache = inspect_gpu_environment(initial_imports)
 
     if target_batch_dir:
-        run_batch_pipeline(target_batch_dir, args, frozen_env, pkg_dist_map, batch_hw_cache)
+        run_batch_pipeline(target_batch_dir, args, frozen_env, pkg_dist_map, batch_hw_cache, precomputed_repo_map=repo_map_pre)
     else:
         run_single_file_pipeline(args, frozen_env, raw_full_freeze, pkg_dist_map, batch_hw_cache)
 
