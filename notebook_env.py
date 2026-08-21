@@ -330,7 +330,8 @@ PLATFORM_PSEUDO_MODULES: Set[str] = {
     "kaggle_secrets",
     "google.colab",
     "pyspark.dbutils",
-    "__main__"
+    "__main__",
+    "notebook_env"
 }
 
 TRANSITIVE_FRAMEWORK_MAP: Dict[str, str] = {
