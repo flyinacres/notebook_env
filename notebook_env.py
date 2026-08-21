@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-notebook_env.py (v39)
+notebook_env.py (v40)
 Headless Jupyter Notebook Dependency Scanner & Lockfile Generator.
 
 Standalone, zero-dependency utility for analyzing notebook environments,
@@ -37,6 +37,7 @@ import os
 import re
 import sys
 import argparse
+import contextlib
 import functools
 import logging
 import warnings
@@ -57,10 +58,12 @@ if hasattr(sys.stderr, "reconfigure"):
 # Setup logging stream for diagnostic messages (directed to stderr)
 logger = logging.getLogger("notebook_env")
 logger.setLevel(logging.INFO)
-logger.propagate = True
-console_handler = logging.StreamHandler(sys.stderr)
-console_handler.setFormatter(logging.Formatter("%(message)s"))
-logger.addHandler(console_handler)
+logger.propagate = False
+
+if not logger.handlers:
+    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(console_handler)
 
 
 # =====================================================================
@@ -326,7 +329,8 @@ PLATFORM_PSEUDO_MODULES: Set[str] = {
     "dbutils",
     "kaggle_secrets",
     "google.colab",
-    "pyspark.dbutils"
+    "pyspark.dbutils",
+    "__main__"
 }
 
 TRANSITIVE_FRAMEWORK_MAP: Dict[str, str] = {
@@ -346,6 +350,51 @@ STD_LIB: Set[str] = set(sys.stdlib_module_names) if hasattr(sys, 'stdlib_module_
     "os", "sys", "re", "json", "ast", "subprocess", "datetime", "math", "random", 
     "time", "pathlib", "typing", "collections", "itertools", "functools", "shutil"
 }
+
+
+def is_running_in_ipython() -> bool:
+    """Checks whether execution is occurring inside an active IPython/Jupyter kernel."""
+    try:
+        from IPython import get_ipython
+        return get_ipython() is not None
+    except ImportError:
+        return False
+
+
+def sanitize_kernel_argv(args: argparse.Namespace) -> None:
+    """
+    Cleans up contaminated sys.argv from ipykernel launcher (e.g. ['-f', 'kernel-xxx.json']).
+    Prevents Path A from attempting to parse connection JSON files.
+    """
+    if not args.notebook:
+        return
+
+    nb_str = str(args.notebook)
+    if "kernel-" in nb_str and nb_str.endswith(".json"):
+        args.notebook = None
+    elif not nb_str.endswith(".ipynb") and is_running_in_ipython():
+        if not os.path.exists(nb_str) or not (os.path.isdir(nb_str) or nb_str.endswith(".ipynb")):
+            args.notebook = None
+
+
+@contextlib.contextmanager
+def silence_fd2_stderr():
+    """
+    Temporarily redirects OS-level file descriptor 2 (stderr) to /dev/null.
+    Prevents low-level C++ drivers (e.g. CUDA cuInit 303) from polluting notebook/terminal output.
+    """
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        old_stderr_fd = os.dup(2)
+        os.dup2(devnull, 2)
+        os.close(devnull)
+        try:
+            yield
+        finally:
+            os.dup2(old_stderr_fd, 2)
+            os.close(old_stderr_fd)
+    except Exception:
+        yield
 
 
 def get_timeline_context_label(is_execution_ordered: bool) -> str:
@@ -528,11 +577,25 @@ def extract_from_file(
 
 
 def extract_from_active_session() -> Tuple[List[str], Dict[str, Set[str]], List[str], Set[str], List[str]]:
-    """Path B (Live Kernel): Reads IPython execution history in chronological order."""
+    """
+    Path B (Live Kernel): Reads IPython execution history in chronological order.
+    Filters out self-referential notebook_env execution cells and invocation commands.
+    """
     import __main__
-    code_sources = [src for src in getattr(__main__, 'In', []) if src and isinstance(src, str)]
-    imports, submodules, guarded_imports, dyn_warnings = extract_imports_from_sources(code_sources)
-    return imports, submodules, code_sources, guarded_imports, dyn_warnings
+    raw_sources = [src for src in getattr(__main__, 'In', []) if src and isinstance(src, str)]
+    
+    clean_sources: List[str] = []
+    for src in raw_sources:
+        # Ignore notebook_env self-definition cell or invocation cell
+        if "NotebookImportVisitor" in src or "def extract_from_active_session" in src:
+            continue
+        stripped = src.strip()
+        if re.search(r'\b(?:ne|notebook_env)\.main\s*\(', stripped) or stripped == "import notebook_env" or stripped.startswith("import notebook_env as"):
+            continue
+        clean_sources.append(src)
+
+    imports, submodules, guarded_imports, dyn_warnings = extract_imports_from_sources(clean_sources)
+    return imports, submodules, clean_sources, guarded_imports, dyn_warnings
 
 
 # =====================================================================
@@ -1277,6 +1340,7 @@ def get_installed_environment() -> Tuple[Dict[str, str], List[str]]:
             
     return frozen, res.stdout.splitlines()
 
+
 def process_package_requirements(
     pinned_list: List[str], 
     harvested_urls: Set[str],
@@ -1313,6 +1377,7 @@ def process_package_requirements(
         manifest_output.extend(writefile_entries)
             
     return manifest_output, local_tagged_info, warnings
+
 
 def build_dependency_entries(
     dependencies: List[DependencyEntry],
@@ -1400,41 +1465,37 @@ def probe_torch_gpu() -> Optional[GpuProbeResult]:
 
 
 def probe_tensorflow_gpu() -> Optional[GpuProbeResult]:
-    """Probes TensorFlow for GPU acceleration."""
+    """Probes TensorFlow for GPU acceleration while silencing C++ CUDA driver noise."""
     try:
-        import tensorflow as tf
-    except ImportError:
-        return None
-    try:
-        gpus = tf.config.list_physical_devices('GPU')
-        if not gpus:
-            return None
-        dev_name = "NVIDIA GPU (via TensorFlow)"
-        try:
-            details = tf.config.experimental.get_device_details(gpus[0])
-            dev_name = f"{details.get('device_name', 'NVIDIA GPU')} (via TensorFlow)"
-        except Exception:
-            pass
-        return GpuProbeResult("GPU", dev_name)
+        with silence_fd2_stderr():
+            import tensorflow as tf
+            gpus = tf.config.list_physical_devices('GPU')
+            if not gpus:
+                return None
+            dev_name = "NVIDIA GPU (via TensorFlow)"
+            try:
+                details = tf.config.experimental.get_device_details(gpus[0])
+                dev_name = f"{details.get('device_name', 'NVIDIA GPU')} (via TensorFlow)"
+            except Exception:
+                pass
+            return GpuProbeResult("GPU", dev_name)
     except Exception as e:
         logger.debug(f"[HardwareProbe] TensorFlow GPU probe failed unexpectedly: {e}")
     return None
 
 
 def probe_jax_gpu() -> Optional[GpuProbeResult]:
-    """Probes JAX for GPU/TPU acceleration."""
+    """Probes JAX for GPU/TPU acceleration while silencing C++ CUDA driver noise."""
     try:
-        import jax
-    except ImportError:
-        return None
-    try:
-        accelerators = [d for d in jax.devices() if d.platform.lower() in ("gpu", "tpu", "metal")]
-        if not accelerators:
-            return None
-        first_accel = accelerators[0]
-        accel_type = first_accel.platform.upper()
-        dev_name = f"{accel_type} ({first_accel.device_kind}) via JAX"
-        return GpuProbeResult(accel_type, dev_name)
+        with silence_fd2_stderr():
+            import jax
+            accelerators = [d for d in jax.devices() if d.platform.lower() in ("gpu", "tpu", "metal")]
+            if not accelerators:
+                return None
+            first_accel = accelerators[0]
+            accel_type = first_accel.platform.upper()
+            dev_name = f"{accel_type} ({first_accel.device_kind}) via JAX"
+            return GpuProbeResult(accel_type, dev_name)
     except Exception as e:
         logger.debug(f"[HardwareProbe] JAX GPU probe failed unexpectedly: {e}")
     return None
@@ -2180,13 +2241,7 @@ def run_single_file_pipeline(
     precomputed_gpu_info: Optional[GpuInfo] = None
 ) -> None:
     """Executes single-notebook analysis or live IPython kernel history extraction."""
-    in_live_ipython = False
-    try:
-        from IPython import get_ipython
-        if get_ipython() is not None:
-            in_live_ipython = True
-    except ImportError:
-        pass
+    in_live_ipython = is_running_in_ipython()
 
     target_single_file_dir = str(Path(args.notebook).parent) if (args.notebook and not os.path.isdir(args.notebook)) else "."
     single_file_local_modules = discover_local_repo_modules(target_single_file_dir)
@@ -2198,6 +2253,8 @@ def run_single_file_pipeline(
         ext_res = extract_from_file(args.notebook, strict=False)
         if not ext_res.success:
             logger.error(f"❌ Error: {ext_res.error_msg}")
+            if in_live_ipython:
+                return
             sys.exit(1)
             
         imports, submodules, code_sources = ext_res.imports, ext_res.submodules, ext_res.code_sources
@@ -2300,6 +2357,8 @@ def run_single_file_pipeline(
             root_dir=target_single_file_dir
         )
         logger.info(f"✅ Updated '{written_path.name}'")
+        if in_live_ipython:
+            return
         sys.exit(0)
 
     blueprint = generate_production_blueprint(
@@ -2317,31 +2376,6 @@ def run_single_file_pipeline(
     print(blueprint["step2_code"])
     print("\n" + "="*80)
 
-def is_running_in_ipython() -> bool:
-    """Checks whether execution is occurring inside an active IPython/Jupyter kernel."""
-    try:
-        from IPython import get_ipython
-        return get_ipython() is not None
-    except ImportError:
-        return False
-
-
-def sanitize_kernel_argv(args: argparse.Namespace) -> None:
-    """
-    Cleans up contaminated sys.argv from ipykernel launcher (e.g. ['-f', 'kernel-xxx.json']).
-    Prevents Path A from attempting to parse connection JSON files.
-    """
-    if not args.notebook:
-        return
-
-    # Check if the positional notebook argument points to an ipykernel connection file
-    nb_str = str(args.notebook)
-    if "kernel-" in nb_str and nb_str.endswith(".json"):
-        args.notebook = None
-    elif not nb_str.endswith(".ipynb") and is_running_in_ipython():
-        # In a live kernel, if the passed target isn't an explicit .ipynb file or dir, discard it
-        if not os.path.exists(nb_str) or not (os.path.isdir(nb_str) or nb_str.endswith(".ipynb")):
-            args.notebook = None
 
 def main() -> None:
     """CLI entrypoint and dispatch router for single notebook or batch analysis modes."""
@@ -2371,6 +2405,9 @@ def main() -> None:
 
     args, unknown = parser.parse_known_args()
 
+    if is_running_in_ipython():
+        sanitize_kernel_argv(args)
+
     if args.quiet:
         logger.setLevel(logging.ERROR)
     elif args.verbose:
@@ -2378,10 +2415,9 @@ def main() -> None:
 
     if (args.output or args.in_place) and not args.batch and not args.notebook:
         logger.error("❌ Error: --output or --in-place requires a target notebook file path or --batch directory.")
+        if is_running_in_ipython():
+            return
         sys.exit(1)
-
-    if is_running_in_ipython():
-            sanitize_kernel_argv(args)
 
     frozen_env, raw_full_freeze = get_installed_environment()
     pkg_dist_map = importlib.metadata.packages_distributions() if hasattr(importlib.metadata, "packages_distributions") else {}
