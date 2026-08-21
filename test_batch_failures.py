@@ -1,8 +1,9 @@
 """
-Failure Modes and Edge Case Tests for Batch Mode (v26).
+Failure Modes and Edge Case Tests for Batch Mode (v26+).
 
 Tests handling of unparseable JSON, bad notebook schemas, non-Python kernel filtering,
-hidden/venv directory skipping, error-gated execution halts, and multi-URL aggregation.
+hidden/venv directory skipping, error-gated execution halts, multi-URL aggregation,
+and low-level driver silence exception propagation.
 """
 
 import json
@@ -45,7 +46,6 @@ class TestBatchFailureModes:
         mock_batch_env: Tuple[Dict[str, str], Dict[str, List[str]]]
     ) -> None:
         """A corrupted JSON file must populate parse_errors and halt batch execution."""
-        # Arrange
         frozen_env, pkg_dist_map = mock_batch_env
 
         valid_nb = {
@@ -54,14 +54,11 @@ class TestBatchFailureModes:
         }
         (tmp_path / "01_valid.ipynb").write_text(json.dumps(valid_nb), encoding="utf-8")
 
-        # 1 Corrupted notebook
         (tmp_path / "02_corrupted.ipynb").write_text("{ unquoted_json: True ", encoding="utf-8")
 
-        # Act
         repo_map = ne.walk_and_scan_directory(str(tmp_path))
         report, is_clean = ne.generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, None)
 
-        # Assert: Execution cleanliness flag is False and the parse error was logged
         assert is_clean is False
         assert len(repo_map.parse_errors) == 1
         assert "02_corrupted.ipynb" in str(repo_map.parse_errors[0].path)
@@ -72,14 +69,11 @@ class TestBatchFailureModes:
         mock_batch_env: Tuple[Dict[str, str], Dict[str, List[str]]]
     ) -> None:
         """JSON file lacking a 'cells' array should be logged as corrupted."""
-        # Arrange: Notebook JSON missing the required top-level 'cells' array
         bad_schema = {"metadata": {"kernelspec": {"language": "python"}}}
         (tmp_path / "no_cells.ipynb").write_text(json.dumps(bad_schema), encoding="utf-8")
 
-        # Act
         repo_map = ne.walk_and_scan_directory(str(tmp_path))
 
-        # Assert: Classified as corrupted status via StatusLabel constant
         assert len(repo_map.parse_errors) == 1
         assert repo_map.parse_errors[0].lang_label in (StatusLabel.CORRUPTED, StatusLabel.ERROR)
         
@@ -92,7 +86,6 @@ class TestBatchFailureModes:
         mock_batch_env: Tuple[Dict[str, str], Dict[str, List[str]]]
     ) -> None:
         """Files inside .ipynb_checkpoints, .git, or venv should never be scanned."""
-        # Arrange
         frozen_env, pkg_dist_map = mock_batch_env
 
         root_nb = {
@@ -109,10 +102,8 @@ class TestBatchFailureModes:
         venv_dir.mkdir(parents=True)
         (venv_dir / "ignored.ipynb").write_text("{ corrupted venv json ", encoding="utf-8")
 
-        # Act
         repo_map = ne.walk_and_scan_directory(str(tmp_path))
 
-        # Assert: Hidden dir files were skipped; no parse errors recorded from them
         assert len(repo_map.parse_errors) == 0
         assert len(repo_map.scan_results) == 1
         assert repo_map.scan_results[0].path.name == "root.ipynb"
@@ -123,7 +114,6 @@ class TestBatchFailureModes:
         mock_batch_env: Tuple[Dict[str, str], Dict[str, List[str]]]
     ) -> None:
         """R, Julia, and conflicting kernel metadata files must be skipped gracefully."""
-        # Arrange
         frozen_env, pkg_dist_map = mock_batch_env
 
         r_nb = {"metadata": {"kernelspec": {"language": "r"}}, "cells": []}
@@ -140,11 +130,9 @@ class TestBatchFailureModes:
         (tmp_path / "script.jl.ipynb").write_text(json.dumps(julia_nb), encoding="utf-8")
         (tmp_path / "conflict.ipynb").write_text(json.dumps(conflict_nb), encoding="utf-8")
 
-        # Act
         repo_map = ne.walk_and_scan_directory(str(tmp_path))
         report, is_clean = ne.generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, None)
 
-        # Assert
         assert is_clean is True
         assert len(repo_map.scan_results) == 0
         assert len(repo_map.non_python_files) == 3
@@ -155,11 +143,9 @@ class TestBatchFailureModes:
         monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Calling --batch --universal on a directory with parse errors must exit with code 1."""
-        # Arrange
         (tmp_path / "broken.ipynb").write_text("{ invalid json ", encoding="utf-8")
         monkeypatch.setattr(sys, "argv", ["notebook_env.py", "--batch", str(tmp_path), "--universal"])
 
-        # Act & Assert
         with pytest.raises(SystemExit) as excinfo:
             ne.main()
 
@@ -171,7 +157,6 @@ class TestBatchFailureModes:
         mock_batch_env: Tuple[Dict[str, str], Dict[str, List[str]]]
     ) -> None:
         """Multiple distinct index URLs across different notebooks must all appear in requirements-all.txt."""
-        # Arrange
         frozen_env, pkg_dist_map = mock_batch_env
 
         nb1 = {
@@ -186,11 +171,9 @@ class TestBatchFailureModes:
         (tmp_path / "01.ipynb").write_text(json.dumps(nb1), encoding="utf-8")
         (tmp_path / "02.ipynb").write_text(json.dumps(nb2), encoding="utf-8")
 
-        # Act
         repo_map = ne.walk_and_scan_directory(str(tmp_path))
         manifest = ne.generate_universal_manifest(repo_map, frozen_env, pkg_dist_map)
 
-        # Assert
         assert "--extra-index-url https://index.a.com" in manifest
         assert "--extra-index-url https://index.b.com" in manifest
 
@@ -208,7 +191,6 @@ class TestBatchFailureModes:
         assert is_clean is True
         assert "requirements file" in report.lower()
 
-
     def test_batch_magic_conda_notice_aggregated(self, tmp_path, mock_batch_env):
         frozen_env, pkg_dist_map = mock_batch_env
         nb = {
@@ -222,3 +204,12 @@ class TestBatchFailureModes:
 
         assert is_clean is True
         assert "conda" in report.lower()
+
+    def test_silence_fd2_stderr_does_not_crash_on_internal_exception(self):
+        """
+        Ensure silence_fd2_stderr allows exceptions inside the with block
+        to propagate cleanly without raising 'RuntimeError: generator didn't stop after throw()'.
+        """
+        with pytest.raises(ValueError, match="Probe test error"):
+            with ne.silence_fd2_stderr():
+                raise ValueError("Probe test error")

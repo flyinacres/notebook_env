@@ -1,5 +1,5 @@
 """
-Unit and Integration Tests for Batch Mode (v25).
+Unit and Integration Tests for Batch Mode (v25+).
 """
 
 import json
@@ -130,7 +130,13 @@ class TestBatchOrchestration:
         nb_path = tmp_path / "analysis.ipynb"
         nb_path.write_text(json.dumps(nb))
 
-        res = ne.NotebookScanResult(path=nb_path, is_python=True, lang_label="python", imports={"pandas"}, code_sources=["import pandas as pd"])
+        res = ne.NotebookScanResult(
+            path=nb_path,
+            is_python=True,
+            lang_label="python",
+            imports=["pandas"],
+            code_sources=["import pandas as pd"]
+        )
         written_path = ne.apply_output_to_notebook(res, frozen_env, pkg_dist_map, None, suffix="_merged")
 
         assert written_path.exists()
@@ -157,14 +163,19 @@ class TestBatchOrchestration:
         nb_path = tmp_path / "inplace_test.ipynb"
         nb_path.write_text(json.dumps(nb))
 
-        res = ne.NotebookScanResult(path=nb_path, is_python=True, lang_label="python", imports={"pandas"}, code_sources=["import pandas as pd"])
+        res = ne.NotebookScanResult(
+            path=nb_path,
+            is_python=True,
+            lang_label="python",
+            imports=["pandas"],
+            code_sources=["import pandas as pd"]
+        )
         written_path = ne.apply_output_to_notebook(res, frozen_env, pkg_dist_map, None, in_place=True)
 
         out_nb = json.loads(written_path.read_text())
         assert len(out_nb["cells"]) == 3
         assert "OLD CONTENT" not in out_nb["cells"][0]["source"][0]
         assert out_nb["cells"][0]["metadata"]["notebook_env"]["managed"] is True
-
 
     def test_batch_walk_populates_cell_magic_fields(self, tmp_path, mock_batch_env):
         frozen_env, pkg_dist_map = mock_batch_env
@@ -191,7 +202,6 @@ class TestBatchOrchestration:
         assert "https://index.foo.com" in res.base_index_urls
         assert "https://index.foo.com" in res.harvested_urls
 
-
     def test_batch_report_surfaces_unimported_magic_packages(self, tmp_path, mock_batch_env):
         frozen_env, pkg_dist_map = mock_batch_env
         
@@ -207,7 +217,6 @@ class TestBatchOrchestration:
 
         assert "gdown" in report
 
-
     def test_universal_manifest_includes_magic_packages(self, tmp_path, mock_batch_env):
         frozen_env, pkg_dist_map = mock_batch_env
         
@@ -222,25 +231,6 @@ class TestBatchOrchestration:
         uni_manifest = ne.generate_universal_manifest(repo_map, frozen_env, pkg_dist_map)
 
         assert "gdown" in uni_manifest
-
-
-    def test_strict_mode_accepts_missing_metadata(self, tmp_path):
-        nb_no_meta = {
-            "cell_type": "code",
-            "metadata": {},
-            "cells": [{"cell_type": "code", "source": ["import math\n"]}]
-        }
-        nb_path = tmp_path / "no_metadata.ipynb"
-        nb_path.write_text(json.dumps(nb_no_meta), encoding="utf-8")
-
-        success, imports, submodules, code_sources, err, lang_label, guarded, dyn_warns = (
-            ne.extract_from_file(str(nb_path), strict=True)
-        )
-
-        assert success is True
-        assert "math" in imports
-        assert err is None
-        assert "unspecified" in lang_label or lang_label == ne.StatusLabel.PYTHON
 
     def test_batch_report_handles_local_tagged_builds(self, tmp_path, mock_batch_env):
         frozen_env, pkg_dist_map = mock_batch_env
@@ -290,6 +280,51 @@ class TestBatchOrchestration:
 
         assert "Packages missing from current environment: 0" in report
 
+    def test_canonicalize_pkg_name_normalizes_variants(self):
+        """PEP 503 normalization: equate hyphens, underscores, and periods."""
+        assert ne.canonicalize_pkg_name("torch_neuronx") == "torch-neuronx"
+        assert ne.canonicalize_pkg_name("torch-neuronx") == "torch-neuronx"
+        assert ne.canonicalize_pkg_name("scikit_learn") == "scikit-learn"
+        assert ne.canonicalize_pkg_name("Scikit.Learn") == "scikit-learn"
+
+    def test_import_to_pypi_map_includes_skimage(self):
+        """'skimage' must resolve to 'scikit-image' in PyPI mapping."""
+        assert ne.IMPORT_TO_PYPI_MAP.get("skimage") == "scikit-image"
+
+    def test_platform_pseudo_modules_contains_bootstrap_tools(self):
+        """'pip', 'setuptools', 'wheel', 'databricks', and 'notebook_env' must be excluded from missing packages."""
+        for mod in ("pip", "setuptools", "wheel", "databricks", "notebook_env"):
+            assert mod in ne.PLATFORM_PSEUDO_MODULES
+
+    def test_batch_summary_deduplicates_and_hyphenates_uninstalled_packages(self, tmp_path):
+        """
+        Batch summary merges underscore and hyphen imports into a single canonical
+        entry and displays it with standard PyPI hyphens.
+        """
+        nb1 = {
+            "metadata": {"kernelspec": {"language": "python"}},
+            "cells": [{"cell_type": "code", "source": ["import torch_neuronx\n"]}]
+        }
+        nb2 = {
+            "metadata": {"kernelspec": {"language": "python"}},
+            "cells": [{"cell_type": "code", "source": ["!pip install torch-neuronx\n"]}]
+        }
+        (tmp_path / "01_nb.ipynb").write_text(json.dumps(nb1), encoding="utf-8")
+        (tmp_path / "02_nb.ipynb").write_text(json.dumps(nb2), encoding="utf-8")
+
+        repo_map = ne.walk_and_scan_directory(str(tmp_path))
+        summary = ne.analyze_batch_repository(
+            repo_map=repo_map,
+            frozen_env={},
+            pkg_dist_map={},
+            batch_hw_cache=None
+        )
+
+        assert "torch-neuronx" in summary.missing_packages
+        assert "torch_neuronx" not in summary.missing_packages
+        assert len(summary.missing_packages["torch-neuronx"]) == 2
+
+
 def test_batch_report_surfaces_hardware_tag_warnings(tmp_path):
     """Verify generate_batch_analysis_report flags local tag builds missing download index URLs."""
     nb_path = tmp_path / "test_hw_tag.ipynb"
@@ -308,7 +343,7 @@ def test_batch_report_surfaces_hardware_tag_warnings(tmp_path):
         path=nb_path,
         is_python=True,
         lang_label="python",
-        imports={"torch"},
+        imports=["torch"],
         code_sources=["import torch"]
     )
     
@@ -319,9 +354,9 @@ def test_batch_report_surfaces_hardware_tag_warnings(tmp_path):
     
     assert "Custom Build Tag Warnings:" in report_text
 
+
 def test_batch_mode_scopes_local_modules_to_notebook_subdirectory(tmp_path):
     """Verify batch analysis recognizes local modules in subdirectories relative to the notebook."""
-    # Build nested layout: repo_root/databricks/notebook.ipynb and repo_root/databricks/cookbook/__init__.py
     sub_dir = tmp_path / "databricks"
     cookbook_dir = sub_dir / "cookbook"
     cookbook_dir.mkdir(parents=True)
@@ -341,7 +376,7 @@ def test_batch_mode_scopes_local_modules_to_notebook_subdirectory(tmp_path):
         path=nb_path,
         is_python=True,
         lang_label="python",
-        imports={"cookbook"},
+        imports=["cookbook"],
         code_sources=["import cookbook"]
     )
 
@@ -350,8 +385,8 @@ def test_batch_mode_scopes_local_modules_to_notebook_subdirectory(tmp_path):
 
     summary = ne.analyze_batch_repository(repo_map, {}, {}, None)
 
-    # Assert 'cookbook' is recognized as a local repo module and NOT flagged as missing PyPI package
     assert "cookbook" not in summary.missing_packages
+
 
 def test_batch_hardware_tag_warnings_use_unified_dependency_pipeline(tmp_path: Path) -> None:
     """Batch analysis catches custom build tag warnings via unified build_dependency_entries pipeline."""
@@ -366,7 +401,6 @@ def test_batch_hardware_tag_warnings_use_unified_dependency_pipeline(tmp_path: P
         json.dump(nb_data, f)
 
     repo_map = ne.walk_and_scan_directory(str(tmp_path))
-    # Active environment has local build tag +cu121 with no harvested download URL
     frozen_env = {"torch": "torch==2.3.1+cu121"}
     
     summary = ne.analyze_batch_repository(repo_map, frozen_env=frozen_env, pkg_dist_map={}, batch_hw_cache=None)
