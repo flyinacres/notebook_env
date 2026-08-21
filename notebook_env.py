@@ -2317,6 +2317,31 @@ def run_single_file_pipeline(
     print(blueprint["step2_code"])
     print("\n" + "="*80)
 
+def is_running_in_ipython() -> bool:
+    """Checks whether execution is occurring inside an active IPython/Jupyter kernel."""
+    try:
+        from IPython import get_ipython
+        return get_ipython() is not None
+    except ImportError:
+        return False
+
+
+def sanitize_kernel_argv(args: argparse.Namespace) -> None:
+    """
+    Cleans up contaminated sys.argv from ipykernel launcher (e.g. ['-f', 'kernel-xxx.json']).
+    Prevents Path A from attempting to parse connection JSON files.
+    """
+    if not args.notebook:
+        return
+
+    # Check if the positional notebook argument points to an ipykernel connection file
+    nb_str = str(args.notebook)
+    if "kernel-" in nb_str and nb_str.endswith(".json"):
+        args.notebook = None
+    elif not nb_str.endswith(".ipynb") and is_running_in_ipython():
+        # In a live kernel, if the passed target isn't an explicit .ipynb file or dir, discard it
+        if not os.path.exists(nb_str) or not (os.path.isdir(nb_str) or nb_str.endswith(".ipynb")):
+            args.notebook = None
 
 def main() -> None:
     """CLI entrypoint and dispatch router for single notebook or batch analysis modes."""
@@ -2354,6 +2379,9 @@ def main() -> None:
     if (args.output or args.in_place) and not args.batch and not args.notebook:
         logger.error("❌ Error: --output or --in-place requires a target notebook file path or --batch directory.")
         sys.exit(1)
+
+    if is_running_in_ipython():
+            sanitize_kernel_argv(args)
 
     frozen_env, raw_full_freeze = get_installed_environment()
     pkg_dist_map = importlib.metadata.packages_distributions() if hasattr(importlib.metadata, "packages_distributions") else {}
