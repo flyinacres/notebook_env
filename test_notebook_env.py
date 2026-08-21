@@ -9,6 +9,8 @@ blueprint generation, and runtime sandbox execution.
 
 import json
 import sys
+import logging
+import argparse
 import types
 import warnings
 import subprocess
@@ -1072,3 +1074,83 @@ class TestExecutionChronology:
         ordered_cells, is_exec_ordered = ne.get_ordered_code_cells(cells)
         assert is_exec_ordered is False
         assert [idx for idx, _ in ordered_cells] == [0, 1, 2]
+
+class TestInteractiveKernelRuntime:
+    """Regression tests covering live interactive kernel lifecycle and CLI dispatch."""
+
+    def test_argv_contamination_from_ipykernel_launcher_clears_notebook_arg(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Regression: When running inside an active IPython kernel, sys.argv contains
+        ipykernel connection arguments like ['-f', '/path/kernel-123.json'].
+        Ensure sanitize_kernel_argv discards the connection JSON and does not route to Path A.
+        """
+        # 1. Simulate running inside an active IPython kernel
+        monkeypatch.setattr(ne, "is_running_in_ipython", lambda: True)
+
+        # 2. Simulate ipykernel launcher argv passed to parse_known_args
+        kernel_json_path = "/root/.local/share/jupyter/runtime/kernel-7d4150cd-35da.json"
+        monkeypatch.setattr(
+            sys, "argv", ["ipykernel_launcher.py", "-f", kernel_json_path]
+        )
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("notebook", nargs="?")
+        args, _ = parser.parse_known_args()
+
+        assert args.notebook == kernel_json_path
+
+        # 3. Sanitize args
+        ne.sanitize_kernel_argv(args)
+
+        # 4. Assert connection file was discarded
+        assert args.notebook is None
+
+    def test_logger_handler_configuration_prevents_duplicate_logging(self) -> None:
+        """
+        Regression: Ensure the notebook_env logger does not propagate to root by default
+        and only attaches a single stderr console handler.
+        """
+        logger = logging.getLogger("notebook_env")
+
+        # In live sessions, propagate must be False so root loggers (e.g. IPython) don't duplicate logs
+        assert logger.propagate is False
+
+        # Verify our specific console handler targeting stderr exists and is not duplicated
+        stderr_handlers = [
+            h for h in logger.handlers 
+            if type(h) is logging.StreamHandler and getattr(h, "stream", None) in (sys.stderr, sys.__stderr__)
+        ]
+        assert len(stderr_handlers) == 1
+
+    def test_live_kernel_history_self_introspection_filter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Regression: Path B extracting from __main__.In must strip notebook_env's own
+        definition cells and invocation commands so internal probes don't pollute the scan.
+        """
+        import __main__
+
+        simulated_in_history = [
+            "",
+            "import pandas as pd\nimport numpy as np\n",
+            "class NotebookImportVisitor(ast.NodeVisitor):\n    pass\ndef extract_from_active_session():\n    pass\nimport cupy\n",  # Simulated notebook_env source cell
+            "import notebook_env as ne\nne.main()\n",  # Invocation cell
+        ]
+
+        monkeypatch.setattr(__main__, "In", simulated_in_history, raising=False)
+
+        imports, submodules, clean_sources, guarded_imports, dyn_warnings = (
+            ne.extract_from_active_session()
+        )
+
+        # User imports must be captured
+        assert "pandas" in imports
+        assert "numpy" in imports
+
+        # Tool internal probes and invocations must be stripped
+        assert "cupy" not in imports
+        assert "notebook_env" not in imports
+        assert len(clean_sources) == 1
