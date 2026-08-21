@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-notebook_env.py (v40)
+notebook_env.py (v41)
 Headless Jupyter Notebook Dependency Scanner & Lockfile Generator.
 
 Standalone, zero-dependency utility for analyzing notebook environments,
@@ -200,6 +200,7 @@ class GpuInfo:
     device_name: Optional[str] = None
     frameworks: List[str] = field(default_factory=list)
     framework_devices: Dict[str, Optional[str]] = field(default_factory=dict)
+    probe_errors: List[str] = field(default_factory=list)
 
 
 class BlueprintResult(TypedDict):
@@ -322,7 +323,8 @@ IMPORT_TO_PYPI_MAP: Dict[str, str] = {
     "attr": "attrs",
     "serial": "pyserial",
     "dotenv": "python-dotenv",
-    "mpl_toolkits": "matplotlib"
+    "mpl_toolkits": "matplotlib",
+    "skimage": "scikit-image"
 }
 
 PLATFORM_PSEUDO_MODULES: Set[str] = {
@@ -331,7 +333,11 @@ PLATFORM_PSEUDO_MODULES: Set[str] = {
     "google.colab",
     "pyspark.dbutils",
     "__main__",
-    "notebook_env"
+    "notebook_env",
+    "pip",
+    "setuptools",
+    "wheel",
+    "databricks"
 }
 
 TRANSITIVE_FRAMEWORK_MAP: Dict[str, str] = {
@@ -351,6 +357,11 @@ STD_LIB: Set[str] = set(sys.stdlib_module_names) if hasattr(sys, 'stdlib_module_
     "os", "sys", "re", "json", "ast", "subprocess", "datetime", "math", "random", 
     "time", "pathlib", "typing", "collections", "itertools", "functools", "shutil"
 }
+
+
+def canonicalize_pkg_name(name: str) -> str:
+    """PEP 503 normalization: lowercase and replace runs of [-_.] with a single hyphen."""
+    return re.sub(r"[-_.]+", "-", name).strip("-").lower()
 
 
 def is_running_in_ipython() -> bool:
@@ -381,21 +392,34 @@ def sanitize_kernel_argv(args: argparse.Namespace) -> None:
 @contextlib.contextmanager
 def silence_fd2_stderr():
     """
-    Temporarily redirects OS-level file descriptor 2 (stderr) to /dev/null.
-    Prevents low-level C++ drivers (e.g. CUDA cuInit 303) from polluting notebook/terminal output.
+    Temporarily redirects OS-level file descriptor 2 (stderr) to os.devnull.
+    Prevents low-level C++ drivers (e.g. CUDA cuInit 303) from polluting output.
+    Ensures safe, generator-compliant exception propagation without crashing.
     """
+    old_stderr_fd = None
+    devnull_fd = None
     try:
-        devnull = os.open(os.devnull, os.O_WRONLY)
-        old_stderr_fd = os.dup(2)
-        os.dup2(devnull, 2)
-        os.close(devnull)
         try:
-            yield
-        finally:
-            os.dup2(old_stderr_fd, 2)
-            os.close(old_stderr_fd)
-    except Exception:
+            devnull_fd = os.open(os.devnull, os.O_WRONLY)
+            old_stderr_fd = os.dup(2)
+            os.dup2(devnull_fd, 2)
+        except Exception:
+            pass
+
         yield
+
+    finally:
+        if old_stderr_fd is not None:
+            try:
+                os.dup2(old_stderr_fd, 2)
+                os.close(old_stderr_fd)
+            except Exception:
+                pass
+        if devnull_fd is not None:
+            try:
+                os.close(devnull_fd)
+            except Exception:
+                pass
 
 
 def get_timeline_context_label(is_execution_ordered: bool) -> str:
@@ -587,7 +611,6 @@ def extract_from_active_session() -> Tuple[List[str], Dict[str, Set[str]], List[
     
     clean_sources: List[str] = []
     for src in raw_sources:
-        # Ignore notebook_env self-definition cell or invocation cell
         if "NotebookImportVisitor" in src or "def extract_from_active_session" in src:
             continue
         stripped = src.strip()
@@ -880,7 +903,6 @@ def harvest_pip_install_occurrences(code_sources: List[str]) -> List[PipInstallO
                         i += 1
                         continue
 
-                    # Split name and version specifier
                     match = re.search(r'[<>=!~;\[#]', token)
                     if match:
                         split_idx = match.start()
@@ -923,7 +945,7 @@ def resolve_pip_occurrences(
     seen_history: Dict[str, List[PipInstallOccurrence]] = {}
 
     for occ in occurrences:
-        norm_key = occ.name.lower()
+        norm_key = canonicalize_pkg_name(occ.name)
         seen_history.setdefault(norm_key, []).append(occ)
 
     time_qualifier = get_timeline_context_label(is_execution_ordered)
@@ -1066,28 +1088,29 @@ def build_unified_timeline(
             if imp.is_guarded:
                 guarded_set.add(imp.module)
 
-    # Collect timeline events keyed by coordinate
-    timeline_events: List[Tuple[Tuple[int, int], str, str]] = []  # ((cell, line), kind, pkg_name)
+    timeline_events: List[Tuple[Tuple[int, int], str, str]] = []
     seen_packages: Set[str] = set()
 
     # 1. Place explicit pip installs
     for norm_key, occ in resolved_pips.items():
-        if norm_key == occ.name.lower():
+        canon = canonicalize_pkg_name(occ.name)
+        if norm_key == canon:
             coord = (occ.cell_idx, occ.line_idx)
             timeline_events.append((coord, "PIP", occ.name))
-            seen_packages.add(norm_key)
+            seen_packages.add(canon)
 
     # 2. Place bare imports only if not already placed via pip install
     for imp in all_import_occs:
-        norm_imp = imp.module.lower()
-        if norm_imp in STD_LIB:
+        norm_imp = canonicalize_pkg_name(imp.module)
+        if imp.module.lower() in STD_LIB:
             continue
         pypi_name = IMPORT_TO_PYPI_MAP.get(imp.module, imp.module)
-        if norm_imp not in seen_packages and pypi_name.lower() not in seen_packages:
+        canon_pypi = canonicalize_pkg_name(pypi_name)
+        if norm_imp not in seen_packages and canon_pypi not in seen_packages:
             coord = (imp.cell_idx, imp.line_idx)
             timeline_events.append((coord, "IMPORT", imp.module))
             seen_packages.add(norm_imp)
-            seen_packages.add(pypi_name.lower())
+            seen_packages.add(canon_pypi)
 
     timeline_events.sort(key=lambda t: t[0])
 
@@ -1095,22 +1118,20 @@ def build_unified_timeline(
     promotion_notices: List[str] = []
 
     for coord, kind, pkg_name in timeline_events:
-        norm_name = pkg_name.lower()
+        canon_name = canonicalize_pkg_name(pkg_name)
         submods = submodules_map.get(pkg_name, set())
         is_guarded = pkg_name in guarded_set
 
         if kind == "PIP":
-            occ = resolved_pips[norm_name]
+            occ = resolved_pips[canon_name]
             dep_entry, notice = resolve_pypi_package_and_extras(
                 occ.name, submods, frozen_env, pkg_dist_map=pkg_dist_map, is_guarded=is_guarded, local_repo_modules=local_repo_modules
             )
-            # If explicit pin provided in token, prefer that over frozen_env
             if occ.version_spec and not dep_entry.is_comment:
                 v_clean = occ.version_spec.lstrip("=<>!~")
                 dep_entry.version = v_clean
                 
-                # Rule 3: Log active-env discrepancy at DEBUG level
-                host_match = frozen_env.get(norm_name)
+                host_match = frozen_env.get(canon_name)
                 if host_match and "==" in host_match:
                     host_ver = host_match.split("==", 1)[1]
                     if host_ver != v_clean:
@@ -1147,10 +1168,10 @@ def build_auxiliary_tool_entries(
 ) -> List[DependencyEntry]:
     """Builds commented DependencyEntry instances for CLI tools installed via cell magics."""
     aux_entries: List[DependencyEntry] = []
-    imported_set = {imp.lower() for imp in imported_packages}
+    imported_set = {canonicalize_pkg_name(imp) for imp in imported_packages}
     unimported_tools = sorted([
         pkg for pkg in harvested_packages 
-        if pkg.lower() not in imported_set and pkg.lower() not in STD_LIB
+        if canonicalize_pkg_name(pkg) not in imported_set and pkg.lower() not in STD_LIB
     ])
 
     if not unimported_tools:
@@ -1158,7 +1179,8 @@ def build_auxiliary_tool_entries(
 
     aux_entries.append(DependencyEntry(is_comment=True, comment_text="\n# --- AUXILIARY TOOL INSTALLS (harvested from cell magics) ---"))
     for tool in unimported_tools:
-        matched_pin = frozen_env.get(tool.lower())
+        canon_tool = canonicalize_pkg_name(tool)
+        matched_pin = frozen_env.get(canon_tool)
         if matched_pin:
             aux_entries.append(DependencyEntry(is_comment=True, comment_text=f"# {matched_pin}  (installed via cell command; not directly imported in Python code)"))
         else:
@@ -1174,10 +1196,10 @@ def build_writefile_tool_entries(
 ) -> List[DependencyEntry]:
     """Builds commented DependencyEntry instances for dependencies inside %%writefile scripts."""
     entries: List[DependencyEntry] = []
-    primary_set = {imp.lower() for imp in primary_imports}
+    primary_set = {canonicalize_pkg_name(imp) for imp in primary_imports}
     script_only = sorted([
         pkg for pkg in writefile_imports 
-        if pkg.lower() not in primary_set and pkg.lower() not in STD_LIB
+        if canonicalize_pkg_name(pkg) not in primary_set and pkg.lower() not in STD_LIB
     ])
 
     if not script_only:
@@ -1186,7 +1208,8 @@ def build_writefile_tool_entries(
     entries.append(DependencyEntry(is_comment=True, comment_text="\n# --- WRITEFILE SCRIPT DEPENDENCIES ---"))
     for pkg in script_only:
         pypi_name = IMPORT_TO_PYPI_MAP.get(pkg, pkg)
-        matched_pin = frozen_env.get(pypi_name.lower())
+        canon_pypi = canonicalize_pkg_name(pypi_name)
+        matched_pin = frozen_env.get(canon_pypi)
         if matched_pin:
             entries.append(DependencyEntry(is_comment=True, comment_text=f"# {matched_pin}  (imported inside script generated via %%writefile)"))
         else:
@@ -1226,7 +1249,8 @@ def resolve_pypi_package_and_extras(
     if not pypi_name:
         pypi_name = IMPORT_TO_PYPI_MAP.get(imp, imp)
 
-    matched_pin = frozen_env.get(pypi_name.lower())
+    canon_pypi = canonicalize_pkg_name(pypi_name)
+    matched_pin = frozen_env.get(canon_pypi)
 
     if is_guarded:
         if matched_pin:
@@ -1337,6 +1361,8 @@ def get_installed_environment() -> Tuple[Dict[str, str], List[str]]:
     for line in res.stdout.splitlines():
         if "==" in line:
             pkg, ver = line.split("==", 1)
+            canon = canonicalize_pkg_name(pkg)
+            frozen[canon] = line.strip()
             frozen[pkg.lower()] = line.strip()
             
     return frozen, res.stdout.splitlines()
@@ -1395,7 +1421,8 @@ def build_dependency_entries(
     for dep in dependencies:
         if not dep.is_comment and dep.name:
             matched_flags: List[str] = []
-            for candidate in (dep.name.lower(), dep.name.replace("-", "_").lower(), dep.name.replace("_", "-").lower()):
+            canon_name = canonicalize_pkg_name(dep.name)
+            for candidate in (dep.name, dep.name.lower(), canon_name):
                 if candidate in flags_map:
                     matched_flags = flags_map[candidate]
                     break
@@ -1454,14 +1481,15 @@ def probe_torch_gpu() -> Optional[GpuProbeResult]:
         import torch
     except ImportError:
         return None
-    try:
-        if torch.cuda.is_available():
-            dev_name = f"{torch.cuda.get_device_name(0)} (via PyTorch)"
-            return GpuProbeResult("NVIDIA CUDA", dev_name)
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return GpuProbeResult("Apple Silicon MPS", "Apple Silicon GPU (Metal via PyTorch)")
     except Exception as e:
-        logger.debug(f"[HardwareProbe] PyTorch GPU probe failed unexpectedly: {e}")
+        logger.debug(f"[HardwareProbe] PyTorch import failed: {e}")
+        raise
+
+    if torch.cuda.is_available():
+        dev_name = f"{torch.cuda.get_device_name(0)} (via PyTorch)"
+        return GpuProbeResult("NVIDIA CUDA", dev_name)
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return GpuProbeResult("Apple Silicon MPS", "Apple Silicon GPU (Metal via PyTorch)")
     return None
 
 
@@ -1480,9 +1508,11 @@ def probe_tensorflow_gpu() -> Optional[GpuProbeResult]:
             except Exception:
                 pass
             return GpuProbeResult("GPU", dev_name)
+    except ImportError:
+        return None
     except Exception as e:
         logger.debug(f"[HardwareProbe] TensorFlow GPU probe failed unexpectedly: {e}")
-    return None
+        raise
 
 
 def probe_jax_gpu() -> Optional[GpuProbeResult]:
@@ -1497,9 +1527,11 @@ def probe_jax_gpu() -> Optional[GpuProbeResult]:
             accel_type = first_accel.platform.upper()
             dev_name = f"{accel_type} ({first_accel.device_kind}) via JAX"
             return GpuProbeResult(accel_type, dev_name)
+    except ImportError:
+        return None
     except Exception as e:
         logger.debug(f"[HardwareProbe] JAX GPU probe failed unexpectedly: {e}")
-    return None
+        raise
 
 
 GPU_PROBES: List[Tuple[str, Callable[[], Optional[GpuProbeResult]]]] = [
@@ -1518,21 +1550,27 @@ def inspect_gpu_environment(imported_packages: Any) -> Optional[GpuInfo]:
 
     framework_devices: Dict[str, Optional[str]] = {}
     active_types: List[str] = []
+    probe_errors: List[str] = []
     primary_fw: Optional[str] = None
     primary_dev: Optional[str] = None
 
     for fw_stem, probe in GPU_PROBES:
         if fw_stem not in found_frameworks:
             continue
-        result = probe()
-        if result:
-            framework_devices[fw_stem] = result.device_name
-            active_types.append(result.accelerator_type)
-            if not primary_dev:
-                primary_fw = CANONICAL_TO_FRAMEWORK_DISPLAY.get(fw_stem, fw_stem.capitalize())
-                primary_dev = result.device_name
-        else:
+        try:
+            result = probe()
+            if result:
+                framework_devices[fw_stem] = result.device_name
+                active_types.append(result.accelerator_type)
+                if not primary_dev:
+                    primary_fw = CANONICAL_TO_FRAMEWORK_DISPLAY.get(fw_stem, fw_stem.capitalize())
+                    primary_dev = result.device_name
+            else:
+                framework_devices[fw_stem] = None
+        except Exception as e:
             framework_devices[fw_stem] = None
+            fw_label = CANONICAL_TO_FRAMEWORK_DISPLAY.get(fw_stem, fw_stem.capitalize())
+            probe_errors.append(f"{fw_label} probe error: {e}")
 
     has_gpu = primary_dev is not None
 
@@ -1542,7 +1580,8 @@ def inspect_gpu_environment(imported_packages: Any) -> Optional[GpuInfo]:
         active_framework=primary_fw,
         device_name=primary_dev,
         frameworks=sorted(found_frameworks),
-        framework_devices=framework_devices
+        framework_devices=framework_devices,
+        probe_errors=probe_errors
     )
 
 
@@ -1873,6 +1912,9 @@ def analyze_batch_repository(
             summary.non_python_languages.get(item.lang_label, 0) + 1
         )
 
+    canonical_to_display: Dict[str, str] = {}
+    canonical_missing_map: Dict[str, List[str]] = {}
+
     for res in repo_map.scan_results:
         nb_local_mods = get_notebook_local_modules(res.path, repo_map.target_dir)
 
@@ -1922,7 +1964,11 @@ def analyze_batch_repository(
                 if "provided automatically" in pin_entry or "local folder/file" in pin_entry:
                     continue
                 pypi_name = pin_entry.split()[1]
-                summary.missing_packages.setdefault(pypi_name, []).append(res.path.name)
+                canon = canonicalize_pkg_name(pypi_name)
+                canonical_missing_map.setdefault(canon, []).append(res.path.name)
+                # Ensure PyPI display defaults to hyphens (e.g. torch-neuronx)
+                display_name = pypi_name.replace("_", "-")
+                canonical_to_display.setdefault(canon, display_name)
             else:
                 pkg_name = pin_entry.split("==")[0]
                 summary.matched_packages.add(pkg_name)
@@ -1931,12 +1977,19 @@ def analyze_batch_repository(
             if pkg in STD_LIB or pkg in PLATFORM_PSEUDO_MODULES or pkg in nb_local_mods:
                 continue
             pypi_name = IMPORT_TO_PYPI_MAP.get(pkg, pkg)
-            matched_pin = frozen_env.get(pypi_name.lower())
+            canon = canonicalize_pkg_name(pypi_name)
+            matched_pin = frozen_env.get(canon) or frozen_env.get(pypi_name.lower())
             if matched_pin:
                 pkg_name = matched_pin.split("==")[0]
                 summary.matched_packages.add(pkg_name)
             else:
-                summary.missing_packages.setdefault(pypi_name, []).append(res.path.name)
+                canonical_missing_map.setdefault(canon, []).append(res.path.name)
+                canonical_to_display.setdefault(canon, pypi_name)
+
+    # Consolidate missing packages under canonical display names
+    for canon, nbs in canonical_missing_map.items():
+        disp_name = canonical_to_display.get(canon, canon)
+        summary.missing_packages[disp_name] = nbs
 
     primary_url, url_reason = select_primary_index_url(repo_map.url_to_notebooks)
     summary.primary_url = primary_url
@@ -2012,6 +2065,9 @@ def format_batch_report(summary: BatchAnalysisSummary) -> str:
     out.append("⚡ ACCELERATOR & DOWNLOAD INDEX CHECK:")
     if summary.batch_hw_cache and summary.batch_hw_cache.has_gpu:
         out.append(f"  • Active Hardware Accelerator: {summary.batch_hw_cache.device_name}")
+    elif summary.batch_hw_cache and summary.batch_hw_cache.probe_errors:
+        err_msg = "; ".join(summary.batch_hw_cache.probe_errors)
+        out.append(f"  • Active Hardware Accelerator: None detected (⚠️ Detection encountered errors: {err_msg})")
     else:
         out.append("  • Active Hardware Accelerator: None (CPU-only execution environment)")
 
@@ -2317,6 +2373,9 @@ def run_single_file_pipeline(
     if gpu_info:
         if gpu_info.has_gpu:
             logger.info(f"⚡ Active accelerator detected: {gpu_info.device_name}\n")
+        elif gpu_info.probe_errors:
+            err_msg = "; ".join(gpu_info.probe_errors)
+            logger.warning(f"⚠️ Accelerator detection encountered errors: {err_msg}\n")
         elif gpu_info.frameworks:
             fw_list = ", ".join(gpu_info.frameworks)
             logger.warning(f"⚠️ Acceleration Framework ({fw_list}) imported, but NO active accelerator detected in host runtime.\n")
