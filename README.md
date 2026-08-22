@@ -84,7 +84,7 @@ This is the reference section. You won't see all of these on any single run — 
 | **❌ Error: Major Python version mismatch**                                      | The notebook was written for a different major Python version (e.g. Python 3 vs. Python 2 — a very rare mismatch today) than the one you're running it with. This stops execution, because it usually won't work at all.                                                                                                                                                                                          | Switch to a kernel/environment running the required Python version.                                                                                                                                                                                                                                                                                                                     |
 | **⚠️ This code was created with Python 3.X. You are trying to run it with 3.Y.** | A smaller mismatch — same major version, different minor version (e.g. 3.10 vs. 3.11). This is a warning, not a stop; execution continues.                                                                                                                                                                                                                                                                        | Usually fine to ignore and just try running it. If something breaks in a confusing way later, this is worth revisiting.                                                                                                                                                                                                                                                                 |
 | **✅ Setup complete! Environment ready.**                                        | Everything installed successfully.                                                                                                                                                                                                                                                                                                                                                                                | Nothing — you're done, continue running your notebook normally.                                                                                                                                                                                                                                                                                                                         |
-| **❌ Setup failed while installing pinned dependencies.**                        | The `pip install` step returned an error. **Known caveat as of this version:** the tool always suggests the failure is about hardware-specific builds (like GPU version tags), even when it isn't. If your notebook doesn't use any GPU-specific packages, that particular suggestion doesn't apply to you — the real reason is in the pip output printed just above this message; scroll up and read that first. | Look at the pip error text right above this message for the actual reason (a typo'd package name, no internet connection, a disk-space or permissions issue, and so on, are all more common in practice than a hardware mismatch). If it does turn out to be hardware-related, try installing the plain (non-hardware-tagged) version instead, e.g. `!pip install torch` in a new cell. |
+| **❌ Setup failed while installing pinned dependencies.**                        | The `pip install` step returned an error. The message right after this one will only mention a hardware-specific build mismatch (like a GPU version tag) if your manifest actually contains one — otherwise it points you toward general causes instead. | Look at the pip error text right above this message for the actual reason (a typo'd package name, no internet connection, a disk-space or permissions issue, and so on, are all more common in practice than a hardware mismatch). If it does turn out to be hardware-related, try installing the plain (non-hardware-tagged) version instead, e.g. `!pip install torch` in a new cell. |
 
 ### Inside the generated package list itself
 
@@ -104,9 +104,7 @@ These show up as comments (lines starting with `#`) inside the list of packages 
 | **⚡ Active accelerator detected: [device name]**                          | A GPU-related library was imported, and a GPU was confirmed available and working when the author ran it. Strong signal the notebook benefits from a GPU — not a guarantee every single step used it.                          |
 | **⚠️ Acceleration Framework imported, but NO active accelerator detected** | A GPU-related library was imported, but no GPU was actually available in that run. If the notebook was meant to require a GPU, this particular run just didn't confirm that — it doesn't necessarily mean it doesn't need one. |
 
-**Known caveat:** if a notebook uses more than one GPU library at once (for example both `torch` and `tensorflow`), the device name shown can currently get attributed to the wrong one of the two. Treat the specific device name as a helpful hint rather than something to fully rely on for now.
-
-**Also worth knowing:** if your notebook uses a higher-level library that relies on `torch`/`tensorflow`/`jax` underneath (for example `fastai`, which is built on `torch`), GPU detection may currently miss it even though a GPU actually was used. This is a known gap, not something you did wrong.
+If your notebook uses a higher-level library that relies on `torch`/`tensorflow`/`jax` underneath (for example `fastai`, which is built on `torch`), GPU detection correctly traces through to the underlying framework's confirmed status.
 
 ### Extra messages
 
@@ -141,11 +139,25 @@ If you're checking an entire course folder or shared repository rather than one 
 python notebook_env.py --batch ./course_materials
 ```
 
-This gives you a summary report across every notebook in that folder — what's missing, what's inconsistent, and which notebooks have problems — without changing any files. It's meant for auditing, not for the single-notebook "paste two cells in" workflow above.
+This gives you a summary report across every notebook in that folder — what's missing, what's inconsistent, and which notebooks have problems — without changing any files. It's meant for auditing, not for the single-notebook "paste two cells in" workflow above. This also correctly flags the hardware-specific build tag issue described above (the `+cu121`-style version warning) on a per-notebook basis within the summary, the same as the single-notebook workflow.
 
-There are a few more options for this mode (writing a combined package list for the whole folder, or actually inserting the setup cells into every notebook automatically). See `DEVELOPMENT.md` if you need those — they're less commonly needed and more worth understanding in detail before using.
+If you want the tool to actually write the setup cells into every notebook in the folder, rather than just reporting on them, add `--output` (writes a companion file alongside each original, named with a suffix) or `--in-place` (overwrites each original directly):
 
-**Known gap:** this folder-wide summary currently can't flag the hardware-specific build tag issue described above (the `+cu121`-style version warning) the way the single-notebook workflow can. If a notebook in your folder has that issue, batch mode won't currently tell you.
+```bash
+python notebook_env.py --batch ./course_materials --output
+```
+
+By default, companion files land in the same folder as the notebook they came from. If you'd rather keep generated files separate from your source material entirely (for example, to avoid a shared or read-only course repository accumulating companion files), point them at a different folder with `--output-dir`:
+
+```bash
+python notebook_env.py --batch ./course_materials --output-dir ./locked_notebooks
+```
+
+This mirrors your folder structure under the target directory, so two notebooks with the same filename in different subfolders (`week1/pipeline.ipynb` and `week2/pipeline.ipynb`) won't overwrite each other. One limitation worth knowing: only the notebook itself gets copied there, not any data files or local `.py` modules sitting alongside it. If your notebook reads a file with a relative path (like `pd.read_csv("data/sales.csv")`), that read will fail from the new location unless you copy those files over yourself. If you want the output to stay directly runnable without extra steps, leave `--output-dir` off and let it sit alongside the source instead.
+
+There are a few more options for this mode. See `DEVELOPMENT.md` if you need those — they're less commonly needed and more worth understanding in detail before using.
+
+**Worth knowing about how folder scanning works:** finding notebooks to analyze searches every subfolder, no matter how deep. But recognizing your own local helper files (so they're not mistakenly flagged as "missing packages") only looks in two places: the exact folder you point `--batch` at, and each notebook's own immediate folder. If you have a shared helper file several folders above where your notebooks live, point `--batch` at that shared folder directly (or a common parent of it and your notebooks) rather than a subfolder underneath it, or the tool won't find it.
 
 ---
 
@@ -154,6 +166,7 @@ There are a few more options for this mode (writing a combined package list for 
 Being upfront about this rather than letting you discover it the hard way:
 
 - If a package is loaded by name from a variable (rather than written directly, e.g. `import pandas`), and that variable's value isn't obvious from reading the code, the tool can't figure out what it is.
+- If your notebook adds a folder to its search path at runtime (`sys.path.append(...)`) and then imports individual files from it directly, those imports may get flagged as missing packages even though they're really local files. Importing the folder itself as a package (`from my_folder import my_module`) is recognized correctly; it's specifically the "add to search path, then import the file directly" style that isn't.
 - A specific, less common style of import (`from . import something`) isn't detected at all.
 - It only checks packages you import directly — not the packages _those_ packages depend on internally. Those can still change version on their own between installs.
 - It confirms a GPU was _available_, not that every part of the notebook actually used it.
