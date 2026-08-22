@@ -293,6 +293,7 @@ class BatchAnalysisSummary:
     total_python_notebooks: int = 0
     non_python_count: int = 0
     non_python_languages: Dict[str, int] = field(default_factory=dict)
+    companion_skipped_count: int = 0
     parse_errors: List[NotebookScanResult] = field(default_factory=list)
     matched_packages: Set[str] = field(default_factory=set)
     missing_packages: Dict[str, List[str]] = field(default_factory=dict)
@@ -1796,6 +1797,7 @@ class RepoEnvironmentMap:
         self.scan_results: List[NotebookScanResult] = []
         self.non_python_files: List[NotebookScanResult] = []
         self.parse_errors: List[NotebookScanResult] = []
+        self.companion_files_skipped: List[Path] = []
         self.global_imports: List[str] = []
         self.package_to_notebooks: Dict[str, List[Path]] = {}
         self.harvested_packages_to_notebooks: Dict[str, List[Path]] = {}
@@ -1852,8 +1854,8 @@ def select_primary_index_url(url_to_notebooks: Dict[str, List[Path]]) -> Tuple[O
     return best_url, reason
 
 
-def walk_and_scan_directory(target_dir: str) -> RepoEnvironmentMap:
-    """Recursively scans directory for .ipynb files in strict batch mode."""
+def walk_and_scan_directory(target_dir: str, skip_suffix: Optional[str] = None) -> RepoEnvironmentMap:
+    """Recursively scans directory for .ipynb files in batch mode."""
     repo_map = RepoEnvironmentMap(target_dir)
     target_path = Path(target_dir)
 
@@ -1862,6 +1864,12 @@ def walk_and_scan_directory(target_dir: str) -> RepoEnvironmentMap:
         for file in sorted(files):
             if file.endswith('.ipynb'):
                 full_path = Path(root) / file
+
+                # Skip companion output artifacts if a skip_suffix is active
+                if skip_suffix and full_path.stem.endswith(skip_suffix):
+                    repo_map.companion_files_skipped.append(full_path)
+                    continue
+
                 ext_res = extract_from_file(str(full_path), strict=True)
                 
                 h_res = harvest_cell_magics_and_commands(ext_res.code_sources)
@@ -1899,10 +1907,11 @@ def analyze_batch_repository(
     batch_hw_cache: Optional[GpuInfo]
 ) -> BatchAnalysisSummary:
     """Aggregates dependency metrics, warnings, and index settings across repository notebooks."""
-    summary = BatchAnalysisSummary(
+    summary = BatchAnalysisSummary( 
         target_dir=repo_map.target_dir,
         total_python_notebooks=len(repo_map.scan_results),
         non_python_count=len(repo_map.non_python_files),
+        companion_skipped_count=len(repo_map.companion_files_skipped),
         parse_errors=repo_map.parse_errors,
         batch_hw_cache=batch_hw_cache
     )
@@ -2010,6 +2019,9 @@ def format_batch_report(summary: BatchAnalysisSummary) -> str:
     out.append("📁 NOTEBOOK INVENTORY & LANGUAGE SCAN:")
     out.append(f"  • Python (.ipynb): {summary.total_python_notebooks} files analyzed")
     
+    if summary.companion_skipped_count > 0:
+        out.append(f"  • Companion outputs skipped: {summary.companion_skipped_count} files")
+
     if summary.non_python_count > 0:
         lang_str = ", ".join([f"{k} ({v})" for k, v in summary.non_python_languages.items()])
         out.append(f"  • Non-Python skipped: {summary.non_python_count} files [{lang_str}]")
@@ -2162,7 +2174,7 @@ def apply_output_to_notebook(
     local_repo_modules: Optional[Set[str]] = None,
     root_dir: Optional[str] = None
 ) -> Path:
-    """Writes per-notebook locked file or replaces setup cells in-place."""
+    """Writes per-notebook locked file or replaces setup cells in-place idempotently."""
     if local_repo_modules is None:
         local_repo_modules = get_notebook_local_modules(scan_res.path, root_dir)
 
@@ -2227,17 +2239,18 @@ def apply_output_to_notebook(
 
     cells = nb_data.get("cells", [])
 
+    # Strip any prior managed setup cells upfront
+    non_managed_cells = [
+        c for c in cells 
+        if not (isinstance(c.get("metadata"), dict) and c.get("metadata", {}).get("notebook_env", {}).get("managed") is True)
+    ]
+    nb_data["cells"] = managed_cells + non_managed_cells
+
     if in_place:
         target_path = scan_res.path
-        non_managed_cells = [
-            c for c in cells 
-            if not (isinstance(c.get("metadata"), dict) and c.get("metadata", {}).get("notebook_env", {}).get("managed") is True)
-        ]
-        nb_data["cells"] = managed_cells + non_managed_cells
     else:
         stem = scan_res.path.stem
         target_path = scan_res.path.parent / f"{stem}{suffix}.ipynb"
-        nb_data["cells"] = managed_cells + cells
 
     with open(target_path, 'w', encoding='utf-8') as f:
         json.dump(nb_data, f, indent=1)
@@ -2486,8 +2499,11 @@ def main() -> None:
     initial_imports: List[str] = []
     repo_map_pre: Optional[RepoEnvironmentMap] = None
 
+    # Do NOT skip suffix if --in-place is specified (in-place exists to re-scan and refresh)
+    skip_suffix = None if args.in_place else args.suffix
+
     if target_batch_dir:
-        repo_map_pre = walk_and_scan_directory(target_batch_dir)
+        repo_map_pre = walk_and_scan_directory(target_batch_dir, skip_suffix=skip_suffix)
         for imp in repo_map_pre.global_imports:
             if imp not in initial_imports:
                 initial_imports.append(imp)
