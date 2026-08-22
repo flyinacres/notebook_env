@@ -2167,7 +2167,7 @@ def apply_output_to_notebook(
     frozen_env: Dict[str, str], 
     pkg_dist_map: Dict[str, List[str]], 
     batch_hw_cache: Optional[GpuInfo], 
-    suffix: str = "_merged", 
+    suffix: Optional[str] = None, 
     in_place: bool = False,
     local_repo_modules: Optional[Set[str]] = None,
     root_dir: Optional[str] = None,
@@ -2250,7 +2250,7 @@ def apply_output_to_notebook(
     elif output_dir:
         out_base = Path(output_dir)
         stem = scan_res.path.stem
-        active_suffix = suffix if suffix != "_merged" else ""
+        active_suffix = suffix if suffix is not None else ""
         file_name = f"{stem}{active_suffix}.ipynb"
 
         if root_dir and Path(root_dir).exists():
@@ -2266,7 +2266,8 @@ def apply_output_to_notebook(
         target_path = dest_dir / file_name
     else:
         stem = scan_res.path.stem
-        target_path = scan_res.path.parent / f"{stem}{suffix}.ipynb"
+        active_suffix = suffix if suffix is not None else "_merged"
+        target_path = scan_res.path.parent / f"{stem}{active_suffix}.ipynb"
 
     with open(target_path, 'w', encoding='utf-8') as f:
         json.dump(nb_data, f, indent=1)
@@ -2283,7 +2284,8 @@ def run_batch_pipeline(
     precomputed_repo_map: Optional[RepoEnvironmentMap] = None
 ) -> None:
     """Executes the batch processing pipeline across a directory of notebooks."""
-    skip_suffix = None if args.in_place else args.suffix
+    effective_suffix = args.suffix if args.suffix is not None else "_merged"
+    skip_suffix = None if args.in_place else effective_suffix
     repo_map = precomputed_repo_map or walk_and_scan_directory(target_batch_dir, skip_suffix=skip_suffix)
     report_text, is_clean = generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, batch_hw_cache)
     print(report_text)
@@ -2301,7 +2303,14 @@ def run_batch_pipeline(
         logger.info(f"\n✅ Wrote universal repository manifest to '{out_file}'")
 
     if args.output or args.in_place or args.output_dir:
-        loc_desc = f"directory: '{args.output_dir}'" if args.output_dir else ('in-place' if args.in_place else 'suffix: ' + args.suffix)
+        active_suffix_display = args.suffix if args.suffix is not None else ("" if args.output_dir else "_merged")
+        if args.in_place:
+            loc_desc = "in-place"
+        elif args.output_dir:
+            loc_desc = f"directory: '{args.output_dir}'" + (f", suffix: '{active_suffix_display}'" if active_suffix_display else "")
+        else:
+            loc_desc = f"suffix: '{active_suffix_display}'"
+
         logger.info(f"\n🚀 Writing per-notebook locked files ({loc_desc})...")
         for res in repo_map.scan_results:
             nb_local_mods = get_notebook_local_modules(res.path, repo_map.target_dir)
@@ -2437,7 +2446,14 @@ def run_single_file_pipeline(
     )
 
     if args.output or args.in_place or args.output_dir:
-        loc_desc = f"directory: '{args.output_dir}'" if args.output_dir else ('in-place' if args.in_place else 'suffix: ' + args.suffix)
+        active_suffix_display = args.suffix if args.suffix is not None else ("" if args.output_dir else "_merged")
+        if args.in_place:
+            loc_desc = "in-place"
+        elif args.output_dir:
+            loc_desc = f"directory: '{args.output_dir}'" + (f", suffix: '{active_suffix_display}'" if active_suffix_display else "")
+        else:
+            loc_desc = f"suffix: '{active_suffix_display}'"
+
         logger.info(f"🚀 Writing updated notebook ({loc_desc})...")
         written_path = apply_output_to_notebook(
             single_res,
@@ -2481,7 +2497,7 @@ def main() -> None:
     parser.add_argument("--full-freeze", action="store_true", help="Append full environment pip freeze after targeted manifest.")
     parser.add_argument("--quiet", action="store_true", help="Suppress diagnostic and status logging outputs.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose debug output.")
-    
+
     # Batch / Output Flags
     parser.add_argument("--batch", metavar="DIR", help="Run in batch mode across all notebooks in specified directory.")
     parser.add_argument("--analyze", action="store_true", help="Run batch analysis mode (default when --batch is provided).")
@@ -2495,7 +2511,7 @@ def main() -> None:
     )
     parser.add_argument("--output", action="store_true", help="Generate per-notebook merged lockfiles.")
     parser.add_argument("--output-dir", metavar="DIR", help="Directory where generated locked notebooks should be written.")
-    parser.add_argument("--suffix", default="_merged", help="File suffix for merged notebook outputs (default: '_merged').")
+    parser.add_argument("--suffix", default=None, help="File suffix for merged notebook outputs (default: '_merged' alongside source, '' with --output-dir).")
     parser.add_argument("--in-place", action="store_true", help="Overwrite original notebooks in-place instead of creating companion files.")
 
     args, unknown = parser.parse_known_args()
@@ -2522,7 +2538,8 @@ def main() -> None:
     initial_imports: List[str] = []
     repo_map_pre: Optional[RepoEnvironmentMap] = None
 
-    skip_suffix = None if args.in_place else args.suffix
+    effective_suffix = args.suffix if args.suffix is not None else "_merged"
+    skip_suffix = None if args.in_place else effective_suffix
 
     if target_batch_dir:
         repo_map_pre = walk_and_scan_directory(target_batch_dir, skip_suffix=skip_suffix)
