@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-notebook_env.py (v41)
+notebook_env.py (v42)
 Headless Jupyter Notebook Dependency Scanner & Lockfile Generator.
 
 Standalone, zero-dependency utility for analyzing notebook environments,
@@ -22,8 +22,8 @@ see the repository README:
 👉 https://github.com/flyinacres/notebook_env/blob/main/README.md
 
 Execution Modes:
-  1. Single Notebook CLI:  python notebook_env.py notebook.ipynb [--output | --in-place]
-  2. Batch Repo Directory: python notebook_env.py --batch ./repo [--universal [FILENAME]] [--output | --in-place]
+  1. Single Notebook CLI:  python notebook_env.py notebook.ipynb [--output | --output-dir DIR | --in-place]
+  2. Batch Repo Directory: python notebook_env.py --batch ./repo [--universal [FILENAME]] [--output | --output-dir DIR | --in-place]
   3. Live IPython Kernel:   import notebook_env as ne; ne.main()
 """
 
@@ -1865,7 +1865,6 @@ def walk_and_scan_directory(target_dir: str, skip_suffix: Optional[str] = None) 
             if file.endswith('.ipynb'):
                 full_path = Path(root) / file
 
-                # Skip companion output artifacts if a skip_suffix is active
                 if skip_suffix and full_path.stem.endswith(skip_suffix):
                     repo_map.companion_files_skipped.append(full_path)
                     continue
@@ -1907,7 +1906,7 @@ def analyze_batch_repository(
     batch_hw_cache: Optional[GpuInfo]
 ) -> BatchAnalysisSummary:
     """Aggregates dependency metrics, warnings, and index settings across repository notebooks."""
-    summary = BatchAnalysisSummary( 
+    summary = BatchAnalysisSummary(
         target_dir=repo_map.target_dir,
         total_python_notebooks=len(repo_map.scan_results),
         non_python_count=len(repo_map.non_python_files),
@@ -1975,7 +1974,6 @@ def analyze_batch_repository(
                 pypi_name = pin_entry.split()[1]
                 canon = canonicalize_pkg_name(pypi_name)
                 canonical_missing_map.setdefault(canon, []).append(res.path.name)
-                # Ensure PyPI display defaults to hyphens (e.g. torch-neuronx)
                 display_name = pypi_name.replace("_", "-")
                 canonical_to_display.setdefault(canon, display_name)
             else:
@@ -1993,9 +1991,9 @@ def analyze_batch_repository(
                 summary.matched_packages.add(pkg_name)
             else:
                 canonical_missing_map.setdefault(canon, []).append(res.path.name)
-                canonical_to_display.setdefault(canon, pypi_name)
+                display_name = pypi_name.replace("_", "-")
+                canonical_to_display.setdefault(canon, display_name)
 
-    # Consolidate missing packages under canonical display names
     for canon, nbs in canonical_missing_map.items():
         disp_name = canonical_to_display.get(canon, canon)
         summary.missing_packages[disp_name] = nbs
@@ -2172,7 +2170,8 @@ def apply_output_to_notebook(
     suffix: str = "_merged", 
     in_place: bool = False,
     local_repo_modules: Optional[Set[str]] = None,
-    root_dir: Optional[str] = None
+    root_dir: Optional[str] = None,
+    output_dir: Optional[str] = None
 ) -> Path:
     """Writes per-notebook locked file or replaces setup cells in-place idempotently."""
     if local_repo_modules is None:
@@ -2239,7 +2238,7 @@ def apply_output_to_notebook(
 
     cells = nb_data.get("cells", [])
 
-    # Strip any prior managed setup cells upfront
+    # Idempotent filter: strip prior managed setup blocks
     non_managed_cells = [
         c for c in cells 
         if not (isinstance(c.get("metadata"), dict) and c.get("metadata", {}).get("notebook_env", {}).get("managed") is True)
@@ -2248,6 +2247,23 @@ def apply_output_to_notebook(
 
     if in_place:
         target_path = scan_res.path
+    elif output_dir:
+        out_base = Path(output_dir)
+        stem = scan_res.path.stem
+        active_suffix = suffix if suffix != "_merged" else ""
+        file_name = f"{stem}{active_suffix}.ipynb"
+
+        if root_dir and Path(root_dir).exists():
+            try:
+                rel_parent = scan_res.path.parent.relative_to(Path(root_dir))
+                dest_dir = out_base / rel_parent
+            except ValueError:
+                dest_dir = out_base
+        else:
+            dest_dir = out_base
+
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        target_path = dest_dir / file_name
     else:
         stem = scan_res.path.stem
         target_path = scan_res.path.parent / f"{stem}{suffix}.ipynb"
@@ -2267,12 +2283,13 @@ def run_batch_pipeline(
     precomputed_repo_map: Optional[RepoEnvironmentMap] = None
 ) -> None:
     """Executes the batch processing pipeline across a directory of notebooks."""
-    repo_map = precomputed_repo_map or walk_and_scan_directory(target_batch_dir)
+    skip_suffix = None if args.in_place else args.suffix
+    repo_map = precomputed_repo_map or walk_and_scan_directory(target_batch_dir, skip_suffix=skip_suffix)
     report_text, is_clean = generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, batch_hw_cache)
     print(report_text)
 
-    if not is_clean and (args.universal or args.output or args.in_place):
-        logger.error("\n❌ Execution aborted: Resolve file/parse errors before running --universal, --output, or --in-place.")
+    if not is_clean and (args.universal or args.output or args.in_place or args.output_dir):
+        logger.error("\n❌ Execution aborted: Resolve file/parse errors before running --universal, --output, --output-dir, or --in-place.")
         sys.exit(1)
 
     if args.universal:
@@ -2283,8 +2300,9 @@ def run_batch_pipeline(
             f.write(uni_content)
         logger.info(f"\n✅ Wrote universal repository manifest to '{out_file}'")
 
-    if args.output or args.in_place:
-        logger.info(f"\n🚀 Writing per-notebook locked files ({'in-place' if args.in_place else 'suffix: ' + args.suffix})...")
+    if args.output or args.in_place or args.output_dir:
+        loc_desc = f"directory: '{args.output_dir}'" if args.output_dir else ('in-place' if args.in_place else 'suffix: ' + args.suffix)
+        logger.info(f"\n🚀 Writing per-notebook locked files ({loc_desc})...")
         for res in repo_map.scan_results:
             nb_local_mods = get_notebook_local_modules(res.path, repo_map.target_dir)
             written_path = apply_output_to_notebook(
@@ -2295,9 +2313,10 @@ def run_batch_pipeline(
                 suffix=args.suffix, 
                 in_place=args.in_place,
                 local_repo_modules=nb_local_mods,
-                root_dir=repo_map.target_dir
+                root_dir=repo_map.target_dir,
+                output_dir=args.output_dir
             )
-            logger.info(f"  • Updated '{written_path.name}'")
+            logger.info(f"  • Updated '{written_path}'")
         logger.info("✅ Batch output complete.")
 
     sys.exit(0)
@@ -2417,8 +2436,9 @@ def run_single_file_pipeline(
         magic_notices=magic_notices
     )
 
-    if args.output or args.in_place:
-        logger.info(f"🚀 Writing updated notebook ({'in-place' if args.in_place else 'suffix: ' + args.suffix})...")
+    if args.output or args.in_place or args.output_dir:
+        loc_desc = f"directory: '{args.output_dir}'" if args.output_dir else ('in-place' if args.in_place else 'suffix: ' + args.suffix)
+        logger.info(f"🚀 Writing updated notebook ({loc_desc})...")
         written_path = apply_output_to_notebook(
             single_res,
             frozen_env,
@@ -2427,9 +2447,10 @@ def run_single_file_pipeline(
             suffix=args.suffix,
             in_place=args.in_place,
             local_repo_modules=single_file_local_modules,
-            root_dir=target_single_file_dir
+            root_dir=target_single_file_dir,
+            output_dir=args.output_dir
         )
-        logger.info(f"✅ Updated '{written_path.name}'")
+        logger.info(f"✅ Updated '{written_path}'")
         if in_live_ipython:
             return
         sys.exit(0)
@@ -2473,6 +2494,7 @@ def main() -> None:
         help=f"Generate universal repository manifest (default: '{DEFAULT_UNIVERSAL_MANIFEST_NAME}' when flag is provided)."
     )
     parser.add_argument("--output", action="store_true", help="Generate per-notebook merged lockfiles.")
+    parser.add_argument("--output-dir", metavar="DIR", help="Directory where generated locked notebooks should be written.")
     parser.add_argument("--suffix", default="_merged", help="File suffix for merged notebook outputs (default: '_merged').")
     parser.add_argument("--in-place", action="store_true", help="Overwrite original notebooks in-place instead of creating companion files.")
 
@@ -2486,8 +2508,10 @@ def main() -> None:
     elif args.verbose:
         logger.setLevel(logging.DEBUG)
 
-    if (args.output or args.in_place) and not args.batch and not args.notebook:
-        logger.error("❌ Error: --output or --in-place requires a target notebook file path or --batch directory.")
+    target_batch_dir = args.batch or (args.notebook if args.notebook and os.path.isdir(args.notebook) else None)
+
+    if (args.output or args.in_place or args.output_dir) and not target_batch_dir and not (args.notebook and os.path.isfile(args.notebook)):
+        logger.error("❌ Error: --output, --output-dir, or --in-place requires a target notebook file path or --batch directory.")
         if is_running_in_ipython():
             return
         sys.exit(1)
@@ -2495,11 +2519,9 @@ def main() -> None:
     frozen_env, raw_full_freeze = get_installed_environment()
     pkg_dist_map = importlib.metadata.packages_distributions() if hasattr(importlib.metadata, "packages_distributions") else {}
     
-    target_batch_dir = args.batch or (args.notebook if args.notebook and os.path.isdir(args.notebook) else None)
     initial_imports: List[str] = []
     repo_map_pre: Optional[RepoEnvironmentMap] = None
 
-    # Do NOT skip suffix if --in-place is specified (in-place exists to re-scan and refresh)
     skip_suffix = None if args.in_place else args.suffix
 
     if target_batch_dir:
