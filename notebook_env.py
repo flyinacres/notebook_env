@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-notebook_env.py (v42)
+notebook_env.py (v43)
 Headless Jupyter Notebook Dependency Scanner & Lockfile Generator.
 
 Standalone, zero-dependency utility for analyzing notebook environments,
@@ -22,8 +22,8 @@ see the repository README:
 👉 https://github.com/flyinacres/notebook_env/blob/main/README.md
 
 Execution Modes:
-  1. Single Notebook CLI:  python notebook_env.py notebook.ipynb [--output | --output-dir DIR | --in-place]
-  2. Batch Repo Directory: python notebook_env.py --batch ./repo [--universal [FILENAME]] [--output | --output-dir DIR | --in-place]
+  1. Single Notebook CLI:  python notebook_env.py notebook.ipynb [--format {text,json}] [--output | --output-dir DIR | --in-place]
+  2. Batch Repo Directory: python notebook_env.py --batch ./repo [--format {text,json}] [--universal [FILENAME]] [--output | --output-dir DIR | --in-place]
   3. Live IPython Kernel:   import notebook_env as ne; ne.main()
 """
 
@@ -48,6 +48,8 @@ from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Set, Dict, List, Tuple, Optional, Any, TypedDict, Callable, NamedTuple, Union
 
+TOOL_VERSION: str = "43"
+SCHEMA_VERSION: str = "1.0"
 
 # Force UTF-8 encoding for stdout and stderr on Windows/redirected environments
 if hasattr(sys.stdout, "reconfigure"):
@@ -96,6 +98,55 @@ class StatusLabel:
     ERROR = "error"
     UNKNOWN = "unknown"
     MISSING_METADATA = "missing metadata"
+
+@dataclass
+class DiagnosticEvent:
+    """Represents a structured warning or informational notice."""
+    type: str
+    detail: str
+    cell_idx: Optional[int] = None
+    line_idx: Optional[int] = None
+    level: str = "warning"
+
+    def format_console(self) -> str:
+        prefix = "⚠️" if self.level == "warning" else "ℹ️"
+        return f"{prefix} {self.detail}"
+
+    def __str__(self) -> str:
+        return self.format_console()
+
+    def __contains__(self, item: str) -> bool:
+        return item in self.detail or item in self.format_console()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "type": self.type,
+            "detail": self.detail,
+            "cell_idx": self.cell_idx,
+            "line_idx": self.line_idx,
+        }
+
+
+@dataclass
+class PromotionDetail:
+    """Represents an automatic extras package promotion event."""
+    import_name: str
+    promoted_name: str
+    version: Optional[str] = None
+    detail: str = ""
+
+    def __str__(self) -> str:
+        return self.detail
+
+    def __contains__(self, item: str) -> bool:
+        return item in self.detail or item in self.promoted_name or item in self.import_name
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "import": self.import_name,
+            "promoted_name": self.promoted_name,
+            "version": self.version,
+        }
 
 
 @dataclass
@@ -147,12 +198,16 @@ class DependencyEntry:
         name: Distribution / PyPI package name (e.g., 'torch', 'pandas').
         version: Pinned version string (e.g., '2.3.1+cu121', '2.2.1') or empty if unversioned.
         flags: Scoped CLI flags to pass to pip install (e.g., ['--extra-index-url', 'https://...']).
+        source: Discovery origin ('import', 'pip_command', 'writefile_script').
+        status: Semantic category ('pinned', 'guarded', 'platform_pseudo_module', 'build_tool', 'local_module', 'auxiliary_tool', 'writefile_script').
         is_comment: True if this entry represents a comment, platform pseudo-module, or uninstalled fallback.
         comment_text: Full string representation when is_comment is True.
     """
     name: str = ""
     version: str = ""
     flags: List[str] = field(default_factory=list)
+    source: str = "import"
+    status: str = "pinned"
     is_comment: bool = False
     comment_text: str = ""
 
@@ -171,6 +226,18 @@ class DependencyEntry:
             "flags": self.flags
         }
 
+    def to_report_dict(self) -> Dict[str, Any]:
+        """Converts to full JSON report representation."""
+        return {
+            "name": self.name,
+            "version": self.version if self.version else None,
+            "source": self.source,
+            "status": self.status,
+            "hardware_tagged": ("+" in self.version) if self.version else False,
+            "flags": self.flags,
+            "comment": self.comment_text if self.is_comment else None
+        }
+
 
 @dataclass
 class TimelineResult:
@@ -179,16 +246,17 @@ class TimelineResult:
 
     Fields:
         dependencies: Ordered list of DependencyEntry objects.
-        promotion_notices: Informational messages for extras promotions (e.g., umap -> umap-learn[plot]).
-        conflict_warnings: Warnings regarding overwritten pins or conflicting flags.
+        promotion_notices: Informational PromotionDetail objects.
+        conflict_warnings: Structured diagnostic events for overwritten pins or conflicting flags.
     """
     dependencies: List[DependencyEntry] = field(default_factory=list)
-    promotion_notices: List[str] = field(default_factory=list)
-    conflict_warnings: List[str] = field(default_factory=list)
+    promotion_notices: List[PromotionDetail] = field(default_factory=list)
+    conflict_warnings: List[DiagnosticEvent] = field(default_factory=list)
 
     def __iter__(self):
-        """Unpacking fallback allowing `deps, notices = timeline_result` in tests."""
-        return iter((self.dependencies, self.promotion_notices))
+        """Unpacking fallback allowing `deps, notices = timeline_result` in legacy callers."""
+        notice_strings = [p.detail for p in self.promotion_notices]
+        return iter((self.dependencies, notice_strings))
 
 
 @dataclass
@@ -202,11 +270,53 @@ class GpuInfo:
     framework_devices: Dict[str, Optional[str]] = field(default_factory=dict)
     probe_errors: List[str] = field(default_factory=list)
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "has_gpu": self.has_gpu,
+            "framework": self.active_framework,
+            "device_name": self.device_name,
+            "frameworks_detected": self.frameworks,
+            "probe_errors": self.probe_errors
+        }
+
 
 class BlueprintResult(TypedDict):
     """Cell blueprint output strings for Cell 1 (Markdown) and Cell 2 (Python script)."""
     step1_markdown: str
     step2_code: str
+
+
+@dataclass
+class NotebookAnalysisReport:
+    """Standardized single-notebook analysis report object."""
+    notebook_path: str
+    is_python: bool
+    lang_label: str
+    parse_error: Optional[str] = None
+    dependencies: List[DependencyEntry] = field(default_factory=list)
+    local_modules: List[str] = field(default_factory=list)
+    platform_pseudo_modules: List[str] = field(default_factory=list)
+    build_and_packaging_tools: List[str] = field(default_factory=list)
+    gpu: Optional[GpuInfo] = None
+    warnings: List[DiagnosticEvent] = field(default_factory=list)
+    notices: List[DiagnosticEvent] = field(default_factory=list)
+    promotions: List[PromotionDetail] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "notebook_path": self.notebook_path,
+            "is_python": self.is_python,
+            "lang_label": self.lang_label,
+            "parse_error": self.parse_error,
+            "dependencies": [d.to_report_dict() for d in self.dependencies],
+            "local_modules": self.local_modules,
+            "platform_pseudo_modules": self.platform_pseudo_modules,
+            "build_and_packaging_tools": self.build_and_packaging_tools,
+            "gpu": self.gpu.to_dict() if self.gpu else None,
+            "warnings": [w.to_dict() for w in self.warnings],
+            "notices": [n.to_dict() for n in self.notices],
+            "promotions": [p.to_dict() for p in self.promotions],
+        }
 
 
 @dataclass
@@ -219,7 +329,7 @@ class NotebookScanResult:
     imports: List[str] = field(default_factory=list)
     submodules: Dict[str, Set[str]] = field(default_factory=dict)
     guarded_imports: Set[str] = field(default_factory=set)
-    dynamic_warnings: List[str] = field(default_factory=list)
+    dynamic_warnings: List[DiagnosticEvent] = field(default_factory=list)
     code_sources: List[str] = field(default_factory=list)
     harvested_urls: Optional[Set[str]] = None
     writefile_imports: List[str] = field(default_factory=list)
@@ -227,8 +337,8 @@ class NotebookScanResult:
     base_index_urls: Set[str] = field(default_factory=set)
     extra_index_urls: Set[str] = field(default_factory=set)
     scoped_flags: Dict[str, List[str]] = field(default_factory=dict)
-    magic_warnings: List[str] = field(default_factory=list)
-    magic_notices: List[str] = field(default_factory=list)
+    magic_warnings: List[DiagnosticEvent] = field(default_factory=list)
+    magic_notices: List[DiagnosticEvent] = field(default_factory=list)
 
     def __post_init__(self):
         if self.harvested_urls is None:
@@ -248,11 +358,12 @@ class ExtractionResult:
     code_sources: List[str] = field(default_factory=list)
     error_msg: Optional[str] = None
     guarded_imports: Set[str] = field(default_factory=set)
-    dynamic_warnings: List[str] = field(default_factory=list)
+    dynamic_warnings: List[DiagnosticEvent] = field(default_factory=list)
     writefile_imports: List[str] = field(default_factory=list)
 
     def __iter__(self):
         """Legacy tuple-unpacking fallback for backward compatibility."""
+        dyn_warn_strings = [w.format_console() for w in self.dynamic_warnings]
         return iter((
             self.success,
             self.imports,
@@ -261,7 +372,7 @@ class ExtractionResult:
             self.error_msg,
             self.lang_label,
             self.guarded_imports,
-            self.dynamic_warnings,
+            dyn_warn_strings,
         ))
 
 
@@ -271,18 +382,20 @@ class HarvestResult:
     harvested_packages: Set[str] = field(default_factory=set)
     base_index_urls: Set[str] = field(default_factory=set)
     extra_index_urls: Set[str] = field(default_factory=set)
-    magic_warnings: List[str] = field(default_factory=list)
-    magic_notices: List[str] = field(default_factory=list)
+    magic_warnings: List[DiagnosticEvent] = field(default_factory=list)
+    magic_notices: List[DiagnosticEvent] = field(default_factory=list)
     scoped_flags: Dict[str, List[str]] = field(default_factory=dict)
 
     def __iter__(self):
         """Legacy tuple-unpacking fallback for backward compatibility."""
+        warn_strings = [w.format_console() for w in self.magic_warnings]
+        notice_strings = [n.format_console() for n in self.magic_notices]
         return iter((
             self.harvested_packages,
             self.base_index_urls,
             self.extra_index_urls,
-            self.magic_warnings,
-            self.magic_notices,
+            warn_strings,
+            notice_strings,
         ))
 
 
@@ -294,17 +407,18 @@ class BatchAnalysisSummary:
     non_python_count: int = 0
     non_python_languages: Dict[str, int] = field(default_factory=dict)
     companion_skipped_count: int = 0
-    parse_errors: List[NotebookScanResult] = field(default_factory=list)
+    parse_errors: List[Dict[str, str]] = field(default_factory=list)
     matched_packages: Set[str] = field(default_factory=set)
     missing_packages: Dict[str, List[str]] = field(default_factory=dict)
-    promotions: List[str] = field(default_factory=list)
-    dynamic_warnings: List[str] = field(default_factory=list)
-    magic_warnings: List[str] = field(default_factory=list)
-    magic_notices: List[str] = field(default_factory=list)
+    promotions: List[PromotionDetail] = field(default_factory=list)
+    dynamic_warnings: List[DiagnosticEvent] = field(default_factory=list)
+    magic_warnings: List[DiagnosticEvent] = field(default_factory=list)
+    magic_notices: List[DiagnosticEvent] = field(default_factory=list)
     batch_hardware_warnings: Dict[str, List[str]] = field(default_factory=dict)
     primary_url: Optional[str] = None
     primary_url_reason: Optional[str] = None
     batch_hw_cache: Optional[GpuInfo] = None
+    notebooks: List[NotebookAnalysisReport] = field(default_factory=list)
 
     @property
     def is_clean(self) -> bool:
@@ -328,6 +442,7 @@ IMPORT_TO_PYPI_MAP: Dict[str, str] = {
     "skimage": "scikit-image"
 }
 
+# Standard build and packaging bootstrap tools; excluded from requirement lockfiles
 BUILD_AND_PACKAGING_TOOLS: Set[str] = {
     "pip",
     "setuptools",
@@ -605,7 +720,7 @@ def extract_from_file(
     )
 
 
-def extract_from_active_session() -> Tuple[List[str], Dict[str, Set[str]], List[str], Set[str], List[str]]:
+def extract_from_active_session() -> Tuple[List[str], Dict[str, Set[str]], List[str], Set[str], List[DiagnosticEvent]]:
     """
     Path B (Live Kernel): Reads IPython execution history in chronological order.
     Filters out self-referential notebook_env execution cells and invocation commands.
@@ -622,7 +737,7 @@ def extract_from_active_session() -> Tuple[List[str], Dict[str, Set[str]], List[
             continue
         clean_sources.append(src)
 
-    imports, submodules, guarded_imports, dyn_warnings = extract_imports_from_sources(clean_sources)
+    imports, submodules, guarded_imports, dyn_warnings = extract_imports_from_sources_typed(clean_sources)
     return imports, submodules, clean_sources, guarded_imports, dyn_warnings
 
 
@@ -639,7 +754,7 @@ class NotebookImportVisitor(ast.NodeVisitor):
         self.submodules: Dict[str, Set[str]] = {}
         self.unconditional_imports: Set[str] = set()
         self.raw_guarded_imports: Set[str] = set()
-        self.dynamic_import_warnings: List[str] = []
+        self.dynamic_import_warnings: List[DiagnosticEvent] = []
         self.occurrences: List[ImportOccurrence] = []
         self._guarded_depth: int = 0
         self._in_writefile: bool = False
@@ -730,7 +845,13 @@ class NotebookImportVisitor(ast.NodeVisitor):
             else:
                 expr_repr = ast.unparse(first_arg) if hasattr(ast, "unparse") else "expression"
                 self.dynamic_import_warnings.append(
-                    f"⚠️ Dynamic import detected via variable '{expr_repr}'. Check that this package is installed if execution fails."
+                    DiagnosticEvent(
+                        type="dynamic_import",
+                        detail=f"Dynamic import detected via variable '{expr_repr}'. Check that this package is installed if execution fails.",
+                        cell_idx=self.cell_idx,
+                        line_idx=getattr(node, "lineno", 1) - 1,
+                        level="warning"
+                    )
                 )
 
         self.generic_visit(node)
@@ -765,8 +886,8 @@ def extract_import_occurrences_from_source(source: str, cell_idx: int = 0) -> Li
 
 def extract_imports_from_sources_full(
     code_sources: List[str]
-) -> Tuple[List[str], Dict[str, Set[str]], Set[str], List[str], List[str]]:
-    """Executes single-pass AST traversal returning primary and writefile imports."""
+) -> Tuple[List[str], Dict[str, Set[str]], Set[str], List[DiagnosticEvent], List[str]]:
+    """Executes single-pass AST traversal returning primary and writefile imports with typed diagnostics."""
     visitor = NotebookImportVisitor()
     for cell_idx, source in enumerate(code_sources):
         visitor.cell_idx = cell_idx
@@ -803,7 +924,15 @@ def extract_imports_from_sources_full(
 def extract_imports_from_sources(
     code_sources: List[str]
 ) -> Tuple[List[str], Dict[str, Set[str]], Set[str], List[str]]:
-    """Standard 4-tuple extractor for primary imports in order."""
+    """Legacy 4-tuple extractor for primary imports with formatted strings."""
+    primary_imports, submodules, guarded, dyn_warns, _ = extract_imports_from_sources_full(code_sources)
+    return primary_imports, submodules, guarded, [w.format_console() for w in dyn_warns]
+
+
+def extract_imports_from_sources_typed(
+    code_sources: List[str]
+) -> Tuple[List[str], Dict[str, Set[str]], Set[str], List[DiagnosticEvent]]:
+    """Typed 4-tuple extractor for primary imports returning DiagnosticEvent objects."""
     primary_imports, submodules, guarded, dyn_warns, _ = extract_imports_from_sources_full(code_sources)
     return primary_imports, submodules, guarded, dyn_warns
 
@@ -859,7 +988,6 @@ def classify_cell_source(source: str) -> Tuple[str, str]:
 
     return "PYTHON", source
 
-
 def harvest_pip_install_occurrences(code_sources: List[str]) -> List[PipInstallOccurrence]:
     """
     Walks all cell lines and extracts structured PipInstallOccurrence records.
@@ -889,6 +1017,7 @@ def harvest_pip_install_occurrences(code_sources: List[str]) -> List[PipInstallO
                 line_flags: List[str] = []
                 token_specs: List[Tuple[str, str, str]] = []
 
+                # Pass 1: Harvest all flags across the command segment first
                 i = 0
                 while i < len(tokens):
                     token = tokens[i]
@@ -898,6 +1027,15 @@ def harvest_pip_install_occurrences(code_sources: List[str]) -> List[PipInstallO
                             i += 2
                             continue
                     elif token in PIP_VALUE_FLAGS:
+                        i += 2
+                        continue
+                    i += 1
+
+                # Pass 2: Extract package names and specs
+                i = 0
+                while i < len(tokens):
+                    token = tokens[i]
+                    if token in {"--extra-index-url", "--index-url", "-i", "-f", "--find-links"} or token in PIP_VALUE_FLAGS:
                         i += 2
                         continue
                     elif token.startswith('-') or token.lower() in PIP_SINGLE_FLAGS:
@@ -938,14 +1076,14 @@ def harvest_pip_install_occurrences(code_sources: List[str]) -> List[PipInstallO
 def resolve_pip_occurrences(
     occurrences: List[PipInstallOccurrence],
     is_execution_ordered: bool = True
-) -> Tuple[Dict[str, PipInstallOccurrence], List[str]]:
+) -> Tuple[Dict[str, PipInstallOccurrence], List[DiagnosticEvent]]:
     """
     Applies atomic last-wins resolution across occurrences.
     The later occurrence completely replaces earlier occurrences (name, version, flags indivisibly).
     Emits synchronized confidence-hedged warnings on pin or flag conflicts.
     """
     resolved: Dict[str, PipInstallOccurrence] = {}
-    conflict_warnings: List[str] = []
+    conflict_warnings: List[DiagnosticEvent] = []
     seen_history: Dict[str, List[PipInstallOccurrence]] = {}
 
     for occ in occurrences:
@@ -963,16 +1101,26 @@ def resolve_pip_occurrences(
             versions = [h.version_spec for h in history if h.version_spec]
             if len(set(versions)) > 1:
                 conflict_warnings.append(
-                    f"⚠️ Conflicting Explicit Pins for '{winning_occ.name}': "
-                    f"Resolving to '{winning_occ.name}{winning_occ.version_spec}' ({time_qualifier})."
+                    DiagnosticEvent(
+                        type="conflicting_pin",
+                        detail=f"Conflicting Explicit Pins for '{winning_occ.name}': Resolving to '{winning_occ.name}{winning_occ.version_spec}' ({time_qualifier}).",
+                        cell_idx=winning_occ.cell_idx,
+                        line_idx=winning_occ.line_idx,
+                        level="warning"
+                    )
                 )
 
             flags_history = [tuple(h.flags) for h in history]
             if len(set(flags_history)) > 1:
                 flags_display = " ".join(winning_occ.flags) if winning_occ.flags else "default index (no flags)"
                 conflict_warnings.append(
-                    f"⚠️ Conflicting Scoped Flags for '{winning_occ.name}': "
-                    f"Overwriting earlier flags with '{flags_display}' ({time_qualifier})."
+                    DiagnosticEvent(
+                        type="conflicting_flags",
+                        detail=f"Conflicting Scoped Flags for '{winning_occ.name}': Overwriting earlier flags with '{flags_display}' ({time_qualifier}).",
+                        cell_idx=winning_occ.cell_idx,
+                        line_idx=winning_occ.line_idx,
+                        level="warning"
+                    )
                 )
 
     return resolved, conflict_warnings
@@ -1001,7 +1149,7 @@ def harvest_cell_magics_and_commands(
     harvested_packages: Set[str] = set()
     base_index_urls: Set[str] = set()
     extra_index_urls: Set[str] = set()
-    magic_notices: List[str] = []
+    magic_notices: List[DiagnosticEvent] = []
     scoped_flags: Dict[str, List[str]] = {}
 
     for occ in occurrences:
@@ -1024,7 +1172,7 @@ def harvest_cell_magics_and_commands(
         if cell_type == "WRITEFILE":
             continue
 
-        for line in clean_body.splitlines():
+        for line_idx, line in enumerate(clean_body.splitlines()):
             clean_line = line.strip()
             if not clean_line or clean_line.startswith('#') or clean_line in SHELL_CELL_MAGICS:
                 continue
@@ -1037,16 +1185,34 @@ def harvest_cell_magics_and_commands(
 
                 if SYSTEM_PKG_PATTERN.match(seg):
                     magic_notices.append(
-                        f"ℹ️ Cell {cell_idx} uses a system install command ('{seg}'). Note: System dependencies must be run manually by readers."
+                        DiagnosticEvent(
+                            type="system_command",
+                            detail=f"Cell {cell_idx} uses a system install command ('{seg}'). Note: System dependencies must be run manually by readers.",
+                            cell_idx=cell_idx - 1,
+                            line_idx=line_idx,
+                            level="notice"
+                        )
                     )
                 elif CONDA_INSTALL_PATTERN.match(seg):
                     magic_notices.append(
-                        f"ℹ️ Cell {cell_idx} uses 'conda install'. Conda packages are not tracked in pip requirements manifests."
+                        DiagnosticEvent(
+                            type="conda_command",
+                            detail=f"Cell {cell_idx} uses 'conda install'. Conda packages are not tracked in pip requirements manifests.",
+                            cell_idx=cell_idx - 1,
+                            line_idx=line_idx,
+                            level="notice"
+                        )
                     )
                 elif PIP_INSTALL_PATTERN.match(seg):
                     if "-r " in seg or "--requirement" in seg:
                         magic_warnings.append(
-                            f"⚠️ Cell {cell_idx} references an external requirements file ('{seg}'). Ensure that file is shared alongside your notebook."
+                            DiagnosticEvent(
+                                type="external_requirement",
+                                detail=f"Cell {cell_idx} references an external requirements file ('{seg}'). Ensure that file is shared alongside your notebook.",
+                                cell_idx=cell_idx - 1,
+                                line_idx=line_idx,
+                                level="warning"
+                            )
                         )
 
     return HarvestResult(
@@ -1119,7 +1285,7 @@ def build_unified_timeline(
     timeline_events.sort(key=lambda t: t[0])
 
     dependencies: List[DependencyEntry] = []
-    promotion_notices: List[str] = []
+    promotion_notices: List[PromotionDetail] = []
 
     for coord, kind, pkg_name in timeline_events:
         canon_name = canonicalize_pkg_name(pkg_name)
@@ -1128,9 +1294,10 @@ def build_unified_timeline(
 
         if kind == "PIP":
             occ = resolved_pips[canon_name]
-            dep_entry, notice = resolve_pypi_package_and_extras(
+            dep_entry, promo = resolve_pypi_package_and_extras(
                 occ.name, submods, frozen_env, pkg_dist_map=pkg_dist_map, is_guarded=is_guarded, local_repo_modules=local_repo_modules
             )
+            dep_entry.source = "pip_command"
             if occ.version_spec and not dep_entry.is_comment:
                 v_clean = occ.version_spec.lstrip("=<>!~")
                 dep_entry.version = v_clean
@@ -1144,15 +1311,16 @@ def build_unified_timeline(
                         )
             dep_entry.flags = list(occ.flags)
             dependencies.append(dep_entry)
-            if notice and notice not in promotion_notices:
-                promotion_notices.append(notice)
+            if promo and promo not in promotion_notices:
+                promotion_notices.append(promo)
         else:
-            dep_entry, notice = resolve_pypi_package_and_extras(
+            dep_entry, promo = resolve_pypi_package_and_extras(
                 pkg_name, submods, frozen_env, pkg_dist_map=pkg_dist_map, is_guarded=is_guarded, local_repo_modules=local_repo_modules
             )
+            dep_entry.source = "import"
             dependencies.append(dep_entry)
-            if notice and notice not in promotion_notices:
-                promotion_notices.append(notice)
+            if promo and promo not in promotion_notices:
+                promotion_notices.append(promo)
 
     return TimelineResult(
         dependencies=dependencies,
@@ -1181,14 +1349,34 @@ def build_auxiliary_tool_entries(
     if not unimported_tools:
         return aux_entries
 
-    aux_entries.append(DependencyEntry(is_comment=True, comment_text="\n# --- AUXILIARY TOOL INSTALLS (harvested from cell magics) ---"))
+    aux_entries.append(DependencyEntry(
+        is_comment=True,
+        source="pip_command",
+        status="auxiliary_tool",
+        comment_text="\n# --- AUXILIARY TOOL INSTALLS (harvested from cell magics) ---"
+    ))
     for tool in unimported_tools:
         canon_tool = canonicalize_pkg_name(tool)
         matched_pin = frozen_env.get(canon_tool)
+        ver = matched_pin.split("==", 1)[1] if matched_pin and "==" in matched_pin else ""
         if matched_pin:
-            aux_entries.append(DependencyEntry(is_comment=True, comment_text=f"# {matched_pin}  (installed via cell command; not directly imported in Python code)"))
+            aux_entries.append(DependencyEntry(
+                name=tool,
+                version=ver,
+                source="pip_command",
+                status="auxiliary_tool",
+                is_comment=True,
+                comment_text=f"# {matched_pin}  (installed via cell command; not directly imported in Python code)"
+            ))
         else:
-            aux_entries.append(DependencyEntry(is_comment=True, comment_text=f"# {tool}  (installed via cell command; not found in active env)"))
+            aux_entries.append(DependencyEntry(
+                name=tool,
+                version="",
+                source="pip_command",
+                status="auxiliary_tool",
+                is_comment=True,
+                comment_text=f"# {tool}  (installed via cell command; not found in active env)"
+            ))
 
     return aux_entries
 
@@ -1209,15 +1397,35 @@ def build_writefile_tool_entries(
     if not script_only:
         return entries
 
-    entries.append(DependencyEntry(is_comment=True, comment_text="\n# --- WRITEFILE SCRIPT DEPENDENCIES ---"))
+    entries.append(DependencyEntry(
+        is_comment=True,
+        source="writefile_script",
+        status="writefile_script",
+        comment_text="\n# --- WRITEFILE SCRIPT DEPENDENCIES ---"
+    ))
     for pkg in script_only:
         pypi_name = IMPORT_TO_PYPI_MAP.get(pkg, pkg)
         canon_pypi = canonicalize_pkg_name(pypi_name)
         matched_pin = frozen_env.get(canon_pypi)
+        ver = matched_pin.split("==", 1)[1] if matched_pin and "==" in matched_pin else ""
         if matched_pin:
-            entries.append(DependencyEntry(is_comment=True, comment_text=f"# {matched_pin}  (imported inside script generated via %%writefile)"))
+            entries.append(DependencyEntry(
+                name=pypi_name,
+                version=ver,
+                source="writefile_script",
+                status="writefile_script",
+                is_comment=True,
+                comment_text=f"# {matched_pin}  (imported inside script generated via %%writefile)"
+            ))
         else:
-            entries.append(DependencyEntry(is_comment=True, comment_text=f"# {pypi_name}  (imported inside script generated via %%writefile; not found in active env)"))
+            entries.append(DependencyEntry(
+                name=pypi_name,
+                version="",
+                source="writefile_script",
+                status="writefile_script",
+                is_comment=True,
+                comment_text=f"# {pypi_name}  (imported inside script generated via %%writefile; not found in active env)"
+            ))
 
     return entries
 
@@ -1229,16 +1437,31 @@ def resolve_pypi_package_and_extras(
     pkg_dist_map: Optional[Dict[str, List[str]]] = None,
     is_guarded: bool = False,
     local_repo_modules: Optional[Set[str]] = None
-) -> Tuple[DependencyEntry, Optional[str]]:
+) -> Tuple[DependencyEntry, Optional[PromotionDetail]]:
     """Resolves top-level import to a DependencyEntry."""
     if imp in PLATFORM_PSEUDO_MODULES:
-        return DependencyEntry(is_comment=True, comment_text=f"# {imp} (provided automatically by platform like Colab/Databricks; no install needed)"), None
+        return DependencyEntry(
+            name=imp,
+            status="platform_pseudo_module",
+            is_comment=True,
+            comment_text=f"# {imp} (provided automatically by platform like Colab/Databricks; no install needed)"
+        ), None
 
     if imp in BUILD_AND_PACKAGING_TOOLS:
-        return DependencyEntry(is_comment=True, comment_text=f"# {imp} (core Python build/packaging tool; excluded from requirement lockfiles)"), None
+        return DependencyEntry(
+            name=imp,
+            status="build_tool",
+            is_comment=True,
+            comment_text=f"# {imp} (core Python build/packaging tool; excluded from requirement lockfiles)"
+        ), None
 
     if local_repo_modules and imp in local_repo_modules:
-        return DependencyEntry(is_comment=True, comment_text=f"# {imp} (local folder/file next to notebook; ensure sibling files were shared)"), None
+        return DependencyEntry(
+            name=imp,
+            status="local_module",
+            is_comment=True,
+            comment_text=f"# {imp} (local folder/file next to notebook; ensure sibling files were shared)"
+        ), None
 
     pypi_name = None
     if pkg_dist_map is None and hasattr(importlib.metadata, "packages_distributions"):
@@ -1261,11 +1484,30 @@ def resolve_pypi_package_and_extras(
 
     if is_guarded:
         if matched_pin:
-            return DependencyEntry(is_comment=True, comment_text=f"# {matched_pin} (optional or conditional dependency inside try/except block)"), None
-        return DependencyEntry(is_comment=True, comment_text=f"# {pypi_name} (optional or conditional dependency inside try/except block)"), None
+            ver = matched_pin.split("==", 1)[1]
+            return DependencyEntry(
+                name=pypi_name,
+                version=ver,
+                status="guarded",
+                is_comment=True,
+                comment_text=f"# {matched_pin} (optional or conditional dependency inside try/except block)"
+            ), None
+        return DependencyEntry(
+            name=pypi_name,
+            version="",
+            status="guarded",
+            is_comment=True,
+            comment_text=f"# {pypi_name} (optional or conditional dependency inside try/except block)"
+        ), None
 
     if not matched_pin:
-        return DependencyEntry(is_comment=True, comment_text=f"# {pypi_name} (imported as '{imp}', not currently found in active env)"), None
+        return DependencyEntry(
+            name=pypi_name,
+            version="",
+            status="pinned",
+            is_comment=True,
+            comment_text=f"# {pypi_name} (imported as '{imp}', not currently found in active env)"
+        ), None
 
     pkg_part, ver_part = matched_pin.split("==", 1)
 
@@ -1287,10 +1529,16 @@ def resolve_pypi_package_and_extras(
     if extra_tag:
         promoted_name = f"{pkg_part}[{extra_tag}]"
         promoted_pin = f"{promoted_name}=={ver_part}"
-        notice = f"💡 Extra Dependency Promotion: importing '{imp}.{extra_tag}' automatically promoted requirement to '{promoted_pin}'"
-        return DependencyEntry(name=promoted_name, version=ver_part), notice
+        notice_detail = f"💡 Extra Dependency Promotion: importing '{imp}.{extra_tag}' automatically promoted requirement to '{promoted_pin}'"
+        promo = PromotionDetail(
+            import_name=f"{imp}.{extra_tag}",
+            promoted_name=promoted_name,
+            version=ver_part,
+            detail=notice_detail
+        )
+        return DependencyEntry(name=promoted_name, version=ver_part, status="pinned"), promo
 
-    return DependencyEntry(name=pkg_part, version=ver_part), None
+    return DependencyEntry(name=pkg_part, version=ver_part, status="pinned"), None
 
 
 @_memoize_for_run
@@ -1303,10 +1551,11 @@ def build_manifest_entries(
     local_repo_modules: Optional[Set[str]] = None
 ) -> Tuple[List[str], List[str]]:
     """Builds string-formatted manifest lines for legacy/batch consumers while preserving order."""
-    entries, notices = build_dependency_objects(
+    entries, promotions = build_dependency_objects(
         imports, submodules, frozen_env, pkg_dist_map, guarded_imports, local_repo_modules
     )
     pinned_manifest = [e.specifier for e in entries]
+    notices = [p.detail for p in promotions if p.detail]
     return pinned_manifest, notices
 
 
@@ -1317,10 +1566,10 @@ def build_dependency_objects(
     pkg_dist_map: Optional[Dict[str, List[str]]] = None,
     guarded_imports: Optional[Set[str]] = None,
     local_repo_modules: Optional[Set[str]] = None
-) -> Tuple[List[DependencyEntry], List[str]]:
+) -> Tuple[List[DependencyEntry], List[PromotionDetail]]:
     """Generates typed DependencyEntry instances in first-encountered order."""
     entries: List[DependencyEntry] = []
-    promotion_notices: List[str] = []
+    promotions: List[PromotionDetail] = []
     guarded_set = guarded_imports or set()
 
     for imp in imports:
@@ -1328,14 +1577,14 @@ def build_dependency_objects(
             continue
         submods = submodules.get(imp, set())
         is_guarded = imp in guarded_set
-        dep_entry, notice = resolve_pypi_package_and_extras(
+        dep_entry, promo = resolve_pypi_package_and_extras(
             imp, submods, frozen_env, pkg_dist_map=pkg_dist_map, is_guarded=is_guarded, local_repo_modules=local_repo_modules
         )
         entries.append(dep_entry)
-        if notice and notice not in promotion_notices:
-            promotion_notices.append(notice)
+        if promo and promo not in promotions:
+            promotions.append(promo)
 
-    return entries, promotion_notices
+    return entries, promotions
 
 
 def resolve_opencv_variant(submodules: Optional[Set[str]] = None) -> str:
@@ -1385,7 +1634,7 @@ def process_package_requirements(
     """Legacy compatibility helper: correlates pinned packages with index URLs and auxiliary entries."""
     manifest_output: List[str] = []
     local_tagged_info: List[Tuple[str, List[str]]] = []
-    warnings: List[str] = []
+    warnings_out: List[str] = []
     
     if base_urls:
         for url in sorted(base_urls):
@@ -1402,7 +1651,7 @@ def process_package_requirements(
             all_urls = sorted(harvested_urls.union(base_urls or set()))
             local_tagged_info.append((item, all_urls))
             if not all_urls:
-                warnings.append(item)
+                warnings_out.append(item)
 
     if auxiliary_entries:
         manifest_output.extend(auxiliary_entries)
@@ -1410,7 +1659,7 @@ def process_package_requirements(
     if writefile_entries:
         manifest_output.extend(writefile_entries)
             
-    return manifest_output, local_tagged_info, warnings
+    return manifest_output, local_tagged_info, warnings_out
 
 
 def build_dependency_entries(
@@ -1418,11 +1667,11 @@ def build_dependency_entries(
     scoped_flags: Optional[Dict[str, List[str]]] = None,
     auxiliary_entries: Optional[List[DependencyEntry]] = None,
     writefile_entries: Optional[List[DependencyEntry]] = None
-) -> Tuple[List[DependencyEntry], List[Tuple[str, List[str]]], List[str]]:
+) -> Tuple[List[DependencyEntry], List[Tuple[str, List[str]]], List[DiagnosticEvent]]:
     """Attaches scoped flags to DependencyEntry objects and identifies local hardware tags."""
     flags_map = scoped_flags or {}
     local_tagged_info: List[Tuple[str, List[str]]] = []
-    warnings: List[str] = []
+    warnings_out: List[DiagnosticEvent] = []
     all_entries: List[DependencyEntry] = []
 
     for dep in dependencies:
@@ -1439,7 +1688,13 @@ def build_dependency_entries(
             if '+' in dep.version:
                 local_tagged_info.append((dep.specifier, dep.flags))
                 if not dep.flags:
-                    warnings.append(dep.specifier)
+                    warnings_out.append(
+                        DiagnosticEvent(
+                            type="missing_hardware_index",
+                            detail=f"Specific hardware build detected: `{dep.specifier}` with no download URL harvested in code cells.",
+                            level="warning"
+                        )
+                    )
 
         all_entries.append(dep)
 
@@ -1449,7 +1704,7 @@ def build_dependency_entries(
     if writefile_entries:
         all_entries.extend(writefile_entries)
 
-    return all_entries, local_tagged_info, warnings
+    return all_entries, local_tagged_info, warnings_out
 
 
 # =====================================================================
@@ -1590,6 +1845,47 @@ def inspect_gpu_environment(imported_packages: Any) -> Optional[GpuInfo]:
         framework_devices=framework_devices,
         probe_errors=probe_errors
     )
+
+
+def resolve_notebook_gpu_info(nb_imports: Any, batch_hw_cache: Optional[GpuInfo]) -> Optional[GpuInfo]:
+    """Matches a notebook's specific imports against the active batch hardware cache."""
+    if not batch_hw_cache:
+        return None
+
+    expanded_nb_imports = expand_transitive_frameworks(nb_imports)
+    nb_fw = set(batch_hw_cache.frameworks).intersection(expanded_nb_imports)
+    if not nb_fw:
+        return None
+
+    fw_devices = batch_hw_cache.framework_devices
+    matched_fw = None
+    matched_device = None
+
+    for fw_stem in sorted(nb_fw):
+        if fw_devices.get(fw_stem):
+            matched_fw = fw_stem
+            matched_device = fw_devices[fw_stem]
+            break
+
+    if matched_device:
+        active_label = CANONICAL_TO_FRAMEWORK_DISPLAY.get(matched_fw, matched_fw.capitalize())
+        return GpuInfo(
+            has_gpu=True,
+            type=batch_hw_cache.type,
+            active_framework=active_label,
+            device_name=matched_device,
+            frameworks=sorted(nb_fw),
+            framework_devices=fw_devices
+        )
+    else:
+        return GpuInfo(
+            has_gpu=False,
+            type=None,
+            active_framework=None,
+            device_name=None,
+            frameworks=sorted(nb_fw),
+            framework_devices=fw_devices
+        )
 
 
 # =====================================================================
@@ -1905,6 +2201,61 @@ def walk_and_scan_directory(target_dir: str, skip_suffix: Optional[str] = None) 
     return repo_map
 
 
+def build_single_notebook_report(
+    scan_res: NotebookScanResult,
+    frozen_env: Dict[str, str],
+    pkg_dist_map: Dict[str, List[str]],
+    gpu_info: Optional[GpuInfo],
+    local_repo_modules: Optional[Set[str]] = None
+) -> NotebookAnalysisReport:
+    """Builds a complete NotebookAnalysisReport object for a single notebook."""
+    if local_repo_modules is None:
+        local_repo_modules = get_notebook_local_modules(scan_res.path)
+
+    timeline_res = build_unified_timeline(
+        scan_res.code_sources,
+        frozen_env=frozen_env,
+        pkg_dist_map=pkg_dist_map,
+        local_repo_modules=local_repo_modules
+    )
+
+    timeline_pkgs = {canonicalize_pkg_name(d.name) for d in timeline_res.dependencies if d.name}
+    aux_entries = build_auxiliary_tool_entries(scan_res.harvested_pkgs - timeline_pkgs, scan_res.imports, frozen_env)    
+    writefile_entries = build_writefile_tool_entries(scan_res.writefile_imports, scan_res.imports, frozen_env)
+
+    all_dep_entries, _, hw_warnings = build_dependency_entries(
+        timeline_res.dependencies,
+        scoped_flags=scan_res.scoped_flags,
+        auxiliary_entries=aux_entries,
+        writefile_entries=writefile_entries
+    )
+
+    all_warnings: List[DiagnosticEvent] = []
+    all_warnings.extend(scan_res.dynamic_warnings)
+    all_warnings.extend(scan_res.magic_warnings)
+    all_warnings.extend(timeline_res.conflict_warnings)
+    all_warnings.extend(hw_warnings)
+
+    local_mods_detected = sorted(list(local_repo_modules.intersection(set(scan_res.imports))))
+    pseudo_mods_detected = sorted(list(PLATFORM_PSEUDO_MODULES.intersection(set(scan_res.imports))))
+    build_tools_detected = sorted(list(BUILD_AND_PACKAGING_TOOLS.intersection(set(scan_res.imports))))
+
+    return NotebookAnalysisReport(
+        notebook_path=str(scan_res.path),
+        is_python=scan_res.is_python,
+        lang_label=scan_res.lang_label,
+        parse_error=scan_res.parse_error,
+        dependencies=all_dep_entries,
+        local_modules=local_mods_detected,
+        platform_pseudo_modules=pseudo_mods_detected,
+        build_and_packaging_tools=build_tools_detected,
+        gpu=gpu_info,
+        warnings=all_warnings,
+        notices=scan_res.magic_notices,
+        promotions=timeline_res.promotion_notices
+    )
+
+
 def analyze_batch_repository(
     repo_map: RepoEnvironmentMap, 
     frozen_env: Dict[str, str], 
@@ -1912,12 +2263,17 @@ def analyze_batch_repository(
     batch_hw_cache: Optional[GpuInfo]
 ) -> BatchAnalysisSummary:
     """Aggregates dependency metrics, warnings, and index settings across repository notebooks."""
+    parse_errors_list = [
+        {"path": str(err_res.path), "cause": err_res.parse_error or "Unknown parse error"}
+        for err_res in repo_map.parse_errors
+    ]
+
     summary = BatchAnalysisSummary(
         target_dir=repo_map.target_dir,
         total_python_notebooks=len(repo_map.scan_results),
         non_python_count=len(repo_map.non_python_files),
         companion_skipped_count=len(repo_map.companion_files_skipped),
-        parse_errors=repo_map.parse_errors,
+        parse_errors=parse_errors_list,
         batch_hw_cache=batch_hw_cache
     )
 
@@ -1931,35 +2287,33 @@ def analyze_batch_repository(
 
     for res in repo_map.scan_results:
         nb_local_mods = get_notebook_local_modules(res.path, repo_map.target_dir)
+        nb_gpu_info = resolve_notebook_gpu_info(res.imports, batch_hw_cache)
 
-        timeline_res = build_unified_timeline(
-            res.code_sources,
-            frozen_env=frozen_env,
-            pkg_dist_map=pkg_dist_map,
-            is_execution_ordered=False,
-            local_repo_modules=nb_local_mods
+        nb_report = build_single_notebook_report(
+            res, frozen_env, pkg_dist_map, nb_gpu_info, local_repo_modules=nb_local_mods
         )
+        summary.notebooks.append(nb_report)
 
-        _, local_tagged, _ = build_dependency_entries(
-            timeline_res.dependencies,
-            scoped_flags=res.scoped_flags
-        )
-        for spec, flags in local_tagged:
-            if not flags:
-                summary.batch_hardware_warnings.setdefault(spec, []).append(res.path.name)
+        for dep in nb_report.dependencies:
+            if not dep.is_comment and dep.version and "+" in dep.version:
+                if not dep.flags:
+                    summary.batch_hardware_warnings.setdefault(dep.specifier, []).append(Path(nb_report.notebook_path).name)
 
-        pinned_entries, notes = build_manifest_entries(
-            res.imports, 
-            res.submodules, 
-            frozen_env, 
-            pkg_dist_map, 
-            guarded_imports=res.guarded_imports,
-            local_repo_modules=nb_local_mods
-        )
+            if dep.is_comment:
+                if dep.status in {"platform_pseudo_module", "build_tool", "local_module"}:
+                    continue
+                pypi_name = dep.name or (dep.comment_text.split()[1] if len(dep.comment_text.split()) > 1 else "")
+                if pypi_name:
+                    canon = canonicalize_pkg_name(pypi_name)
+                    canonical_missing_map.setdefault(canon, []).append(Path(nb_report.notebook_path).name)
+                    display_name = pypi_name.replace("_", "-")
+                    canonical_to_display.setdefault(canon, display_name)
+            elif dep.name:
+                summary.matched_packages.add(dep.name.split("[")[0])
 
-        for note in notes:
-            if note not in summary.promotions:
-                summary.promotions.append(note)
+        for promo in nb_report.promotions:
+            if promo not in summary.promotions:
+                summary.promotions.append(promo)
 
         for warn in res.dynamic_warnings:
             if warn not in summary.dynamic_warnings:
@@ -1973,36 +2327,9 @@ def analyze_batch_repository(
             if notice not in summary.magic_notices:
                 summary.magic_notices.append(notice)
 
-        for pin_entry in pinned_entries:
-            if pin_entry.startswith("#"):
-                if "provided automatically" in pin_entry or "local folder/file" in pin_entry:
-                    continue
-                pypi_name = pin_entry.split()[1]
-                canon = canonicalize_pkg_name(pypi_name)
-                canonical_missing_map.setdefault(canon, []).append(res.path.name)
-                display_name = pypi_name.replace("_", "-")
-                canonical_to_display.setdefault(canon, display_name)
-            else:
-                pkg_name = pin_entry.split("==")[0]
-                summary.matched_packages.add(pkg_name)
-
-        for pkg in res.harvested_pkgs:
-            if pkg in STD_LIB or pkg in PLATFORM_PSEUDO_MODULES or pkg in BUILD_AND_PACKAGING_TOOLS or pkg in nb_local_mods:
-                continue
-            pypi_name = IMPORT_TO_PYPI_MAP.get(pkg, pkg)
-            canon = canonicalize_pkg_name(pypi_name)
-            matched_pin = frozen_env.get(canon) or frozen_env.get(pypi_name.lower())
-            if matched_pin:
-                pkg_name = matched_pin.split("==")[0]
-                summary.matched_packages.add(pkg_name)
-            else:
-                canonical_missing_map.setdefault(canon, []).append(res.path.name)
-                display_name = pypi_name.replace("_", "-")
-                canonical_to_display.setdefault(canon, display_name)
-
     for canon, nbs in canonical_missing_map.items():
         disp_name = canonical_to_display.get(canon, canon)
-        summary.missing_packages[disp_name] = nbs
+        summary.missing_packages[disp_name] = sorted(list(set(nbs)))
 
     primary_url, url_reason = select_primary_index_url(repo_map.url_to_notebooks)
     summary.primary_url = primary_url
@@ -2011,7 +2338,7 @@ def analyze_batch_repository(
     return summary
 
 
-def format_batch_report(summary: BatchAnalysisSummary) -> str:
+def format_console_report(summary: BatchAnalysisSummary) -> str:
     """Formats a BatchAnalysisSummary into a human-readable stdout report string."""
     out = []
     out.append("=" * 80)
@@ -2038,9 +2365,9 @@ def format_batch_report(summary: BatchAnalysisSummary) -> str:
 
     if err_count > 0:
         out.append("❌ FILE & PARSE ERRORS:")
-        for err_res in summary.parse_errors:
-            out.append(f"  • {err_res.path}")
-            out.append(f"    └─ Cause: {err_res.parse_error}")
+        for err_dict in summary.parse_errors:
+            out.append(f"  • {err_dict['path']}")
+            out.append(f"    └─ Cause: {err_dict['cause']}")
         out.append("")
 
     out.append(f"📦 REPOSITORY PACKAGE SUMMARY (Across {summary.total_python_notebooks} Python notebooks):")
@@ -2061,21 +2388,21 @@ def format_batch_report(summary: BatchAnalysisSummary) -> str:
     if summary.dynamic_warnings or summary.magic_warnings:
         out.append("⚠️ NOTICES & WARNINGS:")
         for warn in summary.dynamic_warnings:
-            out.append(f"  • {warn}")
+            out.append(f"  • {warn.format_console()}")
         for warn in summary.magic_warnings:
-            out.append(f"  • {warn}")
+            out.append(f"  • {warn.format_console()}")
         out.append("")
 
     if summary.magic_notices:
         out.append("ℹ️ SYSTEM & CONDA COMMANDS:")
         for notice in summary.magic_notices:
-            out.append(f"  • {notice}")
+            out.append(f"  • {notice.format_console()}")
         out.append("")
 
     if summary.promotions:
         out.append("💡 AUTOMATIC EXTRA PROMOTIONS:")
-        for note in summary.promotions:
-            out.append(f"  • {note}")
+        for promo in summary.promotions:
+            out.append(f"  • {promo.detail}")
         out.append("")
 
     out.append("⚡ ACCELERATOR & DOWNLOAD INDEX CHECK:")
@@ -2110,6 +2437,58 @@ def format_batch_report(summary: BatchAnalysisSummary) -> str:
     return "\n".join(out)
 
 
+def format_batch_report(summary: BatchAnalysisSummary) -> str:
+    """Legacy alias redirecting to format_console_report."""
+    return format_console_report(summary)
+
+
+def format_json_batch_report(summary: BatchAnalysisSummary, artifacts_written: Optional[Dict[str, Any]] = None) -> str:
+    """Formats a BatchAnalysisSummary into valid machine-readable JSON."""
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "tool_version": TOOL_VERSION,
+        "mode": "batch",
+        "target_dir": summary.target_dir,
+        "environment": {
+            "active_interpreter": sys.executable,
+            "python_version": [sys.version_info.major, sys.version_info.minor, sys.version_info.micro]
+        },
+        "summary": {
+            "is_clean": summary.is_clean,
+            "total_python_notebooks": summary.total_python_notebooks,
+            "non_python_count": summary.non_python_count,
+            "non_python_languages": summary.non_python_languages,
+            "companion_skipped_count": summary.companion_skipped_count,
+            "parse_errors": summary.parse_errors,
+            "matched_packages": sorted(list(summary.matched_packages)),
+            "missing_packages": summary.missing_packages,
+            "hardware_warnings": summary.batch_hardware_warnings,
+            "promotions": [p.to_dict() for p in summary.promotions],
+            "primary_index_url": summary.primary_url,
+            "primary_index_url_reason": summary.primary_url_reason
+        },
+        "notebooks": [nb.to_dict() for nb in summary.notebooks],
+        "artifacts_written": artifacts_written
+    }
+    return json.dumps(payload, indent=2)
+
+
+def format_json_single_report(nb_report: NotebookAnalysisReport, artifacts_written: Optional[Dict[str, Any]] = None) -> str:
+    """Formats a single NotebookAnalysisReport into valid machine-readable JSON."""
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "tool_version": TOOL_VERSION,
+        "mode": "single_file",
+        "environment": {
+            "active_interpreter": sys.executable,
+            "python_version": [sys.version_info.major, sys.version_info.minor, sys.version_info.micro]
+        },
+        **nb_report.to_dict(),
+        "artifacts_written": artifacts_written
+    }
+    return json.dumps(payload, indent=2)
+
+
 def generate_batch_analysis_report(
     repo_map: RepoEnvironmentMap, 
     frozen_env: Dict[str, str], 
@@ -2118,7 +2497,7 @@ def generate_batch_analysis_report(
 ) -> Tuple[str, bool]:
     """Orchestrates batch repository analysis and returns (report_text, is_clean)."""
     summary = analyze_batch_repository(repo_map, frozen_env, pkg_dist_map, batch_hw_cache)
-    report_text = format_batch_report(summary)
+    report_text = format_console_report(summary)
     return report_text, summary.is_clean
 
 
@@ -2190,7 +2569,8 @@ def apply_output_to_notebook(
         local_repo_modules=local_repo_modules
     )
 
-    aux_entries = build_auxiliary_tool_entries(scan_res.harvested_pkgs, scan_res.imports, frozen_env)
+    timeline_pkgs = {canonicalize_pkg_name(d.name) for d in timeline_res.dependencies if d.name}
+    aux_entries = build_auxiliary_tool_entries(scan_res.harvested_pkgs - timeline_pkgs, scan_res.imports, frozen_env)    
     writefile_entries = build_writefile_tool_entries(scan_res.writefile_imports, scan_res.imports, frozen_env)
     
     all_dep_entries, local_tagged, _ = build_dependency_entries(
@@ -2200,41 +2580,7 @@ def apply_output_to_notebook(
         writefile_entries=writefile_entries
     )
     
-    gpu_info: Optional[GpuInfo] = None
-    if batch_hw_cache:
-        expanded_nb_imports = expand_transitive_frameworks(scan_res.imports)
-        nb_fw = set(batch_hw_cache.frameworks).intersection(expanded_nb_imports)
-        if nb_fw:
-            fw_devices = batch_hw_cache.framework_devices
-            matched_fw = None
-            matched_device = None
-
-            for fw_stem in sorted(nb_fw):
-                if fw_devices.get(fw_stem):
-                    matched_fw = fw_stem
-                    matched_device = fw_devices[fw_stem]
-                    break
-
-            if matched_device:
-                active_label = CANONICAL_TO_FRAMEWORK_DISPLAY.get(matched_fw, matched_fw.capitalize())
-
-                gpu_info = GpuInfo(
-                    has_gpu=True,
-                    type=batch_hw_cache.type,
-                    active_framework=active_label,
-                    device_name=matched_device,
-                    frameworks=sorted(nb_fw),
-                    framework_devices=fw_devices
-                )
-            else:
-                gpu_info = GpuInfo(
-                    has_gpu=False,
-                    type=None,
-                    active_framework=None,
-                    device_name=None,
-                    frameworks=sorted(nb_fw),
-                    framework_devices=fw_devices
-                )
+    gpu_info = resolve_notebook_gpu_info(scan_res.imports, batch_hw_cache)
 
     blueprint = generate_production_blueprint(all_dep_entries, local_tagged_info=local_tagged, gpu_info=gpu_info)
     managed_cells = create_managed_cells(blueprint)
@@ -2293,12 +2639,19 @@ def run_batch_pipeline(
     effective_suffix = args.suffix if args.suffix is not None else "_merged"
     skip_suffix = None if args.in_place else effective_suffix
     repo_map = precomputed_repo_map or walk_and_scan_directory(target_batch_dir, skip_suffix=skip_suffix)
-    report_text, is_clean = generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, batch_hw_cache)
-    print(report_text)
+    summary = analyze_batch_repository(repo_map, frozen_env, pkg_dist_map, batch_hw_cache)
 
-    if not is_clean and (args.universal or args.output or args.in_place or args.output_dir):
+    is_json = getattr(args, "format", "text") == "json"
+    if not is_json:
+        print(format_console_report(summary))
+
+    if not summary.is_clean and (args.universal or args.output or args.in_place or args.output_dir):
         logger.error("\n❌ Execution aborted: Resolve file/parse errors before running --universal, --output, --output-dir, or --in-place.")
+        if is_json:
+            print(format_json_batch_report(summary))
         sys.exit(1)
+
+    artifacts_written: Dict[str, Any] = {}
 
     if args.universal:
         manifest_filename = args.universal if isinstance(args.universal, str) else DEFAULT_UNIVERSAL_MANIFEST_NAME
@@ -2306,6 +2659,7 @@ def run_batch_pipeline(
         out_file = Path(target_batch_dir) / manifest_filename
         with open(out_file, 'w', encoding='utf-8') as f:
             f.write(uni_content)
+        artifacts_written["universal_manifest"] = str(out_file)
         logger.info(f"\n✅ Wrote universal repository manifest to '{out_file}'")
 
     if args.output or args.in_place or args.output_dir:
@@ -2318,6 +2672,7 @@ def run_batch_pipeline(
             loc_desc = f"suffix: '{active_suffix_display}'"
 
         logger.info(f"\n🚀 Writing per-notebook locked files ({loc_desc})...")
+        written_files = []
         for res in repo_map.scan_results:
             nb_local_mods = get_notebook_local_modules(res.path, repo_map.target_dir)
             written_path = apply_output_to_notebook(
@@ -2331,10 +2686,15 @@ def run_batch_pipeline(
                 root_dir=repo_map.target_dir,
                 output_dir=args.output_dir
             )
+            written_files.append(str(written_path))
             logger.info(f"  • Updated '{written_path}'")
+        artifacts_written["locked_notebooks"] = written_files
         logger.info("✅ Batch output complete.")
 
-    sys.exit(0)
+    if is_json:
+        print(format_json_batch_report(summary, artifacts_written=artifacts_written if artifacts_written else None))
+
+    return
 
 
 def run_single_file_pipeline(
@@ -2346,6 +2706,7 @@ def run_single_file_pipeline(
 ) -> None:
     """Executes single-notebook analysis or live IPython kernel history extraction."""
     in_live_ipython = is_running_in_ipython()
+    is_json = getattr(args, "format", "text") == "json"
 
     target_single_file_dir = str(Path(args.notebook).parent) if (args.notebook and not os.path.isdir(args.notebook)) else "."
     single_file_local_modules = discover_local_repo_modules(target_single_file_dir)
@@ -2357,6 +2718,14 @@ def run_single_file_pipeline(
         ext_res = extract_from_file(args.notebook, strict=False)
         if not ext_res.success:
             logger.error(f"❌ Error: {ext_res.error_msg}")
+            if is_json:
+                bad_report = NotebookAnalysisReport(
+                    notebook_path=str(args.notebook),
+                    is_python=False,
+                    lang_label=ext_res.lang_label,
+                    parse_error=ext_res.error_msg
+                )
+                print(format_json_single_report(bad_report))
             if in_live_ipython:
                 return
             sys.exit(1)
@@ -2379,59 +2748,6 @@ def run_single_file_pipeline(
     magic_warns, magic_notices = h_res.magic_warnings, h_res.magic_notices
     harvested_urls = extra_urls.union(base_urls)
 
-    all_warnings = dyn_warnings + magic_warns
-
-    timeline_res = build_unified_timeline(
-        code_sources,
-        frozen_env=frozen_env,
-        pkg_dist_map=pkg_dist_map,
-        local_repo_modules=single_file_local_modules
-    )
-    timeline_deps = timeline_res.dependencies
-    promotion_notices = timeline_res.promotion_notices
-    
-    aux_entries = build_auxiliary_tool_entries(harvested_pkgs, imports, frozen_env)
-    writefile_entries = build_writefile_tool_entries(writefile_imports, imports, frozen_env)
-
-    all_dep_entries, local_tagged_info, warnings = build_dependency_entries(
-        timeline_deps,
-        scoped_flags=h_res.scoped_flags,
-        auxiliary_entries=aux_entries,
-        writefile_entries=writefile_entries
-    )
-    full_freeze_lines = raw_full_freeze if args.full_freeze else None
-
-    if warnings:
-        logger.warning("⚠️ HARDWARE BUILD WARNINGS:")
-        for pkg in warnings:
-            logger.warning(f"  • Specific hardware build detected: `{pkg}`")
-            logger.warning("    No matching download URL was found in code cells. Ensure target machines match this build or supply an --extra-index-url.\n")
-
-    if all_warnings:
-        for warn in all_warnings:
-            logger.warning(f"{warn}")
-        logger.warning("")
-
-    if magic_notices:
-        for notice in magic_notices:
-            logger.info(f"{notice}")
-        logger.info("")
-
-    if gpu_info:
-        if gpu_info.has_gpu:
-            logger.info(f"⚡ Active accelerator detected: {gpu_info.device_name}\n")
-        elif gpu_info.probe_errors:
-            err_msg = "; ".join(gpu_info.probe_errors)
-            logger.warning(f"⚠️ Accelerator detection encountered errors: {err_msg}\n")
-        elif gpu_info.frameworks:
-            fw_list = ", ".join(gpu_info.frameworks)
-            logger.warning(f"⚠️ Acceleration Framework ({fw_list}) imported, but NO active accelerator detected in host runtime.\n")
-
-    if promotion_notices:
-        for note in promotion_notices:
-            logger.info(note)
-        logger.info("")
-
     single_res = NotebookScanResult(
         path=Path(args.notebook) if args.notebook and not os.path.isdir(args.notebook) else Path("session.ipynb"),
         is_python=True,
@@ -2450,6 +2766,39 @@ def run_single_file_pipeline(
         magic_warnings=magic_warns,
         magic_notices=magic_notices
     )
+
+    nb_report = build_single_notebook_report(
+        single_res, frozen_env, pkg_dist_map, gpu_info, local_repo_modules=single_file_local_modules
+    )
+
+    if not is_json:
+        if nb_report.warnings:
+            logger.warning("⚠️ DIAGNOSTIC WARNINGS:")
+            for warn in nb_report.warnings:
+                logger.warning(f"  • {warn.detail}")
+            logger.warning("")
+
+        if nb_report.notices:
+            for notice in nb_report.notices:
+                logger.info(notice.format_console())
+            logger.info("")
+
+        if gpu_info:
+            if gpu_info.has_gpu:
+                logger.info(f"⚡ Active accelerator detected: {gpu_info.device_name}\n")
+            elif gpu_info.probe_errors:
+                err_msg = "; ".join(gpu_info.probe_errors)
+                logger.warning(f"⚠️ Accelerator detection encountered errors: {err_msg}\n")
+            elif gpu_info.frameworks:
+                fw_list = ", ".join(gpu_info.frameworks)
+                logger.warning(f"⚠️ Acceleration Framework ({fw_list}) imported, but NO active accelerator detected in host runtime.\n")
+
+        if nb_report.promotions:
+            for promo in nb_report.promotions:
+                logger.info(promo.detail)
+            logger.info("")
+
+    artifacts_written: Optional[Dict[str, Any]] = None
 
     if args.output or args.in_place or args.output_dir:
         active_suffix_display = args.suffix if args.suffix is not None else ("" if args.output_dir else "_merged")
@@ -2472,15 +2821,24 @@ def run_single_file_pipeline(
             root_dir=target_single_file_dir,
             output_dir=args.output_dir
         )
+        artifacts_written = {"locked_notebook": str(written_path)}
         logger.info(f"✅ Updated '{written_path}'")
+        if is_json:
+            print(format_json_single_report(nb_report, artifacts_written=artifacts_written))
         if in_live_ipython:
             return
-        sys.exit(0)
+        return
 
+    if is_json:
+        print(format_json_single_report(nb_report))
+        if in_live_ipython:
+            return
+        return
+
+    full_freeze_lines = raw_full_freeze if args.full_freeze else None
     blueprint = generate_production_blueprint(
-        all_dep_entries, 
+        nb_report.dependencies, 
         full_freeze_lines=full_freeze_lines, 
-        local_tagged_info=local_tagged_info,
         gpu_info=gpu_info
     )
 
@@ -2500,6 +2858,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Generate environment lockfiles for Jupyter Notebooks.")
     parser.add_argument("notebook", nargs="?", help="Path to target .ipynb file or directory (when using --batch).")
+    parser.add_argument("--format", choices=["text", "json"], default="text", help="Output report format (default: 'text').")
     parser.add_argument("--full-freeze", action="store_true", help="Append full environment pip freeze after targeted manifest.")
     parser.add_argument("--quiet", action="store_true", help="Suppress diagnostic and status logging outputs.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose debug output.")
