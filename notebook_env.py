@@ -328,6 +328,12 @@ IMPORT_TO_PYPI_MAP: Dict[str, str] = {
     "skimage": "scikit-image"
 }
 
+BUILD_AND_PACKAGING_TOOLS: Set[str] = {
+    "pip",
+    "setuptools",
+    "wheel"
+}
+
 PLATFORM_PSEUDO_MODULES: Set[str] = {
     "dbutils",
     "kaggle_secrets",
@@ -335,9 +341,6 @@ PLATFORM_PSEUDO_MODULES: Set[str] = {
     "pyspark.dbutils",
     "__main__",
     "notebook_env",
-    "pip",
-    "setuptools",
-    "wheel",
     "databricks"
 }
 
@@ -1231,6 +1234,9 @@ def resolve_pypi_package_and_extras(
     if imp in PLATFORM_PSEUDO_MODULES:
         return DependencyEntry(is_comment=True, comment_text=f"# {imp} (provided automatically by platform like Colab/Databricks; no install needed)"), None
 
+    if imp in BUILD_AND_PACKAGING_TOOLS:
+        return DependencyEntry(is_comment=True, comment_text=f"# {imp} (core Python build/packaging tool; excluded from requirement lockfiles)"), None
+
     if local_repo_modules and imp in local_repo_modules:
         return DependencyEntry(is_comment=True, comment_text=f"# {imp} (local folder/file next to notebook; ensure sibling files were shared)"), None
 
@@ -1981,7 +1987,7 @@ def analyze_batch_repository(
                 summary.matched_packages.add(pkg_name)
 
         for pkg in res.harvested_pkgs:
-            if pkg in STD_LIB or pkg in PLATFORM_PSEUDO_MODULES or pkg in nb_local_mods:
+            if pkg in STD_LIB or pkg in PLATFORM_PSEUDO_MODULES or pkg in BUILD_AND_PACKAGING_TOOLS or pkg in nb_local_mods:
                 continue
             pypi_name = IMPORT_TO_PYPI_MAP.get(pkg, pkg)
             canon = canonicalize_pkg_name(pypi_name)

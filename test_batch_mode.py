@@ -291,10 +291,12 @@ class TestBatchOrchestration:
         """'skimage' must resolve to 'scikit-image' in PyPI mapping."""
         assert ne.IMPORT_TO_PYPI_MAP.get("skimage") == "scikit-image"
 
-    def test_platform_pseudo_modules_contains_bootstrap_tools(self):
-        """'pip', 'setuptools', 'wheel', 'databricks', and 'notebook_env' must be excluded from missing packages."""
-        for mod in ("pip", "setuptools", "wheel", "databricks", "notebook_env"):
+    def test_platform_pseudo_and_build_tools_defined(self):
+        """'databricks' and 'notebook_env' in pseudo modules; 'pip', 'setuptools', 'wheel' in build tools."""
+        for mod in ("databricks", "notebook_env"):
             assert mod in ne.PLATFORM_PSEUDO_MODULES
+        for tool in ("pip", "setuptools", "wheel"):
+            assert tool in ne.BUILD_AND_PACKAGING_TOOLS
 
     def test_batch_summary_deduplicates_and_hyphenates_uninstalled_packages(self, tmp_path):
         """
