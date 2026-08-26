@@ -599,10 +599,13 @@ def _memoize_for_run(func: Callable) -> Callable:
 
     def _cache_key_part(value: Any) -> Any:
         if isinstance(value, dict):
-            return id(value)
+            # Recursively convert dict keys and values to an immutable, sorted tuple
+            return tuple(sorted((k, _cache_key_part(v)) for k, v in value.items()))
         if isinstance(value, set):
-            return frozenset(value)
+            return frozenset(_cache_key_part(item) for item in value)
         if isinstance(value, list):
+            return tuple(_cache_key_part(item) for item in value)
+        if isinstance(value, tuple):
             return tuple(_cache_key_part(item) for item in value)
         return value
 

@@ -944,13 +944,8 @@ class TestMemoizeForRun:
 
     def test_build_manifest_entries_distinct_equal_dicts_not_treated_as_cache_hit(self, monkeypatch):
         """
-        Documents an intentional limitation, not a bug: dict arguments are keyed
-        by id() rather than content (see _memoize_for_run docstring — re-hashing
-        a potentially large frozen_env/pkg_dist_map on every call would cost more
-        than caching saves). So two distinct dict objects with equal content are
-        correctly treated as a cache MISS, not a false-positive hit. This is the
-        safe direction to fail in: the worst case is a missed optimization, never
-        a wrong answer served from an unrelated dict.
+        Verifies that calls with distinct dict objects having identical content
+        correctly hit the cache without re-resolving dependencies.
         """
         call_count = {"n": 0}
         real_resolve = ne.resolve_pypi_package_and_extras
@@ -967,11 +962,11 @@ class TestMemoizeForRun:
 
         r1 = ne.build_manifest_entries(imports, {}, frozen_env)
         calls_after_first = call_count["n"]
-        r2 = ne.build_manifest_entries(imports, {}, frozen_env)  # a *different* {} object, same content
+        r2 = ne.build_manifest_entries(imports, {}, frozen_env)  # distinct {} literal, same content
 
-        assert r1 == r2, "results must still be correct even without a cache hit"
-        assert call_count["n"] == calls_after_first * 2, "distinct dict objects must not be conflated into one cache entry"
-
+        assert r1 == r2, "results must match"
+        assert call_count["n"] == calls_after_first, "equal dict contents should hit the cache"
+        
     def test_build_manifest_entries_different_imports_not_conflated(self):
         ne.build_manifest_entries.cache_clear()
         frozen_env = {"pandas": "pandas==2.2.0", "numpy": "numpy==1.26.0"}
