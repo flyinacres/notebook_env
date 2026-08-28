@@ -610,6 +610,8 @@ def _memoize_for_run(func: Callable) -> Callable:
         return value
 
     def _defensive_copy(value: Any) -> Any:
+        if isinstance(value, dict):
+            return dict(value)
         if isinstance(value, set):
             return set(value)
         if isinstance(value, list):

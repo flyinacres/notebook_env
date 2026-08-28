@@ -956,17 +956,23 @@ class TestMemoizeForRun:
 
         monkeypatch.setattr(ne, "resolve_pypi_package_and_extras", counting_resolve)
         ne.build_manifest_entries.cache_clear()
+        if hasattr(ne.resolve_pypi_package_and_extras, "cache_clear"):
+            ne.resolve_pypi_package_and_extras.cache_clear()
 
         imports = {"pandas"}
         frozen_env = {"pandas": "pandas==2.2.0"}
 
+        # 1. First call must execute resolution and record >= 1 call
         r1 = ne.build_manifest_entries(imports, {}, frozen_env)
         calls_after_first = call_count["n"]
-        r2 = ne.build_manifest_entries(imports, {}, frozen_env)  # distinct {} literal, same content
+        assert calls_after_first > 0, "First call must actively invoke dependency resolution"
 
-        assert r1 == r2, "results must match"
-        assert call_count["n"] == calls_after_first, "equal dict contents should hit the cache"
-        
+        # 2. Second call with a fresh distinct {} literal MUST hit build_manifest_entries cache
+        r2 = ne.build_manifest_entries(imports, {}, frozen_env)
+
+        assert r1 == r2, "Results must match between cached runs"
+        assert call_count["n"] == calls_after_first, "Distinct dicts with identical content must not re-invoke resolution"
+
     def test_build_manifest_entries_different_imports_not_conflated(self):
         ne.build_manifest_entries.cache_clear()
         frozen_env = {"pandas": "pandas==2.2.0", "numpy": "numpy==1.26.0"}
