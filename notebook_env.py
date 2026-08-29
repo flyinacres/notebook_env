@@ -2017,7 +2017,8 @@ for idx, item in enumerate(DEPENDENCIES, start=1):
     flags = item.get("flags", [])
     specifier = f"{{name}}=={{ver}}" if ver else name
 
-    # Step 1: Pre-install inspection (skips redundant installs in pre-baked environments)
+    # Step 1: Pre-install inspection
+    # Avoids redundant re-installations in pre-configured platforms (Colab, Kaggle)
     already_satisfied = False
     try:
         current_ver = importlib.metadata.version(name)
@@ -2032,18 +2033,65 @@ for idx, item in enumerate(DEPENDENCIES, start=1):
     if already_satisfied:
         continue
 
-    # Step 2: Non-blocking subprocess execution
+    # Step 2: Non-blocking, progressive streaming installation
+    # Flags explanation:
+    # - "--no-input": Prevents pip from prompting for credentials or confirmation on stdin
+    # - "--disable-pip-version-check": Eliminates network overhead checking for newer pip releases
+    # - "--no-warn-script-location": Suppresses path warnings for binaries installed into user/local bins
     cmd = [
         sys.executable, "-m", "pip", "install",
         "--no-input",
         "--disable-pip-version-check",
+        "--no-warn-script-location",
         specifier
     ] + flags
-    result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
 
-    if result.returncode == 0:
+    print(f"[{{idx}}/{{total_deps}}] 📦 Installing {{specifier}}...")
+    sys.stdout.flush()
+
+    # Streaming subprocess configuration:
+    # - stdin=subprocess.DEVNULL: Closes stdin to guarantee subprocess cannot block waiting on interactive input
+    # - stdout=subprocess.PIPE, stderr=subprocess.STDOUT: Merges output streams to preserve chronological output
+    # - text=True, bufsize=1: Enables line-buffered text mode for real-time progress logging
+    # - timeout=180: Safeguards against dead socket stalls by raising TimeoutExpired after 3 minutes per package
+    captured_output = []
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True
+        )
+        stdout_data, _ = proc.communicate(timeout=120)
+        returncode = proc.returncode
+        for line in stdout_data.splitlines():
+            if line.strip():
+                print(f"    {{line}}")
+        sys.stdout.flush()
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stdout_data, _ = proc.communicate()
+        returncode = -1
+        print("    ❌ Installation timed out after 120s.")
+
+    except subprocess.TimeoutExpired:
+        if proc:
+            proc.kill()
+        returncode = -1
+        captured_output.append("Error: Subprocess installation exceeded per-package timeout limit (180s).")
+        print("    ❌ Installation timed out after 180s.")
+        sys.stdout.flush()
+
+    except Exception as exc:
+        returncode = -1
+        captured_output.append(f"Execution failed: {{exc}}")
+        print(f"    ❌ Execution failed: {{exc}}")
+        sys.stdout.flush()
+
+    if returncode == 0:
         passed_count += 1
-        print(f"[{{idx}}/{{total_deps}}] ✅ {{specifier}} installed successfully")
+        print(f"    ✅ {{specifier}} installed successfully")
         
         # Real-time drift audit across previously installed dependencies
         try:
@@ -2063,13 +2111,13 @@ for idx, item in enumerate(DEPENDENCIES, start=1):
             except Exception:
                 pass
     else:
-        failed_packages.append((specifier, ver, flags, result.stderr))
-        print(f"[{{idx}}/{{total_deps}}] ❌ {{specifier}} failed to install")
-        print(f"   ├─ Author Verified Version: {{ver or 'unspecified'}}")
+        err_snippet = captured_output[-1] if captured_output else "Unknown pip error"
+        failed_packages.append((specifier, ver, flags, "\\n".join(captured_output)))
+        print(f"    ❌ {{specifier}} failed to install (exit code {{returncode}})")
+        print(f"       ├─ Author Verified Version: {{ver or 'unspecified'}}")
         if flags:
-            print(f"   ├─ Scoped Flags: {{' '.join(flags)}}")
-        err_snippet = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "Unknown pip error"
-        print(f"   └─ Error: {{err_snippet}}\\n")
+            print(f"       ├─ Scoped Flags: {{' '.join(flags)}}")
+        print(f"       └─ Error: {{err_snippet}}\\n")
 
 print("\\n" + "=" * 60)
 if not failed_packages:

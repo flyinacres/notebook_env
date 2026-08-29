@@ -25,7 +25,13 @@ docker run --rm \
     for nb in "${FIXTURES[@]}"; do
       echo "=== [COLAB] Processing: ${nb} ==="
       python3 notebook_env.py "${nb}" --output
-      jupyter nbconvert --to notebook --execute "${nb%.ipynb}_merged.ipynb" --output "/tmp/out.ipynb"
+      jupyter nbconvert \
+        --to notebook \
+        --execute "${nb%.ipynb}_merged.ipynb" \
+        --output "/tmp/out.ipynb" \
+        --ExecutePreprocessor.timeout=300 \
+        --NotebookClient.extra_arguments="--IPKernelApp.kernel_class=ipykernel.ipkernel.IPythonKernel" \
+        --NotebookClient.extra_arguments="--InteractiveShellApp.extensions=[]"
       echo ">>> PASS: ${nb}"
     done
   '
