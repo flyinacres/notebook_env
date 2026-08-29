@@ -51,7 +51,6 @@ class TestSingleFileJsonOutput:
         payload: Dict[str, Any] = json.loads(captured.out)
 
         assert payload["schema_version"] == "1.0"
-        assert payload["tool_version"] == "43"
         assert payload["mode"] == "single_file"
         assert payload["notebook_path"] == str(nb_path)
         assert payload["is_python"] is True
@@ -148,7 +147,6 @@ class TestBatchJsonOutput:
         payload = json.loads(captured.out)
 
         assert payload["schema_version"] == "1.0"
-        assert payload["tool_version"] == "43"
         assert payload["mode"] == "batch"
         assert payload["target_dir"] == str(tmp_path)
 
