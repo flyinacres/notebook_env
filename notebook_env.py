@@ -1,6 +1,7 @@
+#!/usr/bin/env bash
 #!/usr/bin/env python3
 """
-notebook_env.py (v43)
+notebook_env.py (v44)
 Headless Jupyter Notebook Dependency Scanner & Lockfile Generator.
 
 Standalone, zero-dependency utility for analyzing notebook environments,
@@ -36,6 +37,7 @@ import json
 import os
 import re
 import sys
+import uuid
 import argparse
 import contextlib
 import functools
@@ -48,7 +50,7 @@ from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Set, Dict, List, Tuple, Optional, Any, TypedDict, Callable, NamedTuple, Union
 
-TOOL_VERSION: str = "43"
+TOOL_VERSION: str = "44"
 SCHEMA_VERSION: str = "1.0"
 
 # Force UTF-8 encoding for stdout and stderr on Windows/redirected environments
@@ -599,7 +601,6 @@ def _memoize_for_run(func: Callable) -> Callable:
 
     def _cache_key_part(value: Any) -> Any:
         if isinstance(value, dict):
-            # Recursively convert dict keys and values to an immutable, sorted tuple
             return tuple(sorted((k, _cache_key_part(v)) for k, v in value.items()))
         if isinstance(value, set):
             return frozenset(_cache_key_part(item) for item in value)
@@ -2016,8 +2017,29 @@ for idx, item in enumerate(DEPENDENCIES, start=1):
     flags = item.get("flags", [])
     specifier = f"{{name}}=={{ver}}" if ver else name
 
-    cmd = [sys.executable, "-m", "pip", "install", specifier] + flags
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # Step 1: Pre-install inspection (skips redundant installs in pre-baked environments)
+    already_satisfied = False
+    try:
+        current_ver = importlib.metadata.version(name)
+        if not ver or current_ver == ver:
+            already_satisfied = True
+            passed_count += 1
+            installed_baseline[name] = current_ver
+            print(f"[{{idx}}/{{total_deps}}] ⚡ {{name}} ({{current_ver}}) already satisfied in environment")
+    except Exception:
+        pass
+
+    if already_satisfied:
+        continue
+
+    # Step 2: Non-blocking subprocess execution
+    cmd = [
+        sys.executable, "-m", "pip", "install",
+        "--no-input",
+        "--disable-pip-version-check",
+        specifier
+    ] + flags
+    result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
 
     if result.returncode == 0:
         passed_count += 1
@@ -2067,9 +2089,10 @@ print("=" * 60)"""
 
 
 def create_managed_cells(blueprint: BlueprintResult) -> List[Dict[str, Any]]:
-    """Creates cell dicts stamped with notebook_env managed metadata."""
+    """Creates cell dicts stamped with notebook_env managed metadata and RFC-compliant IDs."""
     cell1 = {
         "cell_type": "markdown",
+        "id": f"ne-{uuid.uuid4().hex[:6]}",
         "metadata": {
             "notebook_env": {
                 "managed": True,
@@ -2081,6 +2104,7 @@ def create_managed_cells(blueprint: BlueprintResult) -> List[Dict[str, Any]]:
     cell2 = {
         "cell_type": "code",
         "execution_count": None,
+        "id": f"ne-{uuid.uuid4().hex[:6]}",
         "metadata": {
             "notebook_env": {
                 "managed": True,
