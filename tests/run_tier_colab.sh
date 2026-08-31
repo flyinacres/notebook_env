@@ -5,9 +5,8 @@ IMAGE="us-docker.pkg.dev/colab-images/public/runtime:latest"
 WORKSPACE="$(pwd)"
 
 FIXTURES=(
-  "fixtures/execution_safe/clean_baseline.ipynb"
-  "fixtures/execution_safe/pinned_install.ipynb"
-  "fixtures/execution_safe/platform_pseudo_module.ipynb"
+  "fixtures/execution_safe/test_pip_satisfied.ipynb"
+  "fixtures/execution_safe/test_pip_unmanaged_reinstall.ipynb"
 )
 
 echo "=== Pulling Colab Runtime Image ==="
