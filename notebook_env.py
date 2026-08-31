@@ -2049,40 +2049,35 @@ for idx, item in enumerate(DEPENDENCIES, start=1):
     print(f"[{{idx}}/{{total_deps}}] 📦 Installing {{specifier}}...")
     sys.stdout.flush()
 
-    # Streaming subprocess configuration:
+        # Streaming subprocess configuration:
     # - stdin=subprocess.DEVNULL: Closes stdin to guarantee subprocess cannot block waiting on interactive input
     # - stdout=subprocess.PIPE, stderr=subprocess.STDOUT: Merges output streams to preserve chronological output
     # - text=True, bufsize=1: Enables line-buffered text mode for real-time progress logging
     # - timeout=180: Safeguards against dead socket stalls by raising TimeoutExpired after 3 minutes per package
     captured_output = []
     try:
-        proc = subprocess.Popen(
+        proc = subprocess.run(
             cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True
+            text=True,
+            close_fds=True,
+            timeout=120
         )
-        stdout_data, _ = proc.communicate(timeout=120)
         returncode = proc.returncode
-        for line in stdout_data.splitlines():
-            if line.strip():
-                print(f"    {{line}}")
+        if proc.stdout:
+            for line in proc.stdout.splitlines():
+                if line.strip():
+                    print(f"    {{line}}")
+                    captured_output.append(line)
         sys.stdout.flush()
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        stdout_data, _ = proc.communicate()
+    except subprocess.TimeoutExpired as exc:
         returncode = -1
+        timeout_msg = "Error: Subprocess installation exceeded per-package timeout limit (120s)."
+        captured_output.append(timeout_msg)
         print("    ❌ Installation timed out after 120s.")
-
-    except subprocess.TimeoutExpired:
-        if proc:
-            proc.kill()
-        returncode = -1
-        captured_output.append("Error: Subprocess installation exceeded per-package timeout limit (180s).")
-        print("    ❌ Installation timed out after 180s.")
         sys.stdout.flush()
-
     except Exception as exc:
         returncode = -1
         captured_output.append(f"Execution failed: {{exc}}")
