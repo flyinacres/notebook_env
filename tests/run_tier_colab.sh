@@ -1,37 +1,41 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eo pipefail
 
 IMAGE="us-docker.pkg.dev/colab-images/public/runtime:latest"
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WORKSPACE="$(pwd)"
 
-docker run --rm \
-  --platform linux/amd64 \
-  --entrypoint /bin/bash \
-  -v "${REPO_ROOT}:/workspace" \
-  -w /workspace \
-  -e PYTHONPATH="/workspace" \
-  -e PYDEVD_DISABLE_FILE_VALIDATION=1 \
-  -e PYTHONUNBUFFERED=1 \
-  "${IMAGE}" \
-  -c '
-    set -euo pipefail
+FIXTURES=(
+  "fixtures/execution_safe/clean_baseline.ipynb"
+  "fixtures/execution_safe/pinned_install.ipynb"
+  "fixtures/execution_safe/platform_pseudo_module.ipynb"
+)
 
-    FIXTURES=(
-      "fixtures/execution_safe/clean_baseline.ipynb"
-      "fixtures/execution_safe/pinned_install.ipynb"
-      "fixtures/execution_safe/platform_pseudo_module.ipynb"
-    )
+echo "=== Pulling Colab Runtime Image ==="
+docker pull --platform linux/amd64 "${IMAGE}"
 
-    for nb in "${FIXTURES[@]}"; do
-      echo "=== [COLAB] Processing: ${nb} ==="
-      python3 notebook_env.py "${nb}" --output
-      jupyter nbconvert \
-        --to notebook \
-        --execute "${nb%.ipynb}_merged.ipynb" \
-        --output "/tmp/out.ipynb" \
-        --ExecutePreprocessor.timeout=300 \
-        --NotebookClient.extra_arguments="--IPKernelApp.kernel_class=ipykernel.ipkernel.IPythonKernel" \
-        --NotebookClient.extra_arguments="--InteractiveShellApp.extensions=[]"
-      echo ">>> PASS: ${nb}"
-    done
-  '
+for nb in "${FIXTURES[@]}"; do
+  echo "=== [COLAB] Processing: ${nb} ==="
+  
+  merged_nb="${nb%.ipynb}_merged.ipynb"
+
+  # Run both analysis/generation AND execution inside the container
+  docker run --rm \
+    --platform linux/amd64 \
+    -v "${WORKSPACE}:/workspace" \
+    -w /workspace \
+    -e PYDEVD_DISABLE_FILE_VALIDATION=1 \
+    -e PYTHONUNBUFFERED=1 \
+    --entrypoint /bin/bash \
+    "${IMAGE}" \
+    -c "python3 notebook_env.py \"${nb}\" --output && \
+        jupyter nbconvert \
+          --to notebook \
+          --execute \"${merged_nb}\" \
+          --output \"/tmp/out.ipynb\" \
+          --ExecutePreprocessor.timeout=300 \
+          --ExecutePreprocessor.kernel_name=python3"
+      
+  echo ">>> PASS: ${nb}"
+done
+
+echo "All Colab tier execution tests completed successfully."

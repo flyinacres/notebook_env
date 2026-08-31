@@ -1980,6 +1980,7 @@ def generate_production_blueprint(
 
 import sys
 import subprocess
+import tempfile
 import importlib.metadata
 
 REQUIRED_PYTHON = ({py_major}, {py_minor})
@@ -2033,11 +2034,11 @@ for idx, item in enumerate(DEPENDENCIES, start=1):
     if already_satisfied:
         continue
 
-    # Step 2: Non-blocking, progressive streaming installation
+    # Step 2: Non-blocking installation via disk-backed stream redirection
     # Flags explanation:
-    # - "--no-input": Prevents pip from prompting for credentials or confirmation on stdin
-    # - "--disable-pip-version-check": Eliminates network overhead checking for newer pip releases
-    # - "--no-warn-script-location": Suppresses path warnings for binaries installed into user/local bins
+    # - "--no-input": Prevents pip from prompting on stdin
+    # - "--disable-pip-version-check": Eliminates overhead checking for newer pip releases
+    # - "--no-warn-script-location": Suppresses path warnings for local bin paths
     cmd = [
         sys.executable, "-m", "pip", "install",
         "--no-input",
@@ -2049,30 +2050,27 @@ for idx, item in enumerate(DEPENDENCIES, start=1):
     print(f"[{{idx}}/{{total_deps}}] 📦 Installing {{specifier}}...")
     sys.stdout.flush()
 
-        # Streaming subprocess configuration:
-    # - stdin=subprocess.DEVNULL: Closes stdin to guarantee subprocess cannot block waiting on interactive input
-    # - stdout=subprocess.PIPE, stderr=subprocess.STDOUT: Merges output streams to preserve chronological output
-    # - text=True, bufsize=1: Enables line-buffered text mode for real-time progress logging
-    # - timeout=180: Safeguards against dead socket stalls by raising TimeoutExpired after 3 minutes per package
     captured_output = []
+    returncode = 0
+
     try:
-        proc = subprocess.run(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            close_fds=True,
-            timeout=120
-        )
-        returncode = proc.returncode
-        if proc.stdout:
-            for line in proc.stdout.splitlines():
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as tmp_out:
+            proc = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=tmp_out,
+                stderr=subprocess.STDOUT,
+                timeout=120
+            )
+            returncode = proc.returncode
+            tmp_out.seek(0)
+            raw_text = tmp_out.read()
+            for line in raw_text.splitlines():
                 if line.strip():
-                    print(f"    {{line}}")
                     captured_output.append(line)
-        sys.stdout.flush()
-    except subprocess.TimeoutExpired as exc:
+                    print(f"    {{line}}")
+            sys.stdout.flush()
+    except subprocess.TimeoutExpired:
         returncode = -1
         timeout_msg = "Error: Subprocess installation exceeded per-package timeout limit (120s)."
         captured_output.append(timeout_msg)
@@ -2080,8 +2078,9 @@ for idx, item in enumerate(DEPENDENCIES, start=1):
         sys.stdout.flush()
     except Exception as exc:
         returncode = -1
-        captured_output.append(f"Execution failed: {{exc}}")
-        print(f"    ❌ Execution failed: {{exc}}")
+        err_msg = f"Execution failed: {{exc}}"
+        captured_output.append(err_msg)
+        print(f"    ❌ {{err_msg}}")
         sys.stdout.flush()
 
     if returncode == 0:
