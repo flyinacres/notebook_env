@@ -1155,3 +1155,43 @@ class TestInteractiveKernelRuntime:
         assert "cupy" not in imports
         assert "notebook_env" not in imports
         assert len(clean_sources) == 1
+
+
+class TestResolveOpencvVariant:
+
+    def _mock_pip_list(self, output: str):
+        return lambda *a, **kw: types.SimpleNamespace(returncode=0, stdout=output, stderr="")
+
+    def test_contrib_headless_detected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When pip list shows opencv-contrib-python-headless, that exact variant is returned."""
+        monkeypatch.setattr(subprocess, "run", self._mock_pip_list("opencv-contrib-python-headless 4.9.0"))
+        assert ne.resolve_opencv_variant() == "opencv-contrib-python-headless"
+
+    def test_headless_detected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When pip list shows opencv-python-headless, that exact variant is returned."""
+        monkeypatch.setattr(subprocess, "run", self._mock_pip_list("opencv-python-headless 4.9.0"))
+        assert ne.resolve_opencv_variant() == "opencv-python-headless"
+
+    def test_contrib_detected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When pip list shows opencv-contrib-python, that exact variant is returned."""
+        monkeypatch.setattr(subprocess, "run", self._mock_pip_list("opencv-contrib-python 4.9.0"))
+        assert ne.resolve_opencv_variant() == "opencv-contrib-python"
+
+    def test_base_detected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When pip list shows plain opencv-python, that exact variant is returned."""
+        monkeypatch.setattr(subprocess, "run", self._mock_pip_list("opencv-python 4.9.0"))
+        assert ne.resolve_opencv_variant() == "opencv-python"
+
+    def test_no_match_falls_back_to_submodule_heuristic(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When pip list succeeds but matches none of the four variant strings, resolution falls back to the submodules heuristic."""
+        monkeypatch.setattr(subprocess, "run", self._mock_pip_list("some-other-package 1.0.0"))
+        assert ne.resolve_opencv_variant({"aruco"}) == "opencv-contrib-python"
+        assert ne.resolve_opencv_variant(set()) == "opencv-python"
+
+    def test_subprocess_exception_falls_back_to_submodule_heuristic(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When 'pip list' itself raises, resolution falls back to the submodules heuristic."""
+        def raise_error(*a, **kw):
+            raise OSError("pip not found")
+        monkeypatch.setattr(subprocess, "run", raise_error)
+        assert ne.resolve_opencv_variant({"contrib"}) == "opencv-contrib-python"
+        assert ne.resolve_opencv_variant(None) == "opencv-python"
