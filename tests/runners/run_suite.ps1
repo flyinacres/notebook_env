@@ -1,6 +1,6 @@
 param (
     [Parameter(Mandatory = $true)]
-    [ValidateSet("plain", "kaggle", "colab")]
+    [ValidateSet("python3.11", "kaggle", "colab")]
     [string]$Tier
 )
 
@@ -10,33 +10,35 @@ $ErrorActionPreference = "Stop"
 $REPO_ROOT = (Resolve-Path "$PSScriptRoot\..\..").Path
 
 # Tier definitions and image mappings
+# PositiveFixtures/NegativeFixtures share one shape: Path (required),
+# VerifyPattern (optional, checked against captured output on success),
+# ExpectedPattern (optional, negative-only, checked against captured output on failure).
 $TIER_CONFIG = @{
-    "plain" = @{
+    "python3.11" = @{
         Image = "python:3.11-slim"
         PositiveFixtures = @()
         NegativeFixtures = @(
             @{
                 Path = "tests/fixtures/e2e/test_e2e_partial_install_failure.ipynb"
                 ExpectedPattern = "ModuleNotFoundError: No module named 'fake_pkg_does_not_exist_xyz123'"
-                ExpectedDiagnostic = "fake_pkg_does_not_exist_xyz123 failed to install"
             }
         )
     }
     "kaggle" = @{
         Image = "gcr.io/kaggle-images/python:latest"
         PositiveFixtures = @(
-            "tests/fixtures/e2e/test_pip_satisfied.ipynb",
-            "tests/fixtures/e2e/pinned_install.ipynb",
-            "tests/fixtures/e2e/platform_pseudo_module.ipynb"
+            @{ Path = "tests/fixtures/e2e/test_pip_satisfied.ipynb" },
+            @{ Path = "tests/fixtures/e2e/pinned_install.ipynb" },
+            @{ Path = "tests/fixtures/e2e/platform_pseudo_module.ipynb" }
         )
         NegativeFixtures = @()
     }
     "colab" = @{
         Image = "us-docker.pkg.dev/colab-images/public/cpu-runtime:latest"
         PositiveFixtures = @(
-            "tests/fixtures/e2e/test_pip_satisfied.ipynb",
-            "tests/fixtures/e2e/pinned_install.ipynb",
-            "tests/fixtures/e2e/platform_pseudo_module.ipynb"
+            @{ Path = "tests/fixtures/e2e/test_pip_satisfied.ipynb" },
+            @{ Path = "tests/fixtures/e2e/pinned_install.ipynb" },
+            @{ Path = "tests/fixtures/e2e/platform_pseudo_module.ipynb" }
         )
         NegativeFixtures = @()
     }
@@ -57,39 +59,44 @@ function Cleanup-Artifacts($nbPath) {
     }
 }
 
+function Strip-AnsiCodes($text) {
+    return $text -replace '\x1B\[[0-?]*[ -/]*[@-~]', ''
+}
+
 function Build-DockerCmd($tierName, $nb, $mergedNb) {
     switch ($tierName) {
-        "plain" {
+        "python3.11" {
             return "pip install --no-cache-dir ipykernel nbconvert==7.17.1 humanize && " + `
                    "python -m ipykernel install --user --name python3 && " + `
                    "python notebook_env.py `"$nb`" --output && " + `
-                   "jupyter nbconvert --to notebook --execute `"$mergedNb`" --output `"/tmp/out.ipynb`""
+                   "jupyter nbconvert --to notebook --execute `"$mergedNb`" --output `"/tmp/out.ipynb`" --ExecutePreprocessor.timeout=300 --ExecutePreprocessor.kernel_name=python3"
         }
         "kaggle" {
-            $cmd = "python3 -m venv --system-site-packages --without-pip --clear /tmp/run_env && " + `
+            return "python3 -m venv --system-site-packages --without-pip --clear /tmp/run_env && " + `
                    "/tmp/run_env/bin/python notebook_env.py `"$nb`" --output && " + `
-                   "/tmp/run_env/bin/python -m jupyter nbconvert --to notebook --execute `"$mergedNb`" --output `"/tmp/executed_kaggle.ipynb`""
-            if ($nb -match "tests_real_install") {
-                $cmd += " && grep -q 'Real install succeeded' /tmp/executed_kaggle.ipynb"
-            }
-            return $cmd
+                   "/tmp/run_env/bin/python -m jupyter nbconvert --to notebook --execute `"$mergedNb`" --output `"/tmp/executed_kaggle.ipynb`" --ExecutePreprocessor.timeout=300"
         }
         "colab" {
             return "python3 notebook_env.py `"$nb`" --output && " + `
                    "jupyter nbconvert --to notebook --execute `"$mergedNb`" --output `"/tmp/out.ipynb`" --ExecutePreprocessor.timeout=300 --ExecutePreprocessor.kernel_name=python3"
         }
+        default {
+            throw "Build-DockerCmd: no command defined for tier '$tierName'"
+        }
     }
 }
 
-# Positive Fixtures (Expected to PASS with exit code 0)
-foreach ($nb in $Config.PositiveFixtures) {
+# Positive Fixtures (Expected to PASS with exit code 0, and optionally verified content)
+foreach ($item in $Config.PositiveFixtures) {
+    $nb = $item.Path
     Write-Host ""
     Write-Host "=== [$($Tier.ToUpper())] Processing (Expect PASS): $nb ==="
     $merged_nb = $nb -replace '\.ipynb$', '_merged.ipynb'
-    $cmd = Build-DockerCmd $Tier $nb $merged_nb
+    $baseCmd = Build-DockerCmd $Tier $nb $merged_nb
+    $cmd = "$baseCmd 2>&1"
 
     try {
-        docker run --rm `
+        $rawOutput = docker run --rm `
             --pull missing `
             -v "${REPO_ROOT}:/workspace" `
             -w /workspace `
@@ -101,15 +108,30 @@ foreach ($nb in $Config.PositiveFixtures) {
             $IMAGE `
             -c $cmd
 
-        if ($LASTEXITCODE -ne 0) {
-            Write-Error "Tier execution failed unexpectedly on positive test $nb"
-            exit $LASTEXITCODE
-        }
-        Write-Host ">>> PASS: $nb"
+        $dockerExit = $LASTEXITCODE
     }
     finally {
         Cleanup-Artifacts $nb
     }
+
+    # Print captured output to console for full visibility, pass or fail
+    if ($rawOutput) {
+        $rawOutput | ForEach-Object { Write-Host $_ }
+    }
+
+    if ($dockerExit -ne 0) {
+        Write-Error "Tier execution failed unexpectedly on positive test $nb"
+    }
+
+    if ($item.VerifyPattern) {
+        $outputStr = if ($rawOutput) { $rawOutput -join "`n" } else { "" }
+        $cleanOutput = Strip-AnsiCodes $outputStr
+        if (-not $cleanOutput.Contains($item.VerifyPattern)) {
+            Write-Error "Tier test $nb passed, but output did not contain expected pattern: $($item.VerifyPattern)"
+        }
+    }
+
+    Write-Host ">>> PASS: $nb"
 }
 
 # Negative Fixtures (Expected to FAIL with non-zero exit code and verified diagnostics)
@@ -153,15 +175,13 @@ foreach ($item in $Config.NegativeFixtures) {
 
     if ($dockerExit -eq 0) {
         Write-Error "Tier test $nb was expected to fail, but exited cleanly with code 0."
-        exit 1
     }
 
     $outputStr = if ($rawOutput) { $rawOutput -join "`n" } else { "" }
-    $cleanOutput = $outputStr -replace '\x1B\[[0-?]*[ -/]*[@-~]', ''
+    $cleanOutput = Strip-AnsiCodes $outputStr
 
     if ($item.ExpectedPattern -and (-not $cleanOutput.Contains($item.ExpectedPattern))) {
         Write-Error "Tier test $nb failed, but output did not contain expected pattern: $($item.ExpectedPattern)"
-        exit 1
     }
 
     Write-Host ">>> PASS (Controlled failure verified): $nb"
