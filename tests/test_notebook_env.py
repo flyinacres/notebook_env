@@ -601,11 +601,11 @@ class TestSequentialExecutionEngine:
         ]
         blueprint = ne.generate_production_blueprint(manifest_items)
         
-        monkeypatch.setattr(
-            subprocess,
-            "run",
-            lambda *args, **kwargs: types.SimpleNamespace(returncode=1, stderr="Mocked pip error: Could not find wheel", stdout="")
-        )
+        def fake_run(*args, **kwargs):
+            kwargs["stdout"].write("Mocked pip error: Could not find wheel")
+            return types.SimpleNamespace(returncode=1)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
         
         exec_scope: Dict[str, Any] = {"__builtins__": __builtins__}
         compiled_code = compile(blueprint["step2_code"], "<string>", "exec")

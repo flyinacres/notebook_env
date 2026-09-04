@@ -3,6 +3,9 @@ notebook_env/
 .venv/
 venv/
 
+htmlcov/
+.coverage
+
 # Python cache & build artifacts
 __pycache__/
 *.py[cod]
