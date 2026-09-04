@@ -13,12 +13,14 @@ $REPO_ROOT = (Resolve-Path "$PSScriptRoot\..\..").Path
 $TIER_CONFIG = @{
     "plain" = @{
         Image = "python:3.11-slim"
-        PositiveFixtures = @(
-            "tests/fixtures/e2e/test_pip_satisfied.ipynb",
-            "tests/fixtures/e2e/pinned_install.ipynb",
-            "tests/fixtures/e2e/platform_pseudo_module.ipynb"
+        PositiveFixtures = @()
+        NegativeFixtures = @(
+            @{
+                Path = "tests/fixtures/e2e/test_e2e_partial_install_failure.ipynb"
+                ExpectedPattern = "ModuleNotFoundError: No module named 'fake_pkg_does_not_exist_xyz123'"
+                ExpectedDiagnostic = "fake_pkg_does_not_exist_xyz123 failed to install"
+            }
         )
-        NegativeFixtures = @()
     }
     "kaggle" = @{
         Image = "gcr.io/kaggle-images/python:latest"
@@ -79,7 +81,7 @@ function Build-DockerCmd($tierName, $nb, $mergedNb) {
     }
 }
 
-# Positive Fixtures (Expected to PASS)
+# Positive Fixtures (Expected to PASS with exit code 0)
 foreach ($nb in $Config.PositiveFixtures) {
     Write-Host ""
     Write-Host "=== [$($Tier.ToUpper())] Processing (Expect PASS): $nb ==="
@@ -94,6 +96,7 @@ foreach ($nb in $Config.PositiveFixtures) {
             -e PYTHONPATH="/workspace" `
             -e PYTHONUNBUFFERED=1 `
             -e PYDEVD_DISABLE_FILE_VALIDATION=1 `
+            -e PIP_ROOT_USER_ACTION=ignore `
             --entrypoint /bin/bash `
             $IMAGE `
             -c $cmd
@@ -109,34 +112,59 @@ foreach ($nb in $Config.PositiveFixtures) {
     }
 }
 
-# Negative Fixtures (Expected to FAIL with non-zero exit code)
-foreach ($nb in $Config.NegativeFixtures) {
+# Negative Fixtures (Expected to FAIL with non-zero exit code and verified diagnostics)
+foreach ($item in $Config.NegativeFixtures) {
+    $nb = $item.Path
     Write-Host ""
     Write-Host "=== [$($Tier.ToUpper())] Processing (Expect FAIL): $nb ==="
     $merged_nb = $nb -replace '\.ipynb$', '_merged.ipynb'
-    $cmd = Build-DockerCmd $Tier $nb $merged_nb
+    $baseCmd = Build-DockerCmd $Tier $nb $merged_nb
+
+    # Redirect stderr to stdout inside bash so Docker only emits clean standard text lines
+    $cmd = "$baseCmd 2>&1"
 
     try {
-        docker run --rm `
+        $rawOutput = docker run --rm `
             --pull missing `
             -v "${REPO_ROOT}:/workspace" `
             -w /workspace `
             -e PYTHONPATH="/workspace" `
             -e PYTHONUNBUFFERED=1 `
             -e PYDEVD_DISABLE_FILE_VALIDATION=1 `
+            -e PIP_ROOT_USER_ACTION=ignore `
             --entrypoint /bin/bash `
             $IMAGE `
             -c $cmd
 
-        if ($LASTEXITCODE -eq 0) {
-            Write-Error "Tier test $nb was expected to fail, but exited cleanly with code 0."
-            exit 1
-        }
-        Write-Host ">>> PASS (Controlled failure verified): $nb"
+        $dockerExit = $LASTEXITCODE
     }
     finally {
         Cleanup-Artifacts $nb
     }
+
+    # Print captured output to console for full visibility
+    if ($rawOutput) {
+        $rawOutput | ForEach-Object { Write-Host $_ }
+    }
+
+    if ($dockerExit -eq 0) {
+        Write-Error "Tier test $nb was expected to fail, but exited cleanly with code 0."
+        exit 1
+    }
+
+    $outputStr = if ($rawOutput) { $rawOutput -join "`n" } else { "" }
+
+    if ($item.ExpectedPattern -and (-not $outputStr.Contains($item.ExpectedPattern))) {
+        Write-Error "Tier test $nb failed, but output did not contain expected pattern: $($item.ExpectedPattern)"
+        exit 1
+    }
+
+    if ($item.ExpectedDiagnostic -and (-not $outputStr.Contains($item.ExpectedDiagnostic))) {
+        Write-Error "Tier test $nb failed, but output did not contain expected diagnostic: $($item.ExpectedDiagnostic)"
+        exit 1
+    }
+
+    Write-Host ">>> PASS (Controlled failure verified): $nb"
 }
 
 Write-Host ""
