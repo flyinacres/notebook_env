@@ -8,10 +8,7 @@ Write-Host " Running Axis B Suite: KAGGLE TIER ($IMAGE)"
 Write-Host "============================================================"
 
 $FIXTURES = @(
-    "fixtures/execution_safe/clean_baseline.ipynb",
-    "fixtures/execution_safe/pinned_install.ipynb",
-    "fixtures/execution_safe/platform_pseudo_module.ipynb",
-    "fixtures/tests_real_install.ipynb"
+    "fixtures/test_scenario3_multicell.ipynb"
 )
 
 foreach ($nb in $FIXTURES) {
