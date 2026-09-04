@@ -10,7 +10,8 @@ Write-Host "============================================================"
 $FIXTURES = @(
     "fixtures/execution_safe/clean_baseline.ipynb",
     "fixtures/execution_safe/pinned_install.ipynb",
-    "fixtures/execution_safe/platform_pseudo_module.ipynb"
+    "fixtures/execution_safe/platform_pseudo_module.ipynb",
+    "fixtures/tests_real_install.ipynb"
 )
 
 foreach ($nb in $FIXTURES) {
@@ -23,6 +24,10 @@ foreach ($nb in $FIXTURES) {
            "/tmp/run_env/bin/python notebook_env.py `"$nb`" --output && " + `
            "echo '--- [KAGGLE] Executing merged notebook: $merged_nb ---' && " + `
            "/tmp/run_env/bin/python -m jupyter nbconvert --to notebook --execute `"$merged_nb`" --output `"/tmp/executed_kaggle.ipynb`""
+
+    if ($nb -match "tests_real_install") {
+        $cmd += " && grep -q 'Real install succeeded' /tmp/executed_kaggle.ipynb"
+    }
 
     docker run --rm `
         -v "${REPO_ROOT}:/workspace" `
