@@ -24,7 +24,7 @@ import pytest
 import notebook_env as ne
 
 
-FIXTURE_DIR = Path(__file__).parent / "fixtures"
+FIXTURE_DIR = Path(__file__).parent / "fixtures//unit"
 MAGIC_SINK_PATH = FIXTURE_DIR / "magic_sink.ipynb"
 
 
