@@ -173,14 +173,11 @@ foreach ($item in $Config.NegativeFixtures) {
 
     # --allow-errors makes nbconvert always write the output notebook and
     # always exit 0 on a cell error, so we can inspect the actual notebook
-    # JSON instead of grepping a single traceback out of stderr. The inline
-    # python script below is the structural check: exactly one error output
-    # across the whole notebook, reported as ERROR_ENAME=/ERROR_EVALUE=. It
-    # exits 1 (breaking the chain, so $dockerExit reflects a real failure)
-    # if there are zero or more than one error outputs.
-    $pyCode = "import json,sys; nb=json.load(open('$outputPath')); errs=[(i,o.get('ename'),o.get('evalue')) for i,c in enumerate(nb['cells']) for o in c.get('outputs',[]) if o.get('output_type')=='error']; print('ERROR_COUNT='+str(len(errs))); [print('ERROR_ENAME='+str(e[1])) for e in errs[:1]]; [print('ERROR_EVALUE='+str(e[2])) for e in errs[:1]]; sys.exit(0 if len(errs)==1 else 1)"
-    $pyCodeB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($pyCode))
-    $baseCmd = "$baseCmd --allow-errors && echo $pyCodeB64 | base64 -d | python3"
+    # JSON via check_negative_fixture.py instead of grepping a single
+    # traceback out of stderr. That script does its own exactly-one-error
+    # plus ename/evalue comparison and exits 0/1 accordingly, so $dockerExit
+    # alone is the pass/fail signal here.
+    $baseCmd = "$baseCmd --allow-errors && python3 tests/runners/check_negative_fixture.py `"$outputPath`" `"$($item.ExpectedEname)`" `"$($item.ExpectedEvalueSubstring)`""
     $cmd = "$baseCmd 2>&1"
 
     try {
@@ -207,22 +204,8 @@ foreach ($item in $Config.NegativeFixtures) {
         $rawOutput | ForEach-Object { Write-Host $_ }
     }
 
-    $outputStr = if ($rawOutput) { $rawOutput -join "`n" } else { "" }
-    $cleanOutput = Strip-AnsiCodes $outputStr
-
     if ($dockerExit -ne 0) {
-        Write-Error "Tier test ${nb}: expected exactly one cell error, but the structural check failed (see ERROR_COUNT above, or an unrelated invocation failure)."
-    }
-
-    $enameMatch = [regex]::Match($cleanOutput, "ERROR_ENAME=(.*)")
-    $evalueMatch = [regex]::Match($cleanOutput, "ERROR_EVALUE=(.*)")
-
-    if ($item.ExpectedEname -and (-not $enameMatch.Success -or $enameMatch.Groups[1].Value.Trim() -ne $item.ExpectedEname)) {
-        Write-Error "Tier test ${nb}: expected ename '$($item.ExpectedEname)' but got '$($enameMatch.Groups[1].Value)'"
-    }
-
-    if ($item.ExpectedEvalueSubstring -and (-not $evalueMatch.Success -or -not $evalueMatch.Groups[1].Value.Contains($item.ExpectedEvalueSubstring))) {
-        Write-Error "Tier test ${nb}: expected evalue to contain '$($item.ExpectedEvalueSubstring)' but got '$($evalueMatch.Groups[1].Value)'"
+        Write-Error "Tier test ${nb}: structural check failed (see PASS/FAIL line above, or an unrelated invocation failure)."
     }
 
     Write-Host ">>> PASS (Structural failure verified): $nb"
