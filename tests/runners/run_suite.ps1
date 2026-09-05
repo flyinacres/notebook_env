@@ -11,16 +11,27 @@ $REPO_ROOT = (Resolve-Path "$PSScriptRoot\..\..").Path
 
 # Tier definitions and image mappings
 # PositiveFixtures/NegativeFixtures share one shape: Path (required),
-# VerifyPattern (optional, checked against captured output on success),
-# ExpectedPattern (optional, negative-only, checked against captured output on failure).
+# VerifyPattern (optional, positive-only, checked against the executed notebook's content),
+# ExpectedEname/ExpectedEvalueSubstring (optional, negative-only, checked against
+# the single structural error parsed out of the executed notebook - see the
+# negative-fixture loop below for why this replaced a plain traceback grep).
 $TIER_CONFIG = @{
     "python3.11" = @{
         Image = "python:3.11-slim"
-        PositiveFixtures = @()
+        PositiveFixtures = @(
+            @{
+                Path = "tests/fixtures/e2e/test_partial_install_recovery.ipynb"
+                VerifyPattern = @(
+                    "Partial install succeeded for valid packages: humanize==4.16.0, tabulate==0.9.0",
+                    "tabulate==0.0.0.nonexistent failed to install"
+                )
+            }
+        )
         NegativeFixtures = @(
             @{
-                Path = "tests/fixtures/e2e/test_e2e_partial_install_failure.ipynb"
-                ExpectedPattern = "ModuleNotFoundError: No module named 'fake_pkg_does_not_exist_xyz123'"
+                Path = "tests/fixtures/e2e/test_e2e_failed_repin_surfaces_downstream.ipynb"
+                ExpectedEname = "AssertionError"
+                ExpectedEvalueSubstring = "failed silently"
             }
         )
     }
@@ -47,6 +58,15 @@ $TIER_CONFIG = @{
 $Config = $TIER_CONFIG[$Tier]
 $IMAGE = $Config.Image
 
+# Where each tier's Build-DockerCmd writes the executed notebook. Only used
+# when a fixture declares VerifyPattern: per-cell print output lands only in
+# this file's JSON, never in the container's own stdout/stderr stream.
+$OUTPUT_NOTEBOOK_PATH = @{
+    "python3.11" = "/tmp/out.ipynb"
+    "kaggle" = "/tmp/executed_kaggle.ipynb"
+    "colab" = "/tmp/out.ipynb"
+}
+
 Write-Host "============================================================"
 Write-Host " Running E2E Suite: $($Tier.ToUpper()) TIER ($IMAGE)"
 Write-Host "============================================================"
@@ -66,7 +86,7 @@ function Strip-AnsiCodes($text) {
 function Build-DockerCmd($tierName, $nb, $mergedNb) {
     switch ($tierName) {
         "python3.11" {
-            return "pip install --no-cache-dir ipykernel nbconvert==7.17.1 humanize && " + `
+            return "pip install --no-cache-dir ipykernel nbconvert==7.17.1 humanize==4.16.0 tabulate==0.9.0 && " + `
                    "python -m ipykernel install --user --name python3 && " + `
                    "python notebook_env.py `"$nb`" --output && " + `
                    "jupyter nbconvert --to notebook --execute `"$mergedNb`" --output `"/tmp/out.ipynb`" --ExecutePreprocessor.timeout=300 --ExecutePreprocessor.kernel_name=python3"
@@ -93,6 +113,11 @@ foreach ($item in $Config.PositiveFixtures) {
     Write-Host "=== [$($Tier.ToUpper())] Processing (Expect PASS): $nb ==="
     $merged_nb = $nb -replace '\.ipynb$', '_merged.ipynb'
     $baseCmd = Build-DockerCmd $Tier $nb $merged_nb
+    if ($item.VerifyPattern) {
+        # Chained with && so this only runs (and only needs to succeed) on
+        # the clean-exit path already required for a positive fixture.
+        $baseCmd = "$baseCmd && cat `"$($OUTPUT_NOTEBOOK_PATH[$Tier])`""
+    }
     $cmd = "$baseCmd 2>&1"
 
     try {
@@ -126,27 +151,35 @@ foreach ($item in $Config.PositiveFixtures) {
     if ($item.VerifyPattern) {
         $outputStr = if ($rawOutput) { $rawOutput -join "`n" } else { "" }
         $cleanOutput = Strip-AnsiCodes $outputStr
-        if (-not $cleanOutput.Contains($item.VerifyPattern)) {
-            Write-Error "Tier test $nb passed, but output did not contain expected pattern: $($item.VerifyPattern)"
+        foreach ($pattern in @($item.VerifyPattern)) {
+            if (-not $cleanOutput.Contains($pattern)) {
+                Write-Error "Tier test $nb passed, but output did not contain expected pattern: $pattern"
+            }
         }
     }
 
     Write-Host ">>> PASS: $nb"
 }
 
-# Negative Fixtures (Expected to FAIL with non-zero exit code and verified diagnostics)
+# Negative Fixtures (Expected to raise exactly one cell error, of a specific
+# type and message, and no other errors anywhere in the notebook)
 foreach ($item in $Config.NegativeFixtures) {
     $nb = $item.Path
     Write-Host ""
     Write-Host "=== [$($Tier.ToUpper())] Processing (Expect FAIL): $nb ==="
     $merged_nb = $nb -replace '\.ipynb$', '_merged.ipynb'
     $baseCmd = Build-DockerCmd $Tier $nb $merged_nb
+    $outputPath = $OUTPUT_NOTEBOOK_PATH[$Tier]
 
-    # NOTE: ExpectedDiagnostic (setup-cell print output) cannot be verified here.
-    # nbconvert only writes the --output notebook file on a clean run; on
-    # CellExecutionError it raises before serializing, so there is no file to
-    # inspect for that text. Only ExpectedPattern (the exception traceback,
-    # which nbconvert does echo to stderr) is checked below.
+    # --allow-errors makes nbconvert always write the output notebook and
+    # always exit 0 on a cell error, so we can inspect the actual notebook
+    # JSON instead of grepping a single traceback out of stderr. The inline
+    # python script below is the structural check: exactly one error output
+    # across the whole notebook, reported as ERROR_ENAME=/ERROR_EVALUE=. It
+    # exits 1 (breaking the chain, so $dockerExit reflects a real failure)
+    # if there are zero or more than one error outputs.
+    $pyCode = "import json,sys; nb=json.load(open('$outputPath')); errs=[(i,o.get('ename'),o.get('evalue')) for i,c in enumerate(nb['cells']) for o in c.get('outputs',[]) if o.get('output_type')=='error']; print('ERROR_COUNT='+str(len(errs))); [print('ERROR_ENAME='+str(e[1])) for e in errs[:1]]; [print('ERROR_EVALUE='+str(e[2])) for e in errs[:1]]; sys.exit(0 if len(errs)==1 else 1)"
+    $baseCmd = "$baseCmd --allow-errors && python3 -c `"$pyCode`""
     $cmd = "$baseCmd 2>&1"
 
     try {
@@ -173,18 +206,25 @@ foreach ($item in $Config.NegativeFixtures) {
         $rawOutput | ForEach-Object { Write-Host $_ }
     }
 
-    if ($dockerExit -eq 0) {
-        Write-Error "Tier test $nb was expected to fail, but exited cleanly with code 0."
-    }
-
     $outputStr = if ($rawOutput) { $rawOutput -join "`n" } else { "" }
     $cleanOutput = Strip-AnsiCodes $outputStr
 
-    if ($item.ExpectedPattern -and (-not $cleanOutput.Contains($item.ExpectedPattern))) {
-        Write-Error "Tier test $nb failed, but output did not contain expected pattern: $($item.ExpectedPattern)"
+    if ($dockerExit -ne 0) {
+        Write-Error "Tier test $nb: expected exactly one cell error, but the structural check failed (see ERROR_COUNT above, or an unrelated invocation failure)."
     }
 
-    Write-Host ">>> PASS (Controlled failure verified): $nb"
+    $enameMatch = [regex]::Match($cleanOutput, "ERROR_ENAME=(.*)")
+    $evalueMatch = [regex]::Match($cleanOutput, "ERROR_EVALUE=(.*)")
+
+    if ($item.ExpectedEname -and (-not $enameMatch.Success -or $enameMatch.Groups[1].Value.Trim() -ne $item.ExpectedEname)) {
+        Write-Error "Tier test $nb: expected ename '$($item.ExpectedEname)' but got '$($enameMatch.Groups[1].Value)'"
+    }
+
+    if ($item.ExpectedEvalueSubstring -and (-not $evalueMatch.Success -or -not $evalueMatch.Groups[1].Value.Contains($item.ExpectedEvalueSubstring))) {
+        Write-Error "Tier test $nb: expected evalue to contain '$($item.ExpectedEvalueSubstring)' but got '$($evalueMatch.Groups[1].Value)'"
+    }
+
+    Write-Host ">>> PASS (Structural failure verified): $nb"
 }
 
 Write-Host ""
