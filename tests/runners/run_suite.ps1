@@ -179,7 +179,8 @@ foreach ($item in $Config.NegativeFixtures) {
     # exits 1 (breaking the chain, so $dockerExit reflects a real failure)
     # if there are zero or more than one error outputs.
     $pyCode = "import json,sys; nb=json.load(open('$outputPath')); errs=[(i,o.get('ename'),o.get('evalue')) for i,c in enumerate(nb['cells']) for o in c.get('outputs',[]) if o.get('output_type')=='error']; print('ERROR_COUNT='+str(len(errs))); [print('ERROR_ENAME='+str(e[1])) for e in errs[:1]]; [print('ERROR_EVALUE='+str(e[2])) for e in errs[:1]]; sys.exit(0 if len(errs)==1 else 1)"
-    $baseCmd = "$baseCmd --allow-errors && python3 -c `"$pyCode`""
+    $pyCodeB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($pyCode))
+    $baseCmd = "$baseCmd --allow-errors && echo $pyCodeB64 | base64 -d | python3"
     $cmd = "$baseCmd 2>&1"
 
     try {
@@ -210,18 +211,18 @@ foreach ($item in $Config.NegativeFixtures) {
     $cleanOutput = Strip-AnsiCodes $outputStr
 
     if ($dockerExit -ne 0) {
-        Write-Error "Tier test $nb: expected exactly one cell error, but the structural check failed (see ERROR_COUNT above, or an unrelated invocation failure)."
+        Write-Error "Tier test ${nb}: expected exactly one cell error, but the structural check failed (see ERROR_COUNT above, or an unrelated invocation failure)."
     }
 
     $enameMatch = [regex]::Match($cleanOutput, "ERROR_ENAME=(.*)")
     $evalueMatch = [regex]::Match($cleanOutput, "ERROR_EVALUE=(.*)")
 
     if ($item.ExpectedEname -and (-not $enameMatch.Success -or $enameMatch.Groups[1].Value.Trim() -ne $item.ExpectedEname)) {
-        Write-Error "Tier test $nb: expected ename '$($item.ExpectedEname)' but got '$($enameMatch.Groups[1].Value)'"
+        Write-Error "Tier test ${nb}: expected ename '$($item.ExpectedEname)' but got '$($enameMatch.Groups[1].Value)'"
     }
 
     if ($item.ExpectedEvalueSubstring -and (-not $evalueMatch.Success -or -not $evalueMatch.Groups[1].Value.Contains($item.ExpectedEvalueSubstring))) {
-        Write-Error "Tier test $nb: expected evalue to contain '$($item.ExpectedEvalueSubstring)' but got '$($evalueMatch.Groups[1].Value)'"
+        Write-Error "Tier test ${nb}: expected evalue to contain '$($item.ExpectedEvalueSubstring)' but got '$($evalueMatch.Groups[1].Value)'"
     }
 
     Write-Host ">>> PASS (Structural failure verified): $nb"
