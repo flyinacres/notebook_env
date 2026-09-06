@@ -142,6 +142,8 @@ def audit_notebook(path: Path) -> dict:
         findings["authoring_platform"] = "vscode"
     elif "databricks" in metadata:
         findings["authoring_platform"] = "databricks"
+    elif any("application/vnd.databricks.v1+cell" in c.get("metadata", {}) for c in nb_data.get("cells", [])):
+        findings["authoring_platform"] = "databricks"
 
     py_ver = metadata.get("language_info", {}).get("version")
     findings["python_version"] = py_ver
