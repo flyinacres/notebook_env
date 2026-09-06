@@ -25,6 +25,12 @@ $TIER_CONFIG = @{
                     "Partial install succeeded for valid packages: humanize==4.16.0, tabulate==0.9.0",
                     "tabulate==0.0.0.nonexistent failed to install"
                 )
+            },
+            @{
+                Path = "tests/fixtures/e2e/test_numpy_old_pin_preserves_api.ipynb"
+                VerifyPattern = @(
+                    "numpy==1.23.5: numpy.bool alias still works as expected"
+                )
             }
         )
         NegativeFixtures = @(
@@ -86,7 +92,7 @@ function Strip-AnsiCodes($text) {
 function Build-DockerCmd($tierName, $nb, $mergedNb) {
     switch ($tierName) {
         "python3.11" {
-            return "pip install --no-cache-dir ipykernel nbconvert==7.17.1 humanize==4.16.0 tabulate==0.9.0 && " + `
+            return "pip install --no-cache-dir ipykernel nbconvert==7.17.1 humanize==4.16.0 tabulate==0.9.0 numpy==1.23.5 && " + `
                    "python -m ipykernel install --user --name python3 && " + `
                    "python notebook_env.py `"$nb`" --output && " + `
                    "jupyter nbconvert --to notebook --execute `"$mergedNb`" --output `"/tmp/out.ipynb`" --ExecutePreprocessor.timeout=300 --ExecutePreprocessor.kernel_name=python3"
