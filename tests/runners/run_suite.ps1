@@ -131,6 +131,21 @@ function Invoke-CommonTests {
         Write-Error "Live-kernel Phase 0 regressions test failed"
     }
     Write-Host "PASS: Live-kernel Phase 0 regressions test`n" -ForegroundColor Green
+
+    Write-Host "Running Phase 5f: Hardware Mocking (CUDA)..." -ForegroundColor Cyan
+    docker run --rm --pull missing -v "${REPO_ROOT}:/workspace" -w /workspace -e PYTHONPATH="/workspace/tests/fixtures/mock_pkgs:/workspace" -e PYTHONUNBUFFERED=1 -e TEST_HW_MODE="cuda" -e MOCK_CUDA_AVAILABLE="1" -e MOCK_MPS_AVAILABLE="0" python:3.11-slim python tests/runners/test_hardware_mock.py
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Hardware mocking test (CUDA) failed"
+    }
+
+    Write-Host "Running Phase 5f: Hardware Mocking (MPS)..." -ForegroundColor Cyan
+    docker run --rm -v "${REPO_ROOT}:/workspace" -w /workspace -e PYTHONPATH="/workspace/tests/fixtures/mock_pkgs:/workspace" -e PYTHONUNBUFFERED=1 -e TEST_HW_MODE="mps" -e MOCK_CUDA_AVAILABLE="0" -e MOCK_MPS_AVAILABLE="1" python:3.11-slim python tests/runners/test_hardware_mock.py
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Hardware mocking test (MPS) failed"
+    }
+    Write-Host "PASS: Hardware mocking tests`n" -ForegroundColor Green
 }
 
 function Invoke-TierTests($tierName) {
