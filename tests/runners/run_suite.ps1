@@ -112,6 +112,14 @@ function Build-DockerCmd($tierName, $nb, $mergedNb) {
     }
 }
 
+Write-Host "Running Phase 5g: Live-Kernel Stale Module Test..." -ForegroundColor Cyan
+docker run --rm --pull missing -v "${REPO_ROOT}:/workspace" -w /workspace -e PYTHONPATH="/workspace" -e PYTHONUNBUFFERED=1 -e PIP_ROOT_USER_ACTION=ignore --entrypoint /bin/bash python:3.11-slim -c "pip install --no-cache-dir jupyter_client ipykernel numpy==1.26.4 -q && python -m ipykernel install --user --name python3 && python tests/runners/test_live_kernel_stale_repin.py"
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Live-kernel stale module test failed"
+}
+Write-Host "PASS: Live-kernel stale module test`n" -ForegroundColor Green
+
 # Positive Fixtures (Expected to PASS with exit code 0, and optionally verified content)
 foreach ($item in $Config.PositiveFixtures) {
     $nb = $item.Path

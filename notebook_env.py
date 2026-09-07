@@ -2122,6 +2122,8 @@ else:
     print("1. Internet Access: Ensure your notebook environment has active internet access.")
     print("2. Unpinned Installs: Test installing failed libraries manually: '!pip install <pkg>'")
     print(f"3. Troubleshooting Steps: For a detailed guide on resolving setup errors, see: {HELP_URL}")
+
+print("\\n⚠️ Note: You may need to restart the kernel to use updated packages.")
 print("=" * 60)"""
 
     return {
