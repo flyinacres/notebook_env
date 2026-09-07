@@ -123,6 +123,14 @@ function Invoke-CommonTests {
         Write-Error "Live-kernel stale module test failed"
     }
     Write-Host "PASS: Live-kernel stale module test`n" -ForegroundColor Green
+
+    Write-Host "Running Phase 5g: Live-Kernel Phase 0 Regressions..." -ForegroundColor Cyan
+    docker run --rm --pull missing -v "${REPO_ROOT}:/workspace" -w /workspace -e PYTHONPATH="/workspace" -e PYTHONUNBUFFERED=1 -e PIP_ROOT_USER_ACTION=ignore --entrypoint /bin/bash python:3.11-slim -c "pip install --no-cache-dir jupyter_client ipykernel -q && python -m ipykernel install --user --name python3 && python tests/runners/test_live_kernel_phase0_regressions.py"
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Live-kernel Phase 0 regressions test failed"
+    }
+    Write-Host "PASS: Live-kernel Phase 0 regressions test`n" -ForegroundColor Green
 }
 
 function Invoke-TierTests($tierName) {
