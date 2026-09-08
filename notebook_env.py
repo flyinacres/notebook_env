@@ -1902,7 +1902,8 @@ def generate_production_blueprint(
     manifest_items: List[Union[DependencyEntry, Dict[str, Any], str]], 
     full_freeze_lines: Optional[List[str]] = None, 
     local_tagged_info: Optional[List[Tuple[str, List[str]]]] = None, 
-    gpu_info: Optional[GpuInfo] = None
+    gpu_info: Optional[GpuInfo] = None,
+    install_timeout: int = 120
 ) -> BlueprintResult:
     """Assembles Cell 1 Markdown and Cell 2 Python code using structured DependencyEntry objects."""
     py_major, py_minor = sys.version_info.major, sys.version_info.minor
@@ -2060,7 +2061,7 @@ for idx, item in enumerate(DEPENDENCIES, start=1):
                 stdin=subprocess.DEVNULL,
                 stdout=tmp_out,
                 stderr=subprocess.STDOUT,
-                timeout=120
+                timeout={install_timeout}
             )
             returncode = proc.returncode
             tmp_out.seek(0)
@@ -2072,9 +2073,9 @@ for idx, item in enumerate(DEPENDENCIES, start=1):
             sys.stdout.flush()
     except subprocess.TimeoutExpired:
         returncode = -1
-        timeout_msg = "Error: Subprocess installation exceeded per-package timeout limit (120s)."
+        timeout_msg = "Error: Subprocess installation exceeded per-package timeout limit ({install_timeout}s)."
         captured_output.append(timeout_msg)
-        print("    ❌ Installation timed out after 120s.")
+        print("    ❌ Installation timed out after {install_timeout}s.")
         sys.stdout.flush()
     except Exception as exc:
         returncode = -1
@@ -2629,7 +2630,8 @@ def apply_output_to_notebook(
     in_place: bool = False,
     local_repo_modules: Optional[Set[str]] = None,
     root_dir: Optional[str] = None,
-    output_dir: Optional[str] = None
+    output_dir: Optional[str] = None,
+    install_timeout: int = 120
 ) -> Path:
     """Writes per-notebook locked file or replaces setup cells in-place idempotently."""
     if local_repo_modules is None:
@@ -2655,7 +2657,7 @@ def apply_output_to_notebook(
     
     gpu_info = resolve_notebook_gpu_info(scan_res.imports, batch_hw_cache)
 
-    blueprint = generate_production_blueprint(all_dep_entries, local_tagged_info=local_tagged, gpu_info=gpu_info)
+    blueprint = generate_production_blueprint(all_dep_entries, local_tagged_info=local_tagged, gpu_info=gpu_info, install_timeout=install_timeout)
     managed_cells = create_managed_cells(blueprint)
 
     with open(scan_res.path, 'r', encoding='utf-8') as f:
@@ -2757,7 +2759,8 @@ def run_batch_pipeline(
                 in_place=args.in_place,
                 local_repo_modules=nb_local_mods,
                 root_dir=repo_map.target_dir,
-                output_dir=args.output_dir
+                output_dir=args.output_dir,
+                install_timeout=args.timeout
             )
             written_files.append(str(written_path))
             logger.info(f"  • Updated '{written_path}'")
@@ -2892,7 +2895,8 @@ def run_single_file_pipeline(
             in_place=args.in_place,
             local_repo_modules=single_file_local_modules,
             root_dir=target_single_file_dir,
-            output_dir=args.output_dir
+            output_dir=args.output_dir,
+            install_timeout=args.timeout
         )
         artifacts_written = {"locked_notebook": str(written_path)}
         logger.info(f"✅ Updated '{written_path}'")
@@ -2912,7 +2916,8 @@ def run_single_file_pipeline(
     blueprint = generate_production_blueprint(
         nb_report.dependencies, 
         full_freeze_lines=full_freeze_lines, 
-        gpu_info=gpu_info
+        gpu_info=gpu_info,
+        install_timeout=args.timeout
     )
 
     print("--- [ STEP 1: PASTE INTO CELL 1 (MARKDOWN) ] ---\n")
@@ -2933,6 +2938,7 @@ def main() -> None:
     parser.add_argument("notebook", nargs="?", help="Path to target .ipynb file or directory (when using --batch).")
     parser.add_argument("--format", choices=["text", "json"], default="text", help="Output report format (default: 'text').")
     parser.add_argument("--full-freeze", action="store_true", help="Append full environment pip freeze after targeted manifest.")
+    parser.add_argument("--timeout", type=int, default=120, metavar="SECONDS", help="Per-package pip install timeout in seconds, baked into the generated notebook's install cell (default: 120).")
     parser.add_argument("--quiet", action="store_true", help="Suppress diagnostic and status logging outputs.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose debug output.")
 
