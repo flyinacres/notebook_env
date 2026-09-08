@@ -5,10 +5,12 @@
                 "python -m ipykernel install --user --name python3 && " + `
                 "PIP_NO_INDEX=1 PIP_FIND_LINKS=/workspace/tests/fixtures/local_test_pkg/dist pip install local_test_pkg==1.0.0 && " + `
                 "python notebook_env.py `"$repinNb`" --output && " + `
+                "pip uninstall -y local_test_pkg && " + `
                 "PIP_NO_INDEX=1 PIP_FIND_LINKS=/workspace/tests/fixtures/local_test_pkg/dist jupyter nbconvert --to notebook --execute `"$repinMerged`" --output /tmp/out_v1.ipynb --ExecutePreprocessor.timeout=300 --ExecutePreprocessor.kernel_name=python3 && " + `
                 "cat /tmp/out_v1.ipynb && " + `
                 "PIP_NO_INDEX=1 PIP_FIND_LINKS=/workspace/tests/fixtures/local_test_pkg/dist pip install local_test_pkg==2.0.0 && " + `
                 "python notebook_env.py `"$repinNb`" --output && " + `
+                "pip uninstall -y local_test_pkg && " + `
                 "PIP_NO_INDEX=1 PIP_FIND_LINKS=/workspace/tests/fixtures/local_test_pkg/dist jupyter nbconvert --to notebook --execute `"$repinMerged`" --output /tmp/out_v2.ipynb --ExecutePreprocessor.timeout=300 --ExecutePreprocessor.kernel_name=python3 && " + `
                 "cat /tmp/out_v2.ipynb"
 
