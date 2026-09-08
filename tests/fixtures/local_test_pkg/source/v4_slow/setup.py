@@ -11,8 +11,8 @@ class SlowBuildPy(_build_py):
 
 
 setup(
-    name="notebook_env_test_fixture",
+    name="local_test_pkg",
     version="4.0.0",
-    packages=["notebook_env_test_fixture"],
+    packages=["local_test_pkg"],
     cmdclass={"build_py": SlowBuildPy},
 )
