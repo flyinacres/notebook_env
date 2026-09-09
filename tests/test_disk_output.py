@@ -97,7 +97,13 @@ def test_apply_output_companion_file(sample_notebook_file, mock_frozen_env):
 
 
 def test_apply_output_companion_overwrite_existing(sample_notebook_file, mock_frozen_env):
-    """Verify that --output overwrites an existing companion file cleanly."""
+    """Verify that --output overwrites an existing companion file cleanly.
+
+    Note: the source notebook is identical across both calls, so this only
+    exercises destination-file overwrite mechanics, not the managed-cell
+    strip filter. See test_output_dir_strips_preexisting_managed_cells for
+    the test that actually covers a source with pre-existing managed cells.
+    """
     scan_res = ne.NotebookScanResult(
         path=sample_notebook_file,
         is_python=True,
@@ -215,6 +221,43 @@ def test_inplace_idempotency_rerun(sample_notebook_file, mock_frozen_env):
     assert len(data_run2["cells"]) == 3
     assert data_run2["cells"][0]["metadata"]["notebook_env"]["managed"] is True
     assert data_run2["cells"][1]["metadata"]["notebook_env"]["managed"] is True
+
+
+def test_output_dir_strips_preexisting_managed_cells(tmp_path, sample_notebook_file, mock_frozen_env):
+    """A file already carrying managed cells (from a prior --in-place run) must not
+    have them stacked when subsequently written via --output-dir."""
+    success1, imports1, submodules1, sources1, _, _, guarded1, dyn1 = ne.extract_from_file(str(sample_notebook_file))
+    scan_res1 = ne.NotebookScanResult(
+        path=sample_notebook_file,
+        is_python=success1,
+        lang_label="python",
+        imports=imports1,
+        submodules=submodules1,
+        guarded_imports=guarded1,
+        dynamic_warnings=dyn1,
+        code_sources=sources1
+    )
+    ne.apply_output_to_notebook(scan_res1, mock_frozen_env, {}, None, in_place=True)
+
+    success2, imports2, submodules2, sources2, _, _, guarded2, dyn2 = ne.extract_from_file(str(sample_notebook_file))
+    scan_res2 = ne.NotebookScanResult(
+        path=sample_notebook_file,
+        is_python=success2,
+        lang_label="python",
+        imports=imports2,
+        submodules=submodules2,
+        guarded_imports=guarded2,
+        dynamic_warnings=dyn2,
+        code_sources=sources2
+    )
+    out_path = ne.apply_output_to_notebook(scan_res2, mock_frozen_env, {}, None, output_dir=str(tmp_path))
+
+    with open(out_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    assert len(data["cells"]) == 3
+    assert data["cells"][0]["metadata"]["notebook_env"]["managed"] is True
+    assert data["cells"][1]["metadata"]["notebook_env"]["managed"] is True
 
 
 # =====================================================================
