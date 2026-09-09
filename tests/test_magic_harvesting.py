@@ -107,6 +107,29 @@ class TestPackageHarvesting:
         assert not any(p.startswith("git+") for p in pkgs)
 
 
+    def test_bare_local_wheel_path_not_treated_as_a_package(self) -> None:
+        pkgs, _, _, _, _ = ne.harvest_cell_magics_and_commands(
+            ["%pip install ./wheels/local_test_pkg-1.0.0-py3-none-any.whl"]
+        )
+        assert not pkgs
+
+
+    def test_local_version_tag_surfaces_in_generated_markdown(self) -> None:
+        """A '+'-tagged version should produce a local-build warning in the
+        generated notebook's Cell 1 markdown (the --output code path),
+        not just the separate batch-analysis-report warning tested
+        elsewhere in this file."""
+        dep = ne.DependencyEntry(name="local_test_pkg", version="1.0.0+customhw", source="import")
+        all_entries, local_tagged, _ = ne.build_dependency_entries([dep])
+
+        assert local_tagged, "expected the +customhw version to be flagged as a local/hardware tag"
+
+        blueprint = ne.generate_production_blueprint(all_entries, local_tagged_info=local_tagged)
+
+        assert "Specific Package Builds Detected" in blueprint["step1_markdown"]
+        assert "local_test_pkg==1.0.0+customhw" in blueprint["step1_markdown"]
+
+
 class TestIndexUrlSeparation:
     def test_extra_index_url_only(self) -> None:
         _, base, extra, _, _ = ne.harvest_cell_magics_and_commands(
