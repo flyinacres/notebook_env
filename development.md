@@ -20,29 +20,12 @@ Internal tracking for this tool's own development: known bugs still being fixed,
 
 - **`IMPORT_TO_PYPI_MAP` misses confirmed in real notebooks.** The static map has 7 entries; dynamic resolution via `packages_distributions()` only helps if the package happens to already be installed locally, which won't be true when scanning someone else's downloaded notebook. Two concrete real-world misses found: `dotenv` (should resolve to `python-dotenv`) and `mpl_toolkits` (should resolve to `matplotlib` — it's a namespace subpackage shipped inside the matplotlib distribution, not a standalone package). Likely not the last ones; worth growing the map opportunistically as more are found rather than trying to solve this generally.
 
-## Code quality / refactoring — completed this session
-
-Prompted by a general "does this code smell fragile" review, not a specific bug report. Full test suite run and passing (with sabotage-testing on the trickiest pieces — see below) after each item.
-
-- **`GpuInfo` converted from `TypedDict(total=False)` to `@dataclass`.** Matches every other multi-field structured payload in the file (`NotebookScanResult`, `ExtractionResult`, `HarvestResult`, `BatchAnalysisSummary`). The old `total=False` was misleading — every real construction site always populated all six keys, but read sites were inconsistently split between `["key"]` (would `KeyError` if a key really were absent) and `.get("key")`. Dataclass fields now have real defaults; all read sites use attribute access.
-- **GPU probes return a `GpuProbeResult` `NamedTuple`** (`accelerator_type`, `device_name`) instead of a bare 2-tuple, so callers unpack by name instead of position.
-- **`inspect_gpu_environment` split into three independent per-framework functions** (`probe_torch_gpu`, `probe_tensorflow_gpu`, `probe_jax_gpu`), matching the file's existing pattern for optional-dependency detection (narrow `except ImportError`, single purpose per guarded import) rather than one long function with three inline try/excepts.
-- **Exception handling in the three GPU probes narrowed**: each now does `except ImportError: return None` (expected — framework not installed) separately from `except Exception as e: logger.debug(...)` (framework installed but the probe itself broke unexpectedly — now visible via `--verbose` instead of silently reported as "no GPU"). This already satisfies the "narrow the exception, log at debug" recommendation from the `pass`-usage audit below for those three specific spots — done as part of this work, before that audit was written up.
-- **`main()`'s unconditional `torch`/`tensorflow`/`jax` seeding removed** — previously every invocation attempted to import all three frameworks regardless of what the target notebook(s) actually imported. Now only probes frameworks genuinely present in the scanned imports.
-- **GPU probing no longer runs twice for single-file mode** — `main()` now threads its already-computed `batch_hw_cache` into `run_single_file_pipeline` for Path A (saved file); Path B (live kernel) still probes fresh, correctly, since its imports aren't known until session history is read.
-- **`TRANSITIVE_FRAMEWORK_MAP` expansion de-duplicated** into a shared `expand_transitive_frameworks()`, used by both `inspect_gpu_environment` (host-level probe) and `apply_output_to_notebook` (per-notebook attribution) — previously duplicated inline in both places, with the `apply_output_to_notebook` copy missing the dynamic `importlib.metadata.requires()` fallback the other one had.
-- **JAX-on-Apple-Silicon detection fixed** — `jax-metal` reports `platform == 'METAL'` (confirmed via search), which the original `("gpu", "tpu")` check missed entirely; a Mac running JAX with the Metal plugin was silently reported as having no accelerator. `probe_jax_gpu` now also accepts `"metal"`. Covered by `test_jax_metal_active`.
-- **`apply_output_to_notebook` no longer re-runs `harvest_cell_magics_and_commands`** — it was discarding `scan_res.harvested_pkgs`/`base_index_urls`/`extra_index_urls`, already populated by the same harvest call during the initial scan, and re-running the full regex/tokenize pass over every code cell a second time on every `--output`/`--in-place` run.
-- **`NotebookScanResult.harvested_urls` sentinel changed from `field(default_factory=set)` to `Optional[Set[str]] = None`.** The old default meant `__post_init__`'s auto-harvest fallback couldn't distinguish "caller already harvested and confirmed zero index URLs" (the common case — most notebooks reference no custom index) from "caller never computed this at all," so it silently re-ran the full harvest a second time for the common case. Now only a true `None` (nothing passed) triggers the fallback, logged at debug level when it fires.
-- **`_memoize_for_run` decorator added**, applied to `get_notebook_local_modules` and `build_manifest_entries`. Plain `functools.lru_cache` doesn't work here — `build_manifest_entries`'s `Set`/`Dict` arguments are unhashable, confirmed via direct test (`TypeError: unhashable type: 'set'`). Custom memoizer keys `dict` args by `id()` (cheap, correct since the same object is reused by reference within one run — `frozen_env`/`pkg_dist_map`/a given notebook's `res.submodules`) and `set` args by `frozenset()`; returns are shallow-copied on every hit so no caller can corrupt the cache via in-place mutation. **Cache lifetime**: both functions' `.cache_clear()` are called unconditionally at the very top of `main()` — required because this tool is designed to run repeatedly inside a single long-lived process (`import notebook_env as ne; ne.main()` in a live Jupyter kernel — see module docstring), where the notebook's own files can legitimately change between calls; an uncleared cache would silently keep returning pre-change results.
-- **`TestMemoizeForRun`** (10 tests) added: identical-call dedup, cross-notebook non-collision, the `id()`-keying tradeoff (documented as a correctness-safe miss, not a false hit), defensive-copy safety, and `cache_clear()` forcing recomputation. Deliberately sabotage-tested (removed the defensive copy, removed `main()`'s `cache_clear()` calls) to confirm the tests actually fail when they should, not just pass by construction — both sabotage runs failed exactly as expected, then were reverted.
-- **Reviewed and deliberately left alone**: `resolve_pypi_package_and_extras` (63 lines — cascading resolution rules, each branch returns early, no duplication or hidden state) and `generate_production_blueprint` (105 lines — long mainly because it assembles one large literal template string for Cell 2, not tangled logic). Neither showed the duplication/hidden-state pattern that made the other fixes worthwhile.
-
 ## Code quality / refactoring — still outstanding
 
 - **Cell-magic dispatch table.** `harvest_cell_magics_and_commands`'s `SYSTEM_PKG_PATTERN`/`CONDA_INSTALL_PATTERN`/`PIP_INSTALL_PATTERN` if/elif chain is the one item from the original refactor discussion judged genuinely worth doing (order-dependent pattern matching, real and growing set of magic types) — not started.
 - **Four near-identical dedupe-append loops in `analyze_batch_repository`** (`promotions`/`dynamic_warnings`/`magic_warnings`/`magic_notices`, each doing `for x in source: if x not in target: target.append(x)`). Low risk, pure DRY — collapses to one small `_dedupe_extend(target, source)` helper called four times. Not started.
 - **Cross-notebook batch-scope caching + `BatchAnalysisSummary` reverse index — designed, not started.** See dedicated section below; this is the larger item Ron wants to validate against real corpus data before committing to a final shape.
+- **`--format json` payload is assembled as inline literal dicts, not a typed structure.** `format_json_batch_report`/`format_json_single_report` build `payload = {...}` by hand (schema_version, tool_version, mode, environment, summary/notebooks) rather than a dataclass/TypedDict enforcing the shape in code. Not started.
 
 ## Cross-notebook batch-scope caching (design, not yet implemented)
 
@@ -66,74 +49,18 @@ Motivating question: running against ~300 real notebooks, how much of the per-im
 
 **Deliberately deferred**: real-world validation against the actual corpus (MLEModernizer/course-notebook samples) to check the actual import-vocabulary overlap assumption above, before committing to a final cache/summary shape. Do that first.
 
-## Machine-readable output (`--format json`) — design, not yet implemented
+## Machine-readable output (`--format json`) — implemented
 
-Motivating question: the console report (human-formatted, emoji-prefixed, wrapped prose) is currently the only output surface. Two separate needs point at the same fix — test automation needs to assert on structured fields instead of string-matching formatted text, and users wiring this tool into CI/release automation need something parseable that isn't going to break every time a message's wording changes. Both are served by the same feature.
-
-**The one hard constraint, non-negotiable given this project's history**: JSON output must be generated from the _same_ internal report structure the console renderer already builds, not computed as a second independent pass over the raw scan data. This project has hit the "two code paths compute the same answer slightly differently and drift apart" bug more than once already (`--output` mode GPU misattribution, the harvested-name normalization bug, the skip-suffix/managed-metadata inconsistency) — a JSON serializer built as its own separate computation would be the same failure mode with a new name. One report object, two renderers: `format_console_report(report)` and `format_json_report(report)`, both reading the same populated dataclass, neither one recomputing anything the other already derived.
-
-**Proposed CLI surface**: `--format {text,json}`, default `text` (preserves current behavior for existing users/scripts). When `json` is selected, stdout carries only the JSON payload — no mixed human/machine text on the same stream. This already fits naturally with how logging is currently wired: `logger`'s handler targets `sys.stderr`, not stdout, so diagnostic/warning messages can keep going to stderr under `--format json` without any change, and a caller piping stdout into `json.loads()` never has to filter them out.
-
-**Proposed shape** (illustrative, not final — field names/nesting open to revision):
-
-```json
-{
-  "schema_version": "1.0",
-  "tool_version": null,
-  "mode": "single_file",
-  "notebook_path": "example.ipynb",
-  "active_interpreter": "/usr/bin/python3",
-  "python_check": {
-    "required": [3, 11],
-    "current": [3, 11],
-    "status": "match"
-  },
-  "dependencies": [
-    {
-      "name": "torch",
-      "version": "2.3.1+cu121",
-      "source": "import",
-      "guarded": false,
-      "hardware_tagged": true,
-      "flags": []
-    }
-  ],
-  "local_modules": ["utils"],
-  "platform_pseudo_modules": ["kaggle_secrets"],
-  "gpu": {
-    "has_gpu": true,
-    "framework": "torch",
-    "device_name": "NVIDIA GeForce RTX 3090"
-  },
-  "warnings": [
-    {
-      "type": "dynamic_import",
-      "detail": "non-literal import argument, statically unresolvable"
-    }
-  ],
-  "promotions": [
-    { "import": "tqdm.notebook", "resolved": "tqdm[notebook]==4.69.0" }
-  ]
-}
-```
-
-Batch mode would nest a list of per-notebook payloads of roughly this shape under a repo-level summary object (aggregate missing-package counts, `companion_skipped` list, parse errors) — exact nesting still open.
-
-**`schema_version` is required, not optional.** This is a real external contract once shipped (both to test automation and to any customer CI usage), and fields will need to grow over time (this session alone would have added `hardware_tagged`, hypothetically `local_modules` source attribution, etc.). A version field lets consumers detect and handle schema changes deliberately rather than breaking silently on an unannounced field addition or rename.
+`--format {text,json}` (default `text`) is implemented via `format_json_batch_report`/`format_json_single_report`, both reading the same `NotebookAnalysisReport`/`BatchAnalysisSummary` the console renderer uses (`schema_version`, `tool_version`, `mode`, `environment`, plus `summary`/`notebooks` for batch). See the outstanding item above: the payload itself is still assembled as inline dicts rather than a typed structure.
 
 **Open questions, not yet decided:**
 
-- Does `--format json` imply `--quiet` for stderr too, or should diagnostic logging stay independently controllable via the existing `--quiet`/`--verbose` flags regardless of output format? Leaning toward keeping them independent, someone might want verbose debug logging on stderr while still parsing JSON from stdout.
-- Exact field-naming convention (`snake_case` throughout, matching Python convention, vs. something else) — pick one and apply consistently, don't let it drift per-field.
-- Whether `--output`/`--in-place`/`--output-dir`'s write confirmation (which files were written, to where) should also get a JSON representation, or whether that's a separate concern from the analysis report. Likely also needed for CI use cases ("did it actually write N files"), but scope this as a fast-follow rather than blocking v1.
-
-**Deferred deliberately**: exact schema finalization and the batch-mode nesting shape — both should be decided against Phase 5b/5c's actual test-assertion needs once those are being built, rather than speculatively finalized here first.
+- Does `--format json` imply `--quiet` for stderr too, or should diagnostic logging stay independently controllable via the existing `--quiet`/`--verbose` flags regardless of output format? Leaning toward keeping them independent.
+- Whether `--output`/`--in-place`/`--output-dir`'s write confirmation should also get a JSON representation beyond the current `artifacts_written` field, or whether that's a separate concern from the analysis report.
 
 ## `pass`-usage audit (from a manual code read, cross-checked against current source)
 
 Cross-checked against the current file (v37 + this session's refactors) rather than taken at face value — the numbers shifted slightly from the original read-through, worth noting explicitly:
-
-**Already fixed as a side effect of this session's GPU refactor** (not by the audit; done first, audit written after): the original read flagged PyTorch/TensorFlow/JAX GPU probing as broad `except Exception: pass`. As of the `probe_torch_gpu`/`probe_tensorflow_gpu`/`probe_jax_gpu` split above, all three already separate `except ImportError: return None` (expected) from `except Exception as e: logger.debug(...)` (unexpected, now visible via `--verbose`) — no bare `pass` remains in any of the three.
 
 **Confirmed still present, 4 locations, recommend narrowing the exception type and/or adding `logger.debug`**:
 
@@ -144,25 +71,12 @@ Cross-checked against the current file (v37 + this session's refactors) rather t
 
 For all four: catching `Exception` broadly means a missing/uninstalled package (expected, fine) and a genuinely broken installation, permissions error, or corrupted metadata (worth knowing about, especially for the tool's own maintainer running with `--verbose`) get treated identically and silently. Recommended fix, same shape as what was already done for the GPU probes: narrow to the specific expected exception(s) where clearly identifiable, and add `logger.debug(...)` in the broader catch so `--verbose` runs can actually see what got skipped and why.
 
-**Confirmed legitimate, no action needed**:
-
-- `run_single_file_pipeline`'s `from IPython import get_ipython` guard (~line 1953) — `except ImportError: pass`, standard EAFP optional-dependency detection, already narrowly scoped.
-- Two `except SyntaxError: continue` sites (`extract_imports_from_sources` ~line 678, writefile-import extraction ~line 708) — necessary for skipping non-Python cell content (raw SQL under `%%sql`, etc.) during AST scanning. Note: these use `continue` inside a loop, not literally `pass` as the original read described — functionally the same "skip and move on" intent, but worth the correction for anyone searching the file for the literal keyword later.
-
-- **`%%time`/`%%timeit` cells are handled correctly**, despite not being explicitly classified by `classify_cell_source` (they fall through to `PYTHON`). Verified: `extract_imports_from_sources` strips _any_ line starting with `%` or `!`, not just the first line, regardless of cell classification — so the magic line gets stripped and code underneath parses normally. Confirmed against real notebooks (6 real hits across the corpus, all handled fine) and via direct test. No action needed.
-- **`%%sql`/`%%html`/similar cell-consuming magics are silently but safely skipped** — the magic line gets stripped, the remaining non-Python content (e.g. raw SQL) fails `ast.parse`, hits the existing `except SyntaxError: continue`, and contributes nothing. No crash, no false imports — but also no notice to the user that a cell was skipped. Only verified synthetically so far (`SELECT * FROM ...`); no real notebook in the current corpus has hit this path yet (only `%%time`/`%%timeit` appeared in real data).
-- **A plain `open("requirements.txt")` file read (as opposed to a `pip`/`conda` install command) is invisible to the magic harvester by construction.** Seen in a real notebook (`05_tool_calling_agent.ipynb`, used to pass `pip_requirements` into `mlflow.pyfunc.log_model`) — this is a different mechanism than the `-r requirements.txt` pip-install pattern the harvester already catches, and isn't something static scanning can reasonably solve in general. Worth documenting as an accepted blind spot rather than something to chase.
-- **Function calls that only work inside a managed platform** (e.g. `sagemaker.get_execution_role()`, which raises outside SageMaker) are a related-but-distinct category from platform-injected _modules_ — these are ordinary imports/calls, invisible to the tool by design (it's a runtime behavior, not a static import signal), and not fixable via AST analysis. Worth being aware of as a category, not actionable.
-- **Databricks notebooks distributed via git are frequently `.py` source format, not `.ipynb`.** First line `# Databricks notebook source`, cells separated by `# COMMAND ----------`, markdown via `# MAGIC %md` lines. This is a genuinely different, well-documented Databricks export format — the tool's JSON-only `.ipynb` parser can't ingest these at all. Real `.ipynb`-format Databricks exports do exist and are now the platform default (identifiable by the `"application/vnd.databricks.v1+cell"` per-cell metadata key) — GitHub code search `"application/vnd.databricks.v1+cell" path:*.ipynb` finds them. Decision on whether to support source-format `.py` ingestion is still open (see Open design questions).
-
 ## Open design questions
 
 - **Full-freeze mode**: should `--full-freeze` stay additive (current behavior — appended after the targeted manifest) or become a replace-mode? Currently additive; not revisited since it was flagged as an open question.
 - **Metadata write reliability**: embedding a full freeze directly into `.ipynb` metadata was considered and set aside — companion `.txt` files don't travel with downloaded notebooks, and metadata writes are unreliable against frontend autosave. This blocks any future "single portable file, no companion files" version of full-freeze.
 - **Torch/TensorFlow hardware build tag stripping** (`+cu121`, `+cu128`) before pinning: unverified whether this is safe to do automatically. Currently not attempted — tags are flagged, not stripped.
 - **Databricks source-format `.py` ingestion**: real production Databricks repos on GitHub are frequently distributed as `.py` (source format) rather than `.ipynb`. Supporting this would mean a second ingestion path (split on `# COMMAND ----------`, classify `# MAGIC %sql`/`# MAGIC %md` lines) parallel to the existing JSON-based one — a real scope expansion, not a small patch. Not yet decided whether this is worth doing versus deliberately scoping to `.ipynb`-only Databricks exports (which do exist and are now the platform default).
-- ~~Local/repo-relative import disambiguation~~ **Resolved (v37)**: `get_notebook_local_modules()` checks both the notebook's own parent directory and the batch root.
-- ~~Platform-injected pseudo-module handling~~ **Resolved**: `PLATFORM_PSEUDO_MODULES` allowlist with distinct notice.
 - **Plugin/backend-selection dependencies invisible to static import scanning**: libraries that select and import an optional backend internally based on a string argument (`holoviews.extension("bokeh")` pulling in `bokeh`; the same pattern applies to matplotlib backends, pandas `engine=` kwargs, xarray backends) have a real runtime dependency that never appears as an `import` statement anywhere in the notebook's own source, so no AST-based detection can see it. Confirmed via real-corpus review (a `datashader`/`holoviews` notebook using the bokeh backend). Not currently addressed; a targeted special-case rule for specific known extension-name→package mappings is possible in principle (parallel in spirit to `IMPORT_TO_PYPI_MAP`, but keyed on function-call-argument patterns rather than import names) — not started, and not yet decided whether it's worth a dedicated lookup table versus documenting as a permanent scope boundary (see `test_plan.md` Phase 4).
 - **Cell 1 documentation doesn't warn about kernel-restart-after-repin**: when Cell 2 re-installs an already-imported package to fix a bad pin inside a live/already-running kernel session (not the intended fresh-kernel flow, but a real usage pattern), the newly-installed version won't take effect until the kernel restarts — ordinary Python/pip behavior, not a bug in this tool. pip's own `"Note: you may need to restart the kernel..."` advisory already passes through the setup cell's subprocess-output capture unmodified, but it's an easy-to-miss one-line notice buried in install output. Real corpus evidence found: a notebook (`pykeops`) with a stored `!pip install pykeops` followed by `ModuleNotFoundError` for the same package in the same session — this exact scenario occurring in the wild, not hypothetical. Open question: should Cell 1's own generated documentation explicitly warn "restart your kernel if you've already run cells below this point," rather than relying solely on pip's advisory? Not decided; `test_plan.md` Phase 5g's stale-module-after-repin scenario is designed to produce more evidence toward this decision.
 
@@ -171,15 +85,29 @@ For all four: catching `Exception` broadly means a missing/uninstalled package (
 - **Package as an installable library**, rather than only a standalone script. Constraint to preserve: Path A/B currently both depend on the tool being usable as a single self-contained file with no install step — Path B specifically depends on being paste-able into a notebook cell, which matters on ephemeral, sometimes internet-off runtimes (e.g. Kaggle competition rerun mode). Any packaging change needs to keep a single-file distribution form available alongside whatever installable form is added, not replace it.
 - **A separate static-only scanner** for notebooks you don't own (no live execution, no environment correlation — file-based AST scan only). Deferred in favor of the current single-notebook and batch-mode work.
 - **Search path for nearby-directory local modules**: deliberately not committed to — see the `sys.path.append` entry under Known bugs above. Real-corpus evidence (one occurrence, in an already-deprioritized Databricks notebook) doesn't currently justify the scope of a new flag. Revisit only if real-world evidence changes.
-- ~~Consider a separate `--output-dir` flag~~ **Resolved** — implemented, see Known bugs above for what it does and doesn't cover (notebook mirroring works; non-notebook sibling assets are explicitly out of scope).
-- **Machine-readable output (`--format json`)**: design not yet implemented — see dedicated section above. Dual-purpose: unblocks more robust test automation (Phase 5a in `test_plan.md`) and is a real feature for users wiring this into CI/release tooling.
 - **Harvest dependencies and tools currently thrown away from cell magics**: `%pip`/`%conda` installs without a matching import (e.g. `gdown`), `--index-url` (not just `--extra-index-url`), `%%bash`/`%%sh` shell cells, `%run`, and `%%writefile`. These need their own output category rather than folding into the existing import-correlated manifest — there's no import statement to correlate a CLI-only tool like `gdown` against, and conda package names don't reliably map to PyPI names, so conda installs shouldn't be checked against `pip freeze` the way pip installs are. **Status: substantially implemented as of v31/v32** — auxiliary tool harvesting, `%%writefile` isolation, and base/extra index URL separation are all in place and confirmed working against real notebooks (2 real `%%writefile` cells found in the SageMaker corpus, isolation confirmed working). Remaining from this item: `%run` still unhandled; worth a frequency check on whether it's common enough in real data to bother with.
-- ~~Fix the `--output` mode GPU misattribution~~ **Resolved (v37)**: per-framework `framework_devices` map prevents a tensorflow-only notebook inheriting a torch device name.
 - **Bare relative imports** (`from . import x`) remain silently invisible rather than flagged. Low priority — revisit only if real-notebook testing shows this pattern is common. **Status: zero occurrences found across 131 real notebooks tested so far** — still open in principle, but real-world evidence to date supports staying low priority.
 - **`exec()`/`eval()` diagnostic warning**: cheap to add (flag any `exec(`/`eval(` call site as a diagnostic, without attempting to parse the string argument), not yet implemented.
-- ~~Fix the GPU-detection blind spot for wrapped frameworks (fastai/torch)~~ **Resolved (v37)**: `TRANSITIVE_FRAMEWORK_MAP` expansion applied on both the host-level probe and per-notebook attribution.
-- ~~Extend `process_package_requirements`'s hardware-tag audit to batch analysis mode~~ **Resolved**: called per-notebook inside `analyze_batch_repository`, surfaces under "Local / Hardware Tag Build Warnings."
 - **New, from real-world testing**: grow `IMPORT_TO_PYPI_MAP` opportunistically as real misses are found (`dotenv`, `mpl_toolkits` confirmed so far).
+
+## Pinned-dependency drift detection — design, not yet implemented
+
+Motivating problem: pins prevent breakage from the environment moving out from under a notebook, but a pin itself can go stale over time (a pinned package gets yanked, a pinned pair of packages conflict, a pinned release no longer supports the notebook's `REQUIRED_PYTHON`). Nothing currently checks a pin against anything beyond the environment installed at generation time.
+
+**Manifest**: Cell 2's `DEPENDENCIES = [...]` literal becomes a uniquely-named structured literal (e.g. `NOTEBOOK_ENV_MANIFEST`) — Python version, pinned dependencies, GPU info, generation timestamp — built from `NotebookAnalysisReport`/`GpuInfo.to_dict()`. No external file: avoids Kaggle/Colab/offline path ambiguity and multi-notebook directory collisions. Should align with the `--format json` schema already implemented (see above) rather than invent a second shape, and — per the outstanding item above — should itself be a typed structure, not an inline dict.
+
+**Batch drift-check subcommand**: given a directory of previously generated notebooks, parses the manifest back out of each `.ipynb` (no execution) and checks it against live PyPI metadata:
+
+- Pin-vs-pin conflicts among direct pinned packages (`requires_dist`).
+- Yanked packages — confirmed signal.
+- Staleness (no recent release) — heuristic, not proof of breakage.
+- Newer major version available upstream — "worth reviewing," not "will break."
+- Pinned release no longer declares support for the notebook's `REQUIRED_PYTHON`.
+- Transitive dependencies — same metadata walk extended recursively through each pin's `requires_dist`, since a conflict/yank several levels down is invisible from direct pins alone.
+
+Output must distinguish confirmed signals (yanked, declared incompatibility) from heuristic ones (staleness, major bump) — flagging both at equal severity risks false alarms eroding trust, per this project's own "false success is worse than doing nothing" principle.
+
+**Known limitation**: metadata-based checking cannot catch runtime/API breakage that isn't expressible as a version constraint (code that installs cleanly but errors or behaves differently at call time). Only real execution would catch that; this feature doesn't attempt it — a pip dry-run resolves against the local machine, not the target platform (Kaggle/Colab), so it isn't ground truth for what this feature needs anyway.
 
 ## Real-world validation plan (in progress)
 
@@ -265,7 +193,6 @@ Platform images ship a kernel pre-baked; plain-slim images have nothing Jupyter-
   - No test for the two-frameworks-both-active GPU case (e.g. torch and tensorflow both mocked with working GPUs on host, confirming a tensorflow-only notebook picks up tensorflow's own verified device via `framework_devices` rather than any stale result from torch being probed first). Logic reads correctly on inspection; not locked in by a test.
   - No test for `--output`/`--in-place` against an actual notebook from the real corpus specifically — `test_disk_output.py` now gives comprehensive synthetic (`tmp_path`-generated) coverage of the write paths themselves (companion creation, in-place, idempotency, CLI plumbing, cross-flag precedence, error handling), but nothing yet runs `--output`/`--in-place` against one of the real downloaded notebooks to confirm behavior holds on non-synthetic structure/metadata.
   - `kitchen_sink`/`magic_sink` fixtures still don't encode the local-import or platform-injected-module real-world patterns directly (those are currently covered via dynamically-built `tmp_path` notebooks in `test_batch_mode.py`, not folded into the static fixture files) — worth doing if/when those fixtures get another pass, but not blocking.
-  - **Closed since last review**: regression tests for the batch-mode `strict`/missing-metadata fix, local/repo-relative imports (including the subdirectory-scoping case), platform-injected pseudo-modules, `%%sql`/`%%html`-style cell-consuming magics, hardware-tagged packages in `--batch` analysis, and the `dotenv`/`mpl_toolkits` `IMPORT_TO_PYPI_MAP` misses all now have dedicated coverage in `test_batch_mode.py`, `test_magic_harvesting.py`, and `test_notebook_env_fixtures.py`. `sys.argv` contamination, duplicate log handlers, and live-kernel `In`-history self-filtering now covered in `TestInteractiveKernelRuntime` (`test_notebook_env.py`).
   - **New gaps opened this session, no pytest coverage yet**: the four structural fixture cases (subdirectory helpers — both package-style and `sys.path.append`-style, root-level module resolution, `--output-dir` duplicate-stem collision avoidance, relative-asset mirroring limitation) currently only exist as a standalone generator script (`build_test_structures.py`) run and checked by hand, not as pytest fixtures. Converting these into `tmp_path`-based pytest fixtures (build structure → subprocess CLI call → assert on output) is the natural next step, and would also give a reusable pattern for the harvested-name normalization bug and the false-positive local-name notebooks once those are root-caused, since both need a similar "build a minimal repro, assert on the summary" test shape.
   - No test yet for the `apply_output_to_notebook` idempotency fix specifically in `--output-dir` mode (only confirmed by hand: run once, inspect for a single managed cell) — `--in-place` and default `--output` idempotency are covered in `test_disk_output.py`, `--output-dir` isn't yet.
   - No regression test for the batch-mode strict-metadata-gate fix (notebooks with no `kernelspec`/`language_info` at all now correctly assumed Python rather than rejected) — only manual corpus re-runs confirm this (21/21, 25/25 recognized post-fix).
