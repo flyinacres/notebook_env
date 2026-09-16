@@ -100,7 +100,7 @@ Motivating problem: pins prevent breakage from the environment moving out from u
 
 Fields: Python version, pinned dependencies, GPU info, `generated_at`, `tool_version`.
 
-**`dependency_hash`**: covers the *entire* manifest — content (deps, python version, GPU) and provenance (`generated_at`, `tool_version`) alike — via canonical serialization (e.g. sha256 over sorted-key JSON), independent of however the literal happens to be formatted in Cell 2. Purpose: detect hand-editing of the manifest, which invalidates any future check against it — including someone hand-editing the timestamp to hide age, which is exactly the kind of tampering this should catch, not exempt.
+**`dependency_hash`**: covers the _entire_ manifest — content (deps, python version, GPU) and provenance (`generated_at`, `tool_version`) alike — via canonical serialization (e.g. sha256 over sorted-key JSON), independent of however the literal happens to be formatted in Cell 2. Purpose: detect hand-editing of the manifest, which invalidates any future check against it — including someone hand-editing the timestamp to hide age, which is exactly the kind of tampering this should catch, not exempt.
 
 **Two modes** — a middle "verify without changing pins" mode was considered and rejected: confirming pins still work requires actually running the code, and running the code means real installed versions now exist, which should simply become the new pins. There's no meaningful state between "unchanged, trusted" and "changed, replaced."
 
@@ -108,6 +108,7 @@ Fields: Python version, pinned dependencies, GPU info, `generated_at`, `tool_ver
 - **Replace**: not new work — this is the existing generator (`main()`, both Path A saved-file and Path B live-kernel), pointed at an artifact that already has a manifest. **Unconditional**: always produces a fully new manifest (new `generated_at`, new `tool_version`, new hash) regardless of whether the content actually changed — no hash-comparison/preserve-old-timestamp logic, there is no conditional "regenerate" path. Like every other mode in this tool, it only produces new Cell 2 text; the tool never edits the user's file in place to insert it — that stays the user's action, consistent with how the tool has always worked. Pre-existing (pre-feature) notebooks aren't a special case — they just get a fresh manifest the same way any Replace does.
 
 **Check's signals**:
+
 - Pin-vs-pin conflicts among direct pinned packages (`requires_dist`).
 - Yanked packages — confirmed signal. Distinct from **removed** (the whole project deleted from PyPI, not just one release) — different failure mode, needs its own handling since a removed package breaks the lookup itself, not just returns a flag.
 - Staleness (no recent release) — heuristic, not proof of breakage.
@@ -120,6 +121,7 @@ Output must distinguish confirmed signals (yanked, declared incompatibility) fro
 **CLI exit codes — required, not deferred**: 0 (clean), 1 (drift found), 2 (error/exception during check). This is also what makes the feature usable from cron/GitHub Actions/any scheduler without any scheduling logic of its own — Check already produces `--format json` and a clean exit code, which is everything an external scheduler needs; no scheduled-mode feature belongs in this tool itself.
 
 **From `depcheck` — added to the plan** (beyond what's already listed above):
+
 - `why <package>`: trace which pin(s) pulled a package in. Near-free once the transitive walk (signal 6 above) exists.
 - Diff between two manifest snapshots of the same notebook (this run vs. a prior run) — reuses the same manifest-parsing already built for Check; answers "what changed" more directly than a flat report.
 - Changelog/homepage link on the major-bump signal — PyPI's `project_urls` field is already part of the same metadata fetch, so this is close to free.
@@ -135,7 +137,7 @@ Output must distinguish confirmed signals (yanked, declared incompatibility) fro
 
 **Explicitly rejected/out of scope**: SBOM export, license compliance, dependency graph visualization (wrong audience — enterprise supply-chain tooling, real build cost, not asked for). A scheduled/watch mode (already decided against — the check mode is a manually-invoked CLI subcommand only; a hosted version is a plausible future paid product, not part of this tool).
 
-**Competitive landscape (checked, not reused)**: `pip-audit`/`safety` are vulnerability-only, don't touch drift. Dependabot/Renovate are hosted GitHub bots requiring a repo + CI, not invokable as a library/CLI against arbitrary pins. `depcheck` (PyPI: `depdoctor`) is a closer match for the *plain-Python-project* case — outdated/unmaintained/yanked/removed/CVE checks against `requirements.txt`/`pyproject.toml`/`Pipfile` — but single-maintainer, first release June 2026, unproven, and it doesn't solve the notebook problem: it has no generated, portable artifact (Cell 2's actual distinguishing feature) — every future check requires the tool itself reinstalled and rerun. Worth testing against a real project before deciding whether this tool should ever do general project-level scanning; the more distinctive gap it surfaced — a generated, zero-dependency standalone check script for plain Python projects, committed alongside `requirements.txt` — is a genuinely different, separate idea, noted here but not planned.
+**Competitive landscape (checked, not reused)**: `pip-audit`/`safety` are vulnerability-only, don't touch drift. Dependabot/Renovate are hosted GitHub bots requiring a repo + CI, not invokable as a library/CLI against arbitrary pins. `depcheck` (PyPI: `depdoctor`) is a closer match for the _plain-Python-project_ case — outdated/unmaintained/yanked/removed/CVE checks against `requirements.txt`/`pyproject.toml`/`Pipfile` — but single-maintainer, first release June 2026, unproven, and it doesn't solve the notebook problem: it has no generated, portable artifact (Cell 2's actual distinguishing feature) — every future check requires the tool itself reinstalled and rerun. Worth testing against a real project before deciding whether this tool should ever do general project-level scanning; the more distinctive gap it surfaced — a generated, zero-dependency standalone check script for plain Python projects, committed alongside `requirements.txt` — is a genuinely different, separate idea, noted here but not planned.
 
 **Still open, not yet decided**: none — naming, hash scope, mode behavior, and CLI exit codes are all settled as of this session.
 
@@ -226,3 +228,26 @@ Platform images ship a kernel pre-baked; plain-slim images have nothing Jupyter-
   - **New gaps opened this session, no pytest coverage yet**: the four structural fixture cases (subdirectory helpers — both package-style and `sys.path.append`-style, root-level module resolution, `--output-dir` duplicate-stem collision avoidance, relative-asset mirroring limitation) currently only exist as a standalone generator script (`build_test_structures.py`) run and checked by hand, not as pytest fixtures. Converting these into `tmp_path`-based pytest fixtures (build structure → subprocess CLI call → assert on output) is the natural next step, and would also give a reusable pattern for the harvested-name normalization bug and the false-positive local-name notebooks once those are root-caused, since both need a similar "build a minimal repro, assert on the summary" test shape.
   - No test yet for the `apply_output_to_notebook` idempotency fix specifically in `--output-dir` mode (only confirmed by hand: run once, inspect for a single managed cell) — `--in-place` and default `--output` idempotency are covered in `test_disk_output.py`, `--output-dir` isn't yet.
   - No regression test for the batch-mode strict-metadata-gate fix (notebooks with no `kernelspec`/`language_info` at all now correctly assumed Python rather than rejected) — only manual corpus re-runs confirm this (21/21, 25/25 recognized post-fix).
+
+## Deferred: new-vs-pre-existing drift findings
+
+Discussed during CLI/generation-time integration (Sept 2026), deliberately
+not implemented — revisit once the basic check-drift/validation split has
+seen real use.
+
+Problem: check-drift re-reports every confirmed finding every time it runs,
+with no way to distinguish "this appeared since you last checked" from
+"you already saw this and it's unchanged." Applies to yanked, removed,
+conflict, and major-bump -- not to python-support (a published release's
+requires_python is immutable, so re-checking it always agrees with itself).
+
+Fix sketch: store a snapshot of what generation-time validation found
+(which signals fired, against which packages) inside the manifest itself.
+Check-drift then buckets findings into new-since-generation vs.
+already-known-at-generation, rather than flat severity alone.
+
+Cost: real manifest schema change (new field(s), affects dependency_hash
+scope, extraction, and manifest-construction tests). Not undertaken now
+because there wasn't yet a clear signal this is common enough to justify
+the schema churn -- deliberately pinning an old version and re-encountering
+the same known gap on every check is judged to be a rare case.
