@@ -46,10 +46,18 @@ import warnings
 import subprocess
 import hashlib
 import importlib.metadata
+import urllib.request
+import urllib.error
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Set, Dict, List, Tuple, Optional, Any, TypedDict, Callable, NamedTuple, Union
+from packaging.version import Version, InvalidVersion
+from packaging.specifiers import SpecifierSet, InvalidSpecifier
+from packaging.requirements import Requirement, InvalidRequirement
+from packaging.markers import default_environment
+from resolvelib import AbstractProvider, BaseReporter, Resolver
+from resolvelib.resolvers import ResolutionImpossible
 
 TOOL_VERSION: str = "44"
 SCHEMA_VERSION: str = "1.0"
@@ -1749,6 +1757,491 @@ def build_dependency_entries(
         all_entries.extend(writefile_entries)
 
     return all_entries, local_tagged_info, warnings_out
+
+
+# =====================================================================
+# DRIFT-CHECK: PYPI METADATA CLIENT
+# =====================================================================
+# Read-only lookups against live PyPI JSON metadata, used by drift-check
+# (Check mode). Never installs, never executes anything from a response.
+# Two independent caches, scoped to a single run only (cleared per process,
+# never persisted): version-specific data and package-level data answer
+# different questions and are fetched from different PyPI endpoints.
+
+PYPI_REQUEST_TIMEOUT = 10
+PYPI_USER_AGENT = f"steady-py-drift-check/{TOOL_VERSION}"
+
+# Lookup status: "found", "not_found" (404), or "network_error" (offline,
+# timeout, malformed response). "not_found" and "network_error" are kept
+# distinct from each other and from a clean "found" -- a network failure
+# must never be reported or treated as "no drift found."
+
+
+@dataclass
+class PypiVersionMetadata:
+    """Result of looking up one exact (package, version) pin."""
+    status: str
+    requires_dist: List[str] = field(default_factory=list)
+    requires_python: Optional[str] = None
+    yanked: bool = False
+    yanked_reason: Optional[str] = None
+    project_urls: Dict[str, str] = field(default_factory=dict)
+    error_detail: Optional[str] = None
+
+
+@dataclass
+class PypiPackageMetadata:
+    """Result of looking up a package's project-level (version-independent) data."""
+    status: str
+    latest_version: Optional[str] = None
+    releases: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # version -> {"upload_time": str, "yanked": bool}
+    error_detail: Optional[str] = None
+
+
+def _fetch_pypi_json(url: str) -> Tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+    """Shared HTTP GET against a PyPI JSON endpoint. Returns (status, payload, error_detail)."""
+    req = urllib.request.Request(url, headers={"User-Agent": PYPI_USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=PYPI_REQUEST_TIMEOUT) as resp:
+            return "found", json.loads(resp.read()), None
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return "not_found", None, None
+        return "network_error", None, f"HTTP {e.code}"
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+        return "network_error", None, str(e)
+
+
+@_memoize_for_run
+def fetch_pypi_version_metadata(name: str, version: str) -> PypiVersionMetadata:
+    """Looks up one exact pinned release. Cache key: (name, version) -- invariant across notebooks."""
+    status, payload, error_detail = _fetch_pypi_json(f"https://pypi.org/pypi/{name}/{version}/json")
+    if status != "found":
+        return PypiVersionMetadata(status=status, error_detail=error_detail)
+
+    info = payload.get("info", {})
+    return PypiVersionMetadata(
+        status="found",
+        requires_dist=info.get("requires_dist") or [],
+        requires_python=info.get("requires_python"),
+        yanked=info.get("yanked", False),
+        yanked_reason=info.get("yanked_reason"),
+        project_urls=info.get("project_urls") or {},
+    )
+
+
+@_memoize_for_run
+def fetch_pypi_package_metadata(name: str) -> PypiPackageMetadata:
+    """Looks up a package's project-level data (latest version, full release history). Cache key: name alone."""
+    status, payload, error_detail = _fetch_pypi_json(f"https://pypi.org/pypi/{name}/json")
+    if status != "found":
+        return PypiPackageMetadata(status=status, error_detail=error_detail)
+
+    info = payload.get("info", {})
+    releases: Dict[str, Dict[str, Any]] = {}
+    for ver, files in (payload.get("releases") or {}).items():
+        if not files:
+            continue
+        releases[ver] = {
+            "upload_time": files[0].get("upload_time_iso_8601"),
+            "yanked": any(f.get("yanked") for f in files),
+        }
+
+    return PypiPackageMetadata(
+        status="found",
+        latest_version=info.get("version"),
+        releases=releases,
+    )
+
+
+# --- Direct-pin checks ---------------------------------------------------
+# Heuristic thresholds below are deliberately simple defaults, not tuned
+# against corpus data yet -- easy to revisit once Check mode runs against
+# real notebooks.
+STALE_THRESHOLD_DAYS = 730  # ~2 years with no release anywhere in the project
+
+
+@dataclass
+class DriftFinding:
+    """One drift-check finding for a single pinned dependency.
+
+    severity separates "confirmed" (yanked, removed, declared conflict) from
+    "heuristic" (stale, major-bump) per the report's required visual split,
+    plus "error" for a pin that couldn't be checked at all (never collapsed
+    into "no drift found").
+    """
+    package: str
+    version: str
+    signal: str  # "conflict" | "yanked" | "removed" | "stale" | "major_bump" | "unsupported_python" | "check_error"
+    severity: str  # "confirmed" | "heuristic" | "error"
+    message: str
+    details: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "package": self.package,
+            "version": self.version,
+            "signal": self.signal,
+            "severity": self.severity,
+            "message": self.message,
+            "details": self.details,
+        }
+
+
+def _split_pin_name(name: str) -> Tuple[str, Optional[str]]:
+    """Splits a pin name into (bare PyPI project name, extra-or-None).
+
+    Pin names can carry an extras tag (e.g. "pandas[test]") from extras
+    promotion elsewhere in this tool. PyPI's JSON API only resolves bare
+    project names -- passing the extras-tagged form straight through
+    404s and gets misread as "removed from PyPI entirely."
+    """
+    try:
+        req = Requirement(name)
+        extra = next(iter(req.extras)) if req.extras else None
+        return req.name, extra
+    except InvalidRequirement:
+        return name, None
+
+
+def _marker_environment(required_python: Dict[str, int], extra: Optional[str]) -> Dict[str, str]:
+    """Real evaluation environment for a requires_dist marker: actual REQUIRED_PYTHON,
+    the pin's own extra (or none -- a base install activates no extras), and
+    packaging's default_environment() for everything else (platform/OS markers;
+    Kaggle/Colab are Linux, matching this environment, a reasonable approximation).
+    """
+    py_version = f"{required_python.get('major')}.{required_python.get('minor')}"
+    env = dict(default_environment())
+    env["python_version"] = py_version
+    env["python_full_version"] = py_version
+    env["extra"] = extra or ""
+    return env
+
+
+def check_pin_conflicts(dependencies: List[Dict[str, Any]], required_python: Dict[str, int]) -> List[DriftFinding]:
+    """Checks each direct pin's requires_dist against every other direct pin for a declared conflict.
+
+    Markers (python_version, extra) are evaluated properly against the notebook's
+    actual REQUIRED_PYTHON and each pin's actual extras -- not treated as
+    unconditionally applicable, which was tried and found to badly over-match
+    (e.g. pulling in a package's entire test/perf extras as if unconditional).
+    """
+    findings: List[DriftFinding] = []
+    pinned_versions = {
+        canonicalize_pkg_name(_split_pin_name(d["name"])[0]): d["version"]
+        for d in dependencies if d.get("name") and d.get("version")
+    }
+
+    for dep in dependencies:
+        raw_name, version = dep.get("name"), dep.get("version")
+        if not raw_name or not version:
+            continue
+        name, extra = _split_pin_name(raw_name)
+        env = _marker_environment(required_python, extra)
+        meta = fetch_pypi_version_metadata(name, version)
+        if meta.status != "found":
+            continue  # network errors and not-found are surfaced by check_yanked_or_removed
+
+        violations_by_target: Dict[str, List[Requirement]] = {}
+        for raw_req in meta.requires_dist:
+            try:
+                req = Requirement(raw_req)
+            except InvalidRequirement:
+                continue
+            if req.marker is not None and not req.marker.evaluate(env):
+                continue
+            req_canon = canonicalize_pkg_name(req.name)
+            other_version = pinned_versions.get(req_canon)
+            if not other_version or req_canon == canonicalize_pkg_name(name):
+                continue
+            try:
+                if not req.specifier.contains(Version(other_version), prereleases=True):
+                    violations_by_target.setdefault(req_canon, []).append(req)
+            except InvalidVersion:
+                continue
+
+        # With markers now evaluated correctly, at most one branch per target
+        # should ever survive -- this grouping is now a defensive no-op against
+        # genuinely duplicate declarations, not a workaround for marker-blindness.
+        for req_canon, violating_reqs in violations_by_target.items():
+            req = violating_reqs[0]
+            other_version = pinned_versions[req_canon]
+            findings.append(DriftFinding(
+                package=name, version=version, signal="conflict", severity="confirmed",
+                message=f"{name}=={version} requires {req.name}{req.specifier}, but {req.name} is pinned to {other_version}",
+                details={"conflicting_package": req.name, "required_specifier": str(req.specifier), "pinned_version": other_version},
+            ))
+
+    return findings
+
+
+def check_yanked_or_removed(name: str, version: str) -> List[DriftFinding]:
+    """Distinguishes: pin still resolvable -> yanked or clean; pin gone but project alive -> removed;
+    whole project gone -> removed (project-level); any network failure -> check_error, not silence.
+    """
+    name, _ = _split_pin_name(name)
+    version_meta = fetch_pypi_version_metadata(name, version)
+
+    if version_meta.status == "network_error":
+        return [DriftFinding(
+            package=name, version=version, signal="check_error", severity="error",
+            message=f"Could not check {name}=={version} against PyPI: {version_meta.error_detail}",
+        )]
+
+    if version_meta.status == "found":
+        if version_meta.yanked:
+            reason = f" ({version_meta.yanked_reason})" if version_meta.yanked_reason else ""
+            return [DriftFinding(
+                package=name, version=version, signal="yanked", severity="confirmed",
+                message=f"{name}=={version} has been yanked from PyPI{reason}",
+                details={"yanked_reason": version_meta.yanked_reason},
+            )]
+        return []
+
+    # version_meta.status == "not_found": disambiguate version-removed vs. project-removed
+    package_meta = fetch_pypi_package_metadata(name)
+    if package_meta.status == "network_error":
+        return [DriftFinding(
+            package=name, version=version, signal="check_error", severity="error",
+            message=f"Could not check {name}=={version} against PyPI: {package_meta.error_detail}",
+        )]
+    if package_meta.status == "found":
+        return [DriftFinding(
+            package=name, version=version, signal="removed", severity="confirmed",
+            message=f"{name}=={version} no longer exists on PyPI, though {name} itself is still published",
+        )]
+    return [DriftFinding(
+        package=name, version=version, signal="removed", severity="confirmed",
+        message=f"{name} has been removed from PyPI entirely",
+    )]
+
+
+def check_staleness(name: str, version: str) -> List[DriftFinding]:
+    """Heuristic: no release anywhere in the project within STALE_THRESHOLD_DAYS."""
+    name, _ = _split_pin_name(name)
+    package_meta = fetch_pypi_package_metadata(name)
+    if package_meta.status != "found" or not package_meta.releases:
+        return []
+
+    upload_times = []
+    for info in package_meta.releases.values():
+        ts = info.get("upload_time")
+        if not ts:
+            continue
+        try:
+            upload_times.append(datetime.fromisoformat(ts.replace("Z", "+00:00")))
+        except ValueError:
+            continue
+    if not upload_times:
+        return []
+
+    most_recent = max(upload_times)
+    age_days = (datetime.now(most_recent.tzinfo) - most_recent).days
+    if age_days < STALE_THRESHOLD_DAYS:
+        return []
+
+    return [DriftFinding(
+        package=name, version=version, signal="stale", severity="heuristic",
+        message=f"{name} has had no release in {age_days} days (last: {most_recent.date().isoformat()}) -- worth reviewing whether it's still maintained",
+        details={"days_since_last_release": age_days, "last_release_date": most_recent.date().isoformat()},
+    )]
+
+
+def check_major_bump(name: str, version: str) -> List[DriftFinding]:
+    """Heuristic: a newer major version exists than the one pinned -- worth reviewing, not a failure."""
+    name, _ = _split_pin_name(name)
+    package_meta = fetch_pypi_package_metadata(name)
+    if package_meta.status != "found" or not package_meta.latest_version:
+        return []
+    try:
+        pinned_v, latest_v = Version(version), Version(package_meta.latest_version)
+    except InvalidVersion:
+        return []
+    if latest_v.major <= pinned_v.major:
+        return []
+
+    return [DriftFinding(
+        package=name, version=version, signal="major_bump", severity="heuristic",
+        message=f"{name}=={version} is on major version {pinned_v.major}; {package_meta.latest_version} (major {latest_v.major}) is available -- worth reviewing",
+        details={"latest_version": package_meta.latest_version},
+    )]
+
+
+def check_python_support(name: str, version: str, required_python: Dict[str, int]) -> List[DriftFinding]:
+    """Confirms the pinned release declares support for the notebook's REQUIRED_PYTHON."""
+    name, _ = _split_pin_name(name)
+    version_meta = fetch_pypi_version_metadata(name, version)
+    if version_meta.status != "found" or not version_meta.requires_python:
+        return []  # nothing declared -> nothing to confirm against; not a finding
+
+    target = f"{required_python.get('major')}.{required_python.get('minor')}"
+    try:
+        supported = SpecifierSet(version_meta.requires_python).contains(target, prereleases=True)
+    except InvalidSpecifier:
+        return []
+
+    if supported:
+        return []
+    return [DriftFinding(
+        package=name, version=version, signal="unsupported_python", severity="confirmed",
+        message=f"{name}=={version} declares requires-python {version_meta.requires_python}, which does not cover Python {target}",
+        details={"declared_requires_python": version_meta.requires_python, "notebook_python": target},
+    )]
+
+
+# --- Transitive resolution (resolvelib) -----------------------------------
+# Resolves the FULL dependency graph (direct pins + everything transitively
+# required) purely from PyPI-published metadata: what versions exist, and
+# what each declares via requires_dist. No local install, no platform/wheel
+# matching -- that's what makes this usable for Kaggle/Colab targets rather
+# than whatever platform steady-py itself happens to run on. Uses resolvelib,
+# the same PyPA resolution algorithm pip has used internally since pip 20.3,
+# rather than a hand-rolled approximation of what a real resolver does.
+#
+# Known limitation: extras on a direct pin (e.g. "pandas[test]") are not
+# expanded into the graph -- the base package resolves, but the extra's own
+# additional requirements are not walked. Not silently dropped: this is a
+# real gap, not yet built.
+
+@dataclass(frozen=True)
+class _ResolutionCandidate:
+    """A concrete (name, version) resolvelib candidate backed by live PyPI data."""
+    name: str
+    version: str
+
+
+class _PyPIResolutionProvider(AbstractProvider):
+    """resolvelib Provider backed entirely by fetch_pypi_* -- no local environment."""
+
+    def __init__(self, required_python: Dict[str, int]):
+        self.required_python = required_python
+
+    def identify(self, requirement_or_candidate) -> str:
+        return canonicalize_pkg_name(requirement_or_candidate.name)
+
+    def get_preference(self, identifier, resolutions, candidates, information, backtrack_causes) -> int:
+        return len(list(candidates[identifier]))
+
+    def find_matches(self, identifier, requirements, incompatibilities) -> List[_ResolutionCandidate]:
+        reqs = list(requirements[identifier])
+        if not reqs:
+            return []
+        name = reqs[0].name
+        pkg_meta = fetch_pypi_package_metadata(name)
+        if pkg_meta.status != "found":
+            return []
+        excluded = {c.version for c in incompatibilities[identifier]}
+        matches = []
+        for ver_str in pkg_meta.releases:
+            if ver_str in excluded:
+                continue
+            try:
+                v = Version(ver_str)
+            except InvalidVersion:
+                continue
+            if all(r.specifier.contains(v, prereleases=True) for r in reqs):
+                matches.append((v, ver_str))
+        matches.sort(key=lambda pair: pair[0], reverse=True)
+        return [_ResolutionCandidate(name, ver_str) for _, ver_str in matches]
+
+    def is_satisfied_by(self, requirement, candidate) -> bool:
+        try:
+            return requirement.specifier.contains(Version(candidate.version), prereleases=True)
+        except InvalidVersion:
+            return False
+
+    def get_dependencies(self, candidate) -> List[Requirement]:
+        meta = fetch_pypi_version_metadata(candidate.name, candidate.version)
+        if meta.status != "found":
+            return []
+        env = _marker_environment(self.required_python, extra=None)  # base install; see extras limitation above
+        deps = []
+        for raw in meta.requires_dist:
+            try:
+                req = Requirement(raw)
+            except InvalidRequirement:
+                continue
+            if req.marker is not None and not req.marker.evaluate(env):
+                continue
+            deps.append(req)
+        return deps
+
+
+def resolve_transitive_graph(
+    dependencies: List[Dict[str, Any]], required_python: Dict[str, int]
+) -> Tuple[Optional[Dict[str, str]], List[DriftFinding]]:
+    """Resolves direct pins + everything transitively required, from PyPI metadata alone.
+
+    Returns (resolved_versions, findings). On success: resolved_versions maps every
+    package name in the graph to the version resolvelib picked, findings is empty.
+    On an unsatisfiable graph: resolved_versions is None, findings has one confirmed
+    "conflict" finding per underlying cause resolvelib reports.
+    """
+    root_reqs = []
+    for dep in dependencies:
+        raw_name, version = dep.get("name"), dep.get("version")
+        if not raw_name or not version:
+            continue
+        name, _extra = _split_pin_name(raw_name)
+        try:
+            root_reqs.append(Requirement(f"{name}=={version}"))
+        except InvalidRequirement:
+            continue
+
+    provider = _PyPIResolutionProvider(required_python)
+    resolver = Resolver(provider, BaseReporter())
+
+    try:
+        result = resolver.resolve(root_reqs)
+    except ResolutionImpossible as e:
+        findings = [
+            DriftFinding(
+                package=getattr(cause.requirement, "name", "?"),
+                version=str(getattr(cause.requirement, "specifier", "")),
+                signal="conflict", severity="confirmed",
+                message=(
+                    f"Unresolvable dependency graph: {cause.requirement} required by "
+                    f"{cause.parent.name if cause.parent else 'a direct pin'}"
+                ),
+            )
+            for cause in e.causes
+        ]
+        return None, findings
+    except Exception as e:
+        return None, [DriftFinding(
+            package="", version="", signal="check_error", severity="error",
+            message=f"Transitive resolution failed unexpectedly: {type(e).__name__}: {e}",
+        )]
+
+    return {name: cand.version for name, cand in result.mapping.items()}, []
+
+
+def check_transitive_signals(
+    dependencies: List[Dict[str, Any]], required_python: Dict[str, int]
+) -> List[DriftFinding]:
+    """Resolves the full graph, then runs yanked/removed, staleness, major-bump, and
+    python-support against every transitively-discovered package's resolved version.
+    Direct pins are skipped -- already covered by the direct-pin checks against
+    their real pinned version, not a resolver-picked one.
+    """
+    resolved, findings = resolve_transitive_graph(dependencies, required_python)
+    if resolved is None:
+        return findings  # unresolvable -- conflict findings already built
+
+    direct_names = {
+        canonicalize_pkg_name(_split_pin_name(d["name"])[0])
+        for d in dependencies if d.get("name")
+    }
+
+    for name, version in resolved.items():
+        if canonicalize_pkg_name(name) in direct_names:
+            continue
+        findings.extend(check_yanked_or_removed(name, version))
+        findings.extend(check_staleness(name, version))
+        findings.extend(check_major_bump(name, version))
+        findings.extend(check_python_support(name, version, required_python))
+
+    return findings
 
 
 # =====================================================================
