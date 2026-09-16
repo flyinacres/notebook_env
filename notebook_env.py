@@ -3640,7 +3640,7 @@ def run_single_file_pipeline(
         logger.info(f"✅ Updated '{written_path}'")
         if is_json:
             print(format_json_single_report(nb_report, artifacts_written=artifacts_written, drift_report=drift_report))
-        else:
+        elif drift_report.manifest.dependencies:
             print(format_console_drift_report(drift_report))
         if in_live_ipython:
             return
@@ -3667,8 +3667,9 @@ def run_single_file_pipeline(
     print("--- [ STEP 2: PASTE INTO CELL 2 (CODE) ] ---\n")
     print(blueprint["step2_code"])
     print("\n" + "="*80)
-    print()
-    print(format_console_drift_report(blueprint["drift_report"]))
+    if blueprint["drift_report"].manifest.dependencies:
+        print()
+        print(format_console_drift_report(blueprint["drift_report"]))
 
 
 def main() -> None:
