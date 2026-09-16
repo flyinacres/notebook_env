@@ -2212,10 +2212,16 @@ def check_transitive_signals(
 
 @dataclass
 class DriftCheckReport:
-    """Aggregated drift-check result for one manifest."""
+    """Aggregated result for one manifest. kind distinguishes two genuinely different
+    moments: "validation" (generation time -- brand-new pins, checked for the first
+    time, nothing has elapsed) vs "check" (--check-drift -- a previously-frozen
+    manifest, re-checked against however PyPI has moved since). Same underlying
+    checks either way; "drift" as a word only means something for the second one.
+    """
     target: str
     checked_at: str
     manifest: SteadyPyManifest
+    kind: str = "check"  # "validation" | "check"
     confirmed: List[DriftFinding] = field(default_factory=list)
     heuristic: List[DriftFinding] = field(default_factory=list)
     errors: List[DriftFinding] = field(default_factory=list)
@@ -2238,6 +2244,7 @@ class DriftCheckReport:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "kind": self.kind,
             "target": self.target,
             "checked_at": self.checked_at,
             "manifest": self.manifest.to_dict(),
@@ -2247,12 +2254,15 @@ class DriftCheckReport:
         }
 
 
-def build_drift_check_report(target: str, manifest: SteadyPyManifest, findings: List[DriftFinding]) -> DriftCheckReport:
+def build_drift_check_report(
+    target: str, manifest: SteadyPyManifest, findings: List[DriftFinding], kind: str = "check"
+) -> DriftCheckReport:
     """Buckets a flat findings list into confirmed/heuristic/error by severity."""
     report = DriftCheckReport(
         target=target,
         checked_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         manifest=manifest,
+        kind=kind,
     )
     for f in findings:
         if f.severity == "confirmed":
@@ -2268,8 +2278,11 @@ def format_console_drift_report(report: DriftCheckReport) -> str:
     """Formats a DriftCheckReport into a human-readable stdout report string."""
     out = []
     out.append("=" * 80)
-    out.append("DEPENDENCY DRIFT CHECK")
-    out.append(f"Target: {report.target}")
+    if report.kind == "validation":
+        out.append("INITIAL DEPENDENCY VALIDATION")
+    else:
+        out.append("DEPENDENCY DRIFT CHECK")
+        out.append(f"Target: {report.target}")
     out.append(f"Checked: {report.checked_at}")
     out.append("=" * 80 + "\n")
 
@@ -2293,7 +2306,10 @@ def format_console_drift_report(report: DriftCheckReport) -> str:
 
     out.append("-" * 80)
     if report.is_clean:
-        out.append("STATUS: ✅ Clean. No drift detected against the pinned manifest.")
+        if report.kind == "validation":
+            out.append("STATUS: ✅ Clean. No issues found in these pins.")
+        else:
+            out.append("STATUS: ✅ Clean. No drift detected against the pinned manifest.")
     else:
         parts = []
         if report.has_confirmed:
@@ -2313,7 +2329,7 @@ def format_json_drift_report(report: DriftCheckReport) -> str:
     payload = {
         "schema_version": SCHEMA_VERSION,
         "tool_version": TOOL_VERSION,
-        "mode": "check_drift",
+        "mode": "initial_validation" if report.kind == "validation" else "check_drift",
         **report.to_dict(),
     }
     return json.dumps(payload, indent=2)
@@ -2332,11 +2348,21 @@ def extract_manifest_from_file(path: str) -> Tuple[Optional[SteadyPyManifest], O
         if path.endswith(".ipynb"):
             with open(path, "r", encoding="utf-8") as f:
                 nb_data = json.load(f)
-            source = "\n".join(
+            cell_sources = [
                 "".join(cell.get("source", []))
                 for cell in nb_data.get("cells", [])
                 if cell.get("cell_type") == "code"
-            )
+            ]
+            cleaned_cells = []
+            for cell_source in cell_sources:
+                cell_type, clean_body = classify_cell_source(cell_source)
+                if cell_type in {"SHELL_SCRIPT", "WRITEFILE"}:
+                    continue
+                cleaned_cells.append("\n".join(
+                    "" if (line.strip().startswith('%') or line.strip().startswith('!')) else line
+                    for line in clean_body.splitlines()
+                ))
+            source = "\n".join(cleaned_cells)
         else:
             with open(path, "r", encoding="utf-8") as f:
                 source = f.read()
@@ -2389,6 +2415,19 @@ def run_check_drift_pipeline(target: str, output_format: str = "text") -> int:
         return 0
 
     findings: List[DriftFinding] = []
+
+    # Verify the manifest hasn't been hand-edited since it was generated. Only
+    # meaningful here -- generation is writing dependency_hash for the first
+    # time, not verifying a prior one.
+    stored_hash = manifest.dependency_hash
+    recomputed_hash = manifest.compute_and_set_hash()
+    if recomputed_hash != stored_hash:
+        findings.append(DriftFinding(
+            package="", version="", signal="tampered", severity="confirmed",
+            message=f"Manifest hash mismatch in {target} -- it may have been hand-edited since generation.",
+            details={"stored_hash": stored_hash, "recomputed_hash": recomputed_hash},
+        ))
+
     for dep in manifest.dependencies:
         name, version = dep.get("name"), dep.get("version")
         if not name or not version:
@@ -2693,7 +2732,7 @@ def generate_production_blueprint(
         generation_findings.extend(check_major_bump(name, version))
         generation_findings.extend(check_python_support(name, version, manifest.python_version))
     generation_findings.extend(check_transitive_signals(normalized_items, manifest.python_version))
-    drift_report = build_drift_check_report("(generation)", manifest, generation_findings)
+    drift_report = build_drift_check_report("", manifest, generation_findings, kind="validation")
 
     freeze_block_code = ""
     if full_freeze_lines:
