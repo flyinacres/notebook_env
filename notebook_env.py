@@ -1905,6 +1905,23 @@ def _split_pin_name(name: str) -> Tuple[str, Optional[str]]:
         return name, None
 
 
+def _has_local_version_identifier(version: str) -> bool:
+    """True if this pin has a PEP 440 local version segment (e.g. '2.3.1+cu121').
+
+    PyPI's own upload policy rejects any package with a local version label --
+    a public index can never host one. So a '+'-tagged pin will always 404
+    against pypi.org regardless of which index it actually came from (a custom
+    wheel index like download.pytorch.org, a private mirror, etc). Checking
+    this is more robust than parsing --index-url/--extra-index-url flags: it's
+    a direct, standards-based guarantee, not an inference from how the pin
+    happened to be installed.
+    """
+    try:
+        return Version(version).local is not None
+    except InvalidVersion:
+        return False
+
+
 def _marker_environment(required_python: Dict[str, int], extra: Optional[str]) -> Dict[str, str]:
     """Real evaluation environment for a requires_dist marker: actual REQUIRED_PYTHON,
     the pin's own extra (or none -- a base install activates no extras), and
@@ -2141,6 +2158,8 @@ def resolve_transitive_graph(
         raw_name, version = dep.get("name"), dep.get("version")
         if not raw_name or not version:
             continue
+        if _has_local_version_identifier(version):
+            continue  # not on PyPI by definition -- can't be a root requirement here
         name, _extra = _split_pin_name(raw_name)
         try:
             root_reqs.append(Requirement(f"{name}=={version}"))
@@ -2431,6 +2450,14 @@ def run_check_drift_pipeline(target: str, output_format: str = "text") -> int:
     for dep in manifest.dependencies:
         name, version = dep.get("name"), dep.get("version")
         if not name or not version:
+            continue
+        if _has_local_version_identifier(version):
+            findings.append(DriftFinding(
+                package=name, version=version, signal="unverifiable_custom_index", severity="heuristic",
+                message=f"{name}=={version} has a local version identifier -- installed from a custom index, "
+                        f"not PyPI, so PyPI-based checks (yanked/removed/staleness/major-bump/python-support) "
+                        f"cannot be run against it.",
+            ))
             continue
         findings.extend(check_yanked_or_removed(name, version))
         findings.extend(check_staleness(name, version))
@@ -2726,6 +2753,14 @@ def generate_production_blueprint(
     for dep in normalized_items:
         name, version = dep.get("name"), dep.get("version")
         if not name or not version:
+            continue
+        if _has_local_version_identifier(version):
+            generation_findings.append(DriftFinding(
+                package=name, version=version, signal="unverifiable_custom_index", severity="heuristic",
+                message=f"{name}=={version} has a local version identifier -- installed from a custom index, "
+                        f"not PyPI, so PyPI-based checks (yanked/removed/staleness/major-bump/python-support) "
+                        f"cannot be run against it.",
+            ))
             continue
         generation_findings.extend(check_yanked_or_removed(name, version))
         generation_findings.extend(check_staleness(name, version))
