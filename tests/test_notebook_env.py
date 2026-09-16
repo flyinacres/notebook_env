@@ -588,7 +588,7 @@ class TestSequentialExecutionEngine:
         code = blueprint["step2_code"]
 
         # Must contain structured iterable data, not just raw text block
-        assert "DEPENDENCIES =" in code or "REQUIREMENTS =" in code
+        assert "STEADY_PY_MANIFEST =" in code
         assert "2.3.1+cu121" in code
         assert "https://download.pytorch.org/whl/cu121" in code
 

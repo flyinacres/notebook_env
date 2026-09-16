@@ -44,6 +44,7 @@ import functools
 import logging
 import warnings
 import subprocess
+import hashlib
 import importlib.metadata
 from pathlib import Path
 from datetime import datetime
@@ -280,6 +281,43 @@ class GpuInfo:
             "frameworks_detected": self.frameworks,
             "probe_errors": self.probe_errors
         }
+
+
+@dataclass
+class SteadyPyManifest:
+    """Reproducibility manifest embedded in generated Cell 2 as STEADY_PY_MANIFEST.
+
+    Also the payload drift-check parses back out of a notebook/.py file to
+    evaluate pins against live PyPI metadata (no execution, no installs).
+    """
+    python_version: Dict[str, int]
+    dependencies: List[Dict[str, Any]]
+    gpu: Optional[Dict[str, Any]]
+    generated_at: str
+    tool_version: str = TOOL_VERSION
+    dependency_hash: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "python_version": self.python_version,
+            "dependencies": self.dependencies,
+            "gpu": self.gpu,
+            "generated_at": self.generated_at,
+            "tool_version": self.tool_version,
+            "dependency_hash": self.dependency_hash,
+        }
+
+    def compute_and_set_hash(self) -> str:
+        """Hashes canonical (sorted-key) JSON of every field except dependency_hash itself.
+
+        Covers content and provenance fields alike, so hand-editing anything in
+        the manifest -- including generated_at, to hide age -- invalidates the hash.
+        """
+        payload = self.to_dict()
+        payload.pop("dependency_hash")
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        self.dependency_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return self.dependency_hash
 
 
 class BlueprintResult(TypedDict):
@@ -1970,6 +2008,14 @@ def generate_production_blueprint(
     if comment_lines:
         comments_block = "\n# Informational notes & uninstalled fallbacks:\n" + "\n".join(comment_lines) + "\n"
 
+    manifest = SteadyPyManifest(
+        python_version={"major": py_major, "minor": py_minor},
+        dependencies=normalized_items,
+        gpu=gpu_info.to_dict() if gpu_info else None,
+        generated_at=timestamp,
+    )
+    manifest.compute_and_set_hash()
+
     freeze_block_code = ""
     if full_freeze_lines:
         freeze_lines_repr = repr(full_freeze_lines)
@@ -2002,18 +2048,18 @@ if CURRENT_PYTHON[1] != REQUIRED_PYTHON[1]:
     print(f"⚠️ This code was created with Python {{req_ver}}. You are trying to run it with {{curr_ver}}.")
     print(f"If installation fails, consider changing your runtime Python version back to {{req_ver}}.\\n")
 
-# Dependency Specification with Scoped Flags
-DEPENDENCIES = {repr(normalized_items)}
+# Reproducibility manifest (dependencies, Python target, GPU context, integrity hash)
+STEADY_PY_MANIFEST = {repr(manifest.to_dict())}
 {comments_block}{freeze_block_code}
 print(f"Applying verified environment dependencies [{timestamp}]...")
 print("💡 Note: Dependencies are installed sequentially to prevent index conflicts.\\n")
 
 passed_count = 0
 failed_packages = []
-total_deps = len(DEPENDENCIES)
+total_deps = len(STEADY_PY_MANIFEST["dependencies"])
 installed_baseline = {{}}
 
-for idx, item in enumerate(DEPENDENCIES, start=1):
+for idx, item in enumerate(STEADY_PY_MANIFEST["dependencies"], start=1):
     name = item["name"]
     ver = item.get("version", "")
     flags = item.get("flags", [])
