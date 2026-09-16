@@ -1918,63 +1918,6 @@ def _marker_environment(required_python: Dict[str, int], extra: Optional[str]) -
     return env
 
 
-def check_pin_conflicts(dependencies: List[Dict[str, Any]], required_python: Dict[str, int]) -> List[DriftFinding]:
-    """Checks each direct pin's requires_dist against every other direct pin for a declared conflict.
-
-    Markers (python_version, extra) are evaluated properly against the notebook's
-    actual REQUIRED_PYTHON and each pin's actual extras -- not treated as
-    unconditionally applicable, which was tried and found to badly over-match
-    (e.g. pulling in a package's entire test/perf extras as if unconditional).
-    """
-    findings: List[DriftFinding] = []
-    pinned_versions = {
-        canonicalize_pkg_name(_split_pin_name(d["name"])[0]): d["version"]
-        for d in dependencies if d.get("name") and d.get("version")
-    }
-
-    for dep in dependencies:
-        raw_name, version = dep.get("name"), dep.get("version")
-        if not raw_name or not version:
-            continue
-        name, extra = _split_pin_name(raw_name)
-        env = _marker_environment(required_python, extra)
-        meta = fetch_pypi_version_metadata(name, version)
-        if meta.status != "found":
-            continue  # network errors and not-found are surfaced by check_yanked_or_removed
-
-        violations_by_target: Dict[str, List[Requirement]] = {}
-        for raw_req in meta.requires_dist:
-            try:
-                req = Requirement(raw_req)
-            except InvalidRequirement:
-                continue
-            if req.marker is not None and not req.marker.evaluate(env):
-                continue
-            req_canon = canonicalize_pkg_name(req.name)
-            other_version = pinned_versions.get(req_canon)
-            if not other_version or req_canon == canonicalize_pkg_name(name):
-                continue
-            try:
-                if not req.specifier.contains(Version(other_version), prereleases=True):
-                    violations_by_target.setdefault(req_canon, []).append(req)
-            except InvalidVersion:
-                continue
-
-        # With markers now evaluated correctly, at most one branch per target
-        # should ever survive -- this grouping is now a defensive no-op against
-        # genuinely duplicate declarations, not a workaround for marker-blindness.
-        for req_canon, violating_reqs in violations_by_target.items():
-            req = violating_reqs[0]
-            other_version = pinned_versions[req_canon]
-            findings.append(DriftFinding(
-                package=name, version=version, signal="conflict", severity="confirmed",
-                message=f"{name}=={version} requires {req.name}{req.specifier}, but {req.name} is pinned to {other_version}",
-                details={"conflicting_package": req.name, "required_specifier": str(req.specifier), "pinned_version": other_version},
-            ))
-
-    return findings
-
-
 def check_yanked_or_removed(name: str, version: str) -> List[DriftFinding]:
     """Distinguishes: pin still resolvable -> yanked or clean; pin gone but project alive -> removed;
     whole project gone -> removed (project-level); any network failure -> check_error, not silence.
@@ -2020,6 +1963,11 @@ def check_staleness(name: str, version: str) -> List[DriftFinding]:
     """Heuristic: no release anywhere in the project within STALE_THRESHOLD_DAYS."""
     name, _ = _split_pin_name(name)
     package_meta = fetch_pypi_package_metadata(name)
+    if package_meta.status == "network_error":
+        return [DriftFinding(
+            package=name, version=version, signal="check_error", severity="error",
+            message=f"Could not check {name} for staleness: {package_meta.error_detail}",
+        )]
     if package_meta.status != "found" or not package_meta.releases:
         return []
 
@@ -2051,6 +1999,11 @@ def check_major_bump(name: str, version: str) -> List[DriftFinding]:
     """Heuristic: a newer major version exists than the one pinned -- worth reviewing, not a failure."""
     name, _ = _split_pin_name(name)
     package_meta = fetch_pypi_package_metadata(name)
+    if package_meta.status == "network_error":
+        return [DriftFinding(
+            package=name, version=version, signal="check_error", severity="error",
+            message=f"Could not check {name} for a newer major version: {package_meta.error_detail}",
+        )]
     if package_meta.status != "found" or not package_meta.latest_version:
         return []
     try:
@@ -2071,6 +2024,11 @@ def check_python_support(name: str, version: str, required_python: Dict[str, int
     """Confirms the pinned release declares support for the notebook's REQUIRED_PYTHON."""
     name, _ = _split_pin_name(name)
     version_meta = fetch_pypi_version_metadata(name, version)
+    if version_meta.status == "network_error":
+        return [DriftFinding(
+            package=name, version=version, signal="check_error", severity="error",
+            message=f"Could not check {name}=={version} for Python support: {version_meta.error_detail}",
+        )]
     if version_meta.status != "found" or not version_meta.requires_python:
         return []  # nothing declared -> nothing to confirm against; not a finding
 
