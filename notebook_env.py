@@ -332,6 +332,7 @@ class BlueprintResult(TypedDict):
     """Cell blueprint output strings for Cell 1 (Markdown) and Cell 2 (Python script)."""
     step1_markdown: str
     step2_code: str
+    drift_report: "DriftCheckReport"
 
 
 @dataclass
@@ -2202,6 +2203,216 @@ def check_transitive_signals(
     return findings
 
 
+# --- Report shape ----------------------------------------------------------
+# Confirmed findings (yanked, removed, declared conflict, unsupported-python)
+# are visually separated from heuristic findings (stale, major-bump) per this
+# project's stated principle: mixing severities erodes trust. Errors (a pin
+# that couldn't be checked at all) get their own section too -- never folded
+# into "no drift found."
+
+@dataclass
+class DriftCheckReport:
+    """Aggregated drift-check result for one manifest."""
+    target: str
+    checked_at: str
+    manifest: SteadyPyManifest
+    confirmed: List[DriftFinding] = field(default_factory=list)
+    heuristic: List[DriftFinding] = field(default_factory=list)
+    errors: List[DriftFinding] = field(default_factory=list)
+
+    @property
+    def has_confirmed(self) -> bool:
+        return len(self.confirmed) > 0
+
+    @property
+    def has_heuristic(self) -> bool:
+        return len(self.heuristic) > 0
+
+    @property
+    def has_errors(self) -> bool:
+        return len(self.errors) > 0
+
+    @property
+    def is_clean(self) -> bool:
+        return not (self.has_confirmed or self.has_heuristic or self.has_errors)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "target": self.target,
+            "checked_at": self.checked_at,
+            "manifest": self.manifest.to_dict(),
+            "confirmed": [f.to_dict() for f in self.confirmed],
+            "heuristic": [f.to_dict() for f in self.heuristic],
+            "errors": [f.to_dict() for f in self.errors],
+        }
+
+
+def build_drift_check_report(target: str, manifest: SteadyPyManifest, findings: List[DriftFinding]) -> DriftCheckReport:
+    """Buckets a flat findings list into confirmed/heuristic/error by severity."""
+    report = DriftCheckReport(
+        target=target,
+        checked_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        manifest=manifest,
+    )
+    for f in findings:
+        if f.severity == "confirmed":
+            report.confirmed.append(f)
+        elif f.severity == "heuristic":
+            report.heuristic.append(f)
+        else:
+            report.errors.append(f)
+    return report
+
+
+def format_console_drift_report(report: DriftCheckReport) -> str:
+    """Formats a DriftCheckReport into a human-readable stdout report string."""
+    out = []
+    out.append("=" * 80)
+    out.append("DEPENDENCY DRIFT CHECK")
+    out.append(f"Target: {report.target}")
+    out.append(f"Checked: {report.checked_at}")
+    out.append("=" * 80 + "\n")
+
+    if report.confirmed:
+        out.append(f"🔴 CONFIRMED ISSUES ({len(report.confirmed)}):")
+        for f in report.confirmed:
+            out.append(f"  • [{f.signal}] {f.message}")
+        out.append("")
+
+    if report.heuristic:
+        out.append(f"🟡 WORTH REVIEWING -- heuristic, not confirmed ({len(report.heuristic)}):")
+        for f in report.heuristic:
+            out.append(f"  • [{f.signal}] {f.message}")
+        out.append("")
+
+    if report.errors:
+        out.append(f"⚠️ COULD NOT CHECK ({len(report.errors)}):")
+        for f in report.errors:
+            out.append(f"  • {f.message}")
+        out.append("")
+
+    out.append("-" * 80)
+    if report.is_clean:
+        out.append("STATUS: ✅ Clean. No drift detected against the pinned manifest.")
+    else:
+        parts = []
+        if report.has_confirmed:
+            parts.append(f"{len(report.confirmed)} confirmed issue(s)")
+        if report.has_errors:
+            parts.append(f"{len(report.errors)} pin(s) could not be checked")
+        if report.has_heuristic:
+            parts.append(f"{len(report.heuristic)} item(s) worth reviewing")
+        out.append(f"STATUS: ⚠️ {'; '.join(parts)}")
+    out.append("=" * 80)
+
+    return "\n".join(out)
+
+
+def format_json_drift_report(report: DriftCheckReport) -> str:
+    """Formats a DriftCheckReport into valid machine-readable JSON."""
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "tool_version": TOOL_VERSION,
+        "mode": "check_drift",
+        **report.to_dict(),
+    }
+    return json.dumps(payload, indent=2)
+
+
+# --- Manifest extraction ----------------------------------------------------
+# Parses a previously-generated STEADY_PY_MANIFEST back out of a .ipynb or .py
+# file. No execution: ast.parse + ast.literal_eval only. "No manifest present"
+# is not an error -- it's the expected state for a pre-feature notebook.
+
+def extract_manifest_from_file(path: str) -> Tuple[Optional[SteadyPyManifest], Optional[str]]:
+    """Returns (manifest, error). No manifest found -> (None, None), not an error.
+    A real problem (unreadable file, corrupted embedded literal) -> (None, "message").
+    """
+    try:
+        if path.endswith(".ipynb"):
+            with open(path, "r", encoding="utf-8") as f:
+                nb_data = json.load(f)
+            source = "\n".join(
+                "".join(cell.get("source", []))
+                for cell in nb_data.get("cells", [])
+                if cell.get("cell_type") == "code"
+            )
+        else:
+            with open(path, "r", encoding="utf-8") as f:
+                source = f.read()
+    except (OSError, json.JSONDecodeError) as e:
+        return None, f"Could not read {path}: {e}"
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as e:
+        return None, f"Could not parse {path} as Python source: {e}"
+
+    manifest_dict = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "STEADY_PY_MANIFEST" for t in node.targets
+        ):
+            try:
+                manifest_dict = ast.literal_eval(node.value)
+            except (ValueError, SyntaxError) as e:
+                return None, f"STEADY_PY_MANIFEST found in {path} but is not a valid literal: {e}"
+            break
+
+    if manifest_dict is None:
+        return None, None  # no manifest present -- not an error
+
+    try:
+        return SteadyPyManifest(**manifest_dict), None
+    except TypeError as e:
+        return None, f"STEADY_PY_MANIFEST found in {path} but has an unexpected shape: {e}"
+
+
+# --- Check-drift pipeline ----------------------------------------------------
+
+def run_check_drift_pipeline(target: str, output_format: str = "text") -> int:
+    """Orchestrates Check mode end to end: extract -> run all checks -> report.
+
+    Returns the process exit code: 0 clean, 1 drift found (confirmed or
+    heuristic), 2 a pin (or the manifest itself) could not be checked. A
+    missing manifest is not an error -- it exits 0 with a clear "nothing to
+    check" message, since a pre-feature notebook is an expected, valid state.
+    """
+    manifest, error = extract_manifest_from_file(target)
+
+    if error:
+        print(f"⚠️ {error}", file=sys.stderr)
+        return 2
+
+    if manifest is None:
+        print(f"No STEADY_PY_MANIFEST found in {target} -- nothing to check.")
+        return 0
+
+    findings: List[DriftFinding] = []
+    for dep in manifest.dependencies:
+        name, version = dep.get("name"), dep.get("version")
+        if not name or not version:
+            continue
+        findings.extend(check_yanked_or_removed(name, version))
+        findings.extend(check_staleness(name, version))
+        findings.extend(check_major_bump(name, version))
+        findings.extend(check_python_support(name, version, manifest.python_version))
+    findings.extend(check_transitive_signals(manifest.dependencies, manifest.python_version))
+
+    report = build_drift_check_report(target, manifest, findings)
+
+    if output_format == "json":
+        print(format_json_drift_report(report))
+    else:
+        print(format_console_drift_report(report))
+
+    if report.has_errors:
+        return 2
+    if report.has_confirmed or report.has_heuristic:
+        return 1
+    return 0
+
+
 # =====================================================================
 # HARDWARE ACCELERATION INSPECTION
 # =====================================================================
@@ -2467,6 +2678,23 @@ def generate_production_blueprint(
     )
     manifest.compute_and_set_hash()
 
+    # Check pins against live PyPI at generation time, not only via a later,
+    # separate --check-drift run -- catching a bad pin now is strictly better
+    # than freezing it into a "reproducible" cell that never worked. The
+    # manifest is still produced either way (this tool never withholds
+    # output); findings are surfaced to the caller for a loud warning.
+    generation_findings: List[DriftFinding] = []
+    for dep in normalized_items:
+        name, version = dep.get("name"), dep.get("version")
+        if not name or not version:
+            continue
+        generation_findings.extend(check_yanked_or_removed(name, version))
+        generation_findings.extend(check_staleness(name, version))
+        generation_findings.extend(check_major_bump(name, version))
+        generation_findings.extend(check_python_support(name, version, manifest.python_version))
+    generation_findings.extend(check_transitive_signals(normalized_items, manifest.python_version))
+    drift_report = build_drift_check_report("(generation)", manifest, generation_findings)
+
     freeze_block_code = ""
     if full_freeze_lines:
         freeze_lines_repr = repr(full_freeze_lines)
@@ -2626,7 +2854,8 @@ print("=" * 60)"""
 
     return {
         "step1_markdown": step1_markdown,
-        "step2_code": step2_code
+        "step2_code": step2_code,
+        "drift_report": drift_report,
     }
 
 
@@ -3044,7 +3273,11 @@ def format_json_batch_report(summary: BatchAnalysisSummary, artifacts_written: O
     return json.dumps(payload, indent=2)
 
 
-def format_json_single_report(nb_report: NotebookAnalysisReport, artifacts_written: Optional[Dict[str, Any]] = None) -> str:
+def format_json_single_report(
+    nb_report: NotebookAnalysisReport,
+    artifacts_written: Optional[Dict[str, Any]] = None,
+    drift_report: Optional["DriftCheckReport"] = None,
+) -> str:
     """Formats a single NotebookAnalysisReport into valid machine-readable JSON."""
     payload = {
         "schema_version": SCHEMA_VERSION,
@@ -3055,7 +3288,8 @@ def format_json_single_report(nb_report: NotebookAnalysisReport, artifacts_writt
             "python_version": [sys.version_info.major, sys.version_info.minor, sys.version_info.micro]
         },
         **nb_report.to_dict(),
-        "artifacts_written": artifacts_written
+        "artifacts_written": artifacts_written,
+        "drift_check": drift_report.to_dict() if drift_report else None,
     }
     return json.dumps(payload, indent=2)
 
@@ -3129,8 +3363,9 @@ def apply_output_to_notebook(
     root_dir: Optional[str] = None,
     output_dir: Optional[str] = None,
     install_timeout: int = 120
-) -> Path:
-    """Writes per-notebook locked file or replaces setup cells in-place idempotently."""
+) -> Tuple[Path, "DriftCheckReport"]:
+    """Writes per-notebook locked file or replaces setup cells in-place idempotently.
+    Returns the written path and the generation-time drift-check report."""
     if local_repo_modules is None:
         local_repo_modules = get_notebook_local_modules(scan_res.path, root_dir)
 
@@ -3196,7 +3431,7 @@ def apply_output_to_notebook(
     with open(target_path, 'w', encoding='utf-8') as f:
         json.dump(nb_data, f, indent=1)
 
-    return target_path
+    return target_path, blueprint["drift_report"]
 
 
 def run_batch_pipeline(
@@ -3247,7 +3482,7 @@ def run_batch_pipeline(
         written_files = []
         for res in repo_map.scan_results:
             nb_local_mods = get_notebook_local_modules(res.path, repo_map.target_dir)
-            written_path = apply_output_to_notebook(
+            written_path, drift_report = apply_output_to_notebook(
                 res, 
                 frozen_env, 
                 pkg_dist_map, 
@@ -3261,6 +3496,12 @@ def run_batch_pipeline(
             )
             written_files.append(str(written_path))
             logger.info(f"  • Updated '{written_path}'")
+            if drift_report.has_confirmed or drift_report.has_errors:
+                logger.warning(
+                    f"    ⚠️ {len(drift_report.confirmed)} confirmed issue(s), "
+                    f"{len(drift_report.errors)} pin(s) could not be checked -- "
+                    f"run --check-drift on this file for details."
+                )
         artifacts_written["locked_notebooks"] = written_files
         logger.info("✅ Batch output complete.")
 
@@ -3383,7 +3624,7 @@ def run_single_file_pipeline(
             loc_desc = f"suffix: '{active_suffix_display}'"
 
         logger.info(f"🚀 Writing updated notebook ({loc_desc})...")
-        written_path = apply_output_to_notebook(
+        written_path, drift_report = apply_output_to_notebook(
             single_res,
             frozen_env,
             pkg_dist_map,
@@ -3398,7 +3639,9 @@ def run_single_file_pipeline(
         artifacts_written = {"locked_notebook": str(written_path)}
         logger.info(f"✅ Updated '{written_path}'")
         if is_json:
-            print(format_json_single_report(nb_report, artifacts_written=artifacts_written))
+            print(format_json_single_report(nb_report, artifacts_written=artifacts_written, drift_report=drift_report))
+        else:
+            print(format_console_drift_report(drift_report))
         if in_live_ipython:
             return
         return
@@ -3424,6 +3667,8 @@ def run_single_file_pipeline(
     print("--- [ STEP 2: PASTE INTO CELL 2 (CODE) ] ---\n")
     print(blueprint["step2_code"])
     print("\n" + "="*80)
+    print()
+    print(format_console_drift_report(blueprint["drift_report"]))
 
 
 def main() -> None:
@@ -3438,6 +3683,7 @@ def main() -> None:
     parser.add_argument("--timeout", type=int, default=120, metavar="SECONDS", help="Per-package pip install timeout in seconds, baked into the generated notebook's install cell (default: 120).")
     parser.add_argument("--quiet", action="store_true", help="Suppress diagnostic and status logging outputs.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose debug output.")
+    parser.add_argument("--check-drift", action="store_true", help="Read-only: check an existing notebook's pinned manifest for drift against live PyPI, instead of generating a new one.")
 
     # Batch / Output Flags
     parser.add_argument("--batch", metavar="DIR", help="Run in batch mode across all notebooks in specified directory.")
@@ -3464,6 +3710,17 @@ def main() -> None:
         logger.setLevel(logging.ERROR)
     elif args.verbose:
         logger.setLevel(logging.DEBUG)
+
+    if args.check_drift:
+        if not args.notebook or not os.path.isfile(args.notebook):
+            logger.error("❌ Error: --check-drift requires a target notebook or .py file path.")
+            if is_running_in_ipython():
+                return
+            sys.exit(2)
+        exit_code = run_check_drift_pipeline(args.notebook, output_format=args.format)
+        if is_running_in_ipython():
+            return
+        sys.exit(exit_code)
 
     target_batch_dir = args.batch or (args.notebook if args.notebook and os.path.isdir(args.notebook) else None)
 

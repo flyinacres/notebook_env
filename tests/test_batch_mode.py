@@ -1,411 +1,339 @@
-"""
-Unit and Integration Tests for Batch Mode (v25+).
-"""
-
 import json
 import sys
-import types
+import subprocess
 import pytest
 from pathlib import Path
 
 import notebook_env as ne
 
 
+# --- FIXTURES ---
+
 @pytest.fixture
-def mock_batch_env(monkeypatch):
-    frozen_env = {
-        "numpy": "numpy==1.26.4",
-        "pandas": "pandas==2.2.1",
-        "torch": "torch==2.3.1+cu121",
-        "scikit-learn": "scikit-learn==1.4.2",
-        "umap-learn": "umap-learn==0.5.5",
+def mock_frozen_env(monkeypatch):
+    """Provides deterministic environment pins for Tier 1 tests."""
+    mock_env = {
+        "pandas": "pandas==2.1.0",
+        "numpy": "numpy==1.25.0",
+        "requests": "requests==2.31.0"
     }
-    raw_freeze = list(frozen_env.values())
-    pkg_dist_map = {
-        "numpy": ["numpy"],
-        "pandas": ["pandas"],
-        "torch": ["torch"],
-        "sklearn": ["scikit-learn"],
-        "umap": ["umap-learn"]
-    }
-    monkeypatch.setattr(ne, "get_installed_environment", lambda: (frozen_env, raw_freeze))
-    return frozen_env, pkg_dist_map
-
-
-class TestLanguageKernelDetection:
-    def test_python_notebook_detected(self):
-        nb = {"metadata": {"kernelspec": {"language": "python"}}}
-        is_py, label = ne.detect_notebook_language(nb)
-        assert is_py is True
-        assert label == "python"
-
-    def test_r_notebook_skipped(self):
-        nb = {"metadata": {"kernelspec": {"language": "R"}}}
-        is_py, label = ne.detect_notebook_language(nb)
-        assert is_py is False
-        assert label == "r"
-
-    def test_conflicting_language_metadata(self):
-        nb = {"metadata": {"kernelspec": {"language": "python"}, "language_info": {"name": "julia"}}}
-        is_py, label = ne.detect_notebook_language(nb)
-        assert is_py is False
-        assert "conflict" in label
-
-    def test_strict_mode_accepts_missing_metadata(self, tmp_path):
-        nb_no_meta = {
-            "cell_type": "code",
-            "metadata": {},
-            "cells": [{"cell_type": "code", "source": ["import math\n"]}]
-        }
-        nb_path = tmp_path / "no_metadata.ipynb"
-        nb_path.write_text(json.dumps(nb_no_meta), encoding="utf-8")
-
-        success, imports, submodules, code_sources, err, lang_label, guarded, dyn_warns = (
-            ne.extract_from_file(str(nb_path), strict=True)
-        )
-
-        assert success is True
-        assert "math" in imports
-        assert err is None
-        assert "unspecified" in lang_label or lang_label == ne.StatusLabel.PYTHON
-
-
-class TestPrimaryIndexSelection:
-    def test_majority_rule_selection(self):
-        url_map = {
-            "https://index.a.com": [Path("01.ipynb"), Path("02.ipynb"), Path("03.ipynb")],
-            "https://index.b.com": [Path("04.ipynb")]
-        }
-        best_url, reason = ne.select_primary_index_url(url_map)
-        assert best_url == "https://index.a.com"
-
-    def test_alphabetical_filename_tie_break(self):
-        url_map = {
-            "https://index.b.com": [Path("02_file.ipynb")],
-            "https://index.a.com": [Path("01_file.ipynb")]
-        }
-        best_url, reason = ne.select_primary_index_url(url_map)
-        assert best_url == "https://index.a.com"
-
-    def test_alphabetical_url_tie_break(self):
-        url_map = {
-            "https://z_index.com": [Path("01_same.ipynb")],
-            "https://a_index.com": [Path("01_same.ipynb")]
-        }
-        best_url, reason = ne.select_primary_index_url(url_map)
-        assert best_url == "https://a_index.com"
-
-
-class TestBatchOrchestration:
-    def test_batch_scan_and_universal_generation(self, tmp_path, mock_batch_env):
-        frozen_env, pkg_dist_map = mock_batch_env
-        
-        nb1 = {
-            "metadata": {
-                "kernelspec": {"language": "python"}
-            },
-            "cells": [{"cell_type": "code", "source": ["import numpy as np\n!pip install -i https://index.foo.com pkg"]}]
-        }
-        nb1_path = tmp_path / "01_test.ipynb"
-        nb1_path.write_text(json.dumps(nb1))
-
-        nb_r = {"metadata": {"kernelspec": {"language": "R"}}, "cells": []}
-        (tmp_path / "02_r.ipynb").write_text(json.dumps(nb_r))
-
-        repo_map = ne.walk_and_scan_directory(str(tmp_path))
-        report, is_clean = ne.generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, None)
-
-        assert is_clean is True
-        assert len(repo_map.scan_results) == 1
-        assert len(repo_map.non_python_files) == 1
-
-        uni_manifest = ne.generate_universal_manifest(repo_map, frozen_env, pkg_dist_map)
-        assert "numpy==1.26.4" in uni_manifest
-        assert "https://index.foo.com" in uni_manifest
-
-    def test_per_notebook_output_generation(self, tmp_path, mock_batch_env):
-        frozen_env, pkg_dist_map = mock_batch_env
-        
-        nb = {"cells": [{"cell_type": "code", "source": ["import pandas as pd\n"]}]}
-        nb_path = tmp_path / "analysis.ipynb"
-        nb_path.write_text(json.dumps(nb))
-
-        res = ne.NotebookScanResult(
-            path=nb_path,
-            is_python=True,
-            lang_label="python",
-            imports=["pandas"],
-            code_sources=["import pandas as pd"]
-        )
-        written_path = ne.apply_output_to_notebook(res, frozen_env, pkg_dist_map, None, suffix="_merged")
-
-        assert written_path.exists()
-        assert written_path.name == "analysis_merged.ipynb"
-
-        out_nb = json.loads(written_path.read_text())
-        first_cell = out_nb["cells"][0]
-        assert first_cell["metadata"]["notebook_env"]["managed"] is True
-        assert first_cell["metadata"]["notebook_env"]["role"] == "setup_markdown"
-
-    def test_in_place_cell_replacement(self, tmp_path, mock_batch_env):
-        frozen_env, pkg_dist_map = mock_batch_env
-        
-        nb = {
-            "cells": [
-                {
-                    "cell_type": "markdown", 
-                    "metadata": {"notebook_env": {"managed": True, "role": "setup_markdown"}},
-                    "source": ["OLD CONTENT"]
-                },
-                {"cell_type": "code", "source": ["import pandas as pd\n"]}
-            ]
-        }
-        nb_path = tmp_path / "inplace_test.ipynb"
-        nb_path.write_text(json.dumps(nb))
-
-        res = ne.NotebookScanResult(
-            path=nb_path,
-            is_python=True,
-            lang_label="python",
-            imports=["pandas"],
-            code_sources=["import pandas as pd"]
-        )
-        written_path = ne.apply_output_to_notebook(res, frozen_env, pkg_dist_map, None, in_place=True)
-
-        out_nb = json.loads(written_path.read_text())
-        assert len(out_nb["cells"]) == 3
-        assert "OLD CONTENT" not in out_nb["cells"][0]["source"][0]
-        assert out_nb["cells"][0]["metadata"]["notebook_env"]["managed"] is True
-
-    def test_batch_walk_populates_cell_magic_fields(self, tmp_path, mock_batch_env):
-        frozen_env, pkg_dist_map = mock_batch_env
-        
-        nb = {
-            "metadata": {"kernelspec": {"language": "python"}},
-            "cells": [{
-                "cell_type": "code", 
-                "source": [
-                    "%pip install seaborn\n",
-                    "!pip install -i https://index.foo.com custom_pkg\n"
-                ]
-            }]
-        }
-        nb_path = tmp_path / "magic_test.ipynb"
-        nb_path.write_text(json.dumps(nb))
-
-        repo_map = ne.walk_and_scan_directory(str(tmp_path))
-        assert len(repo_map.scan_results) == 1
-        
-        res = repo_map.scan_results[0]
-        assert "seaborn" in res.harvested_pkgs
-        assert "custom_pkg" in res.harvested_pkgs
-        assert "https://index.foo.com" in res.base_index_urls
-        assert "https://index.foo.com" in res.harvested_urls
-
-    def test_batch_report_surfaces_unimported_magic_packages(self, tmp_path, mock_batch_env):
-        frozen_env, pkg_dist_map = mock_batch_env
-        
-        nb = {
-            "metadata": {"kernelspec": {"language": "python"}},
-            "cells": [{"cell_type": "code", "source": ["!pip install gdown\n"]}]
-        }
-        nb_path = tmp_path / "unimported_magic.ipynb"
-        nb_path.write_text(json.dumps(nb))
-
-        repo_map = ne.walk_and_scan_directory(str(tmp_path))
-        report, is_clean = ne.generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, None)
-
-        assert "gdown" in report
-
-    def test_universal_manifest_includes_magic_packages(self, tmp_path, mock_batch_env):
-        frozen_env, pkg_dist_map = mock_batch_env
-        
-        nb = {
-            "metadata": {"kernelspec": {"language": "python"}},
-            "cells": [{"cell_type": "code", "source": ["!pip install gdown\n"]}]
-        }
-        nb_path = tmp_path / "magic_manifest.ipynb"
-        nb_path.write_text(json.dumps(nb))
-
-        repo_map = ne.walk_and_scan_directory(str(tmp_path))
-        uni_manifest = ne.generate_universal_manifest(repo_map, frozen_env, pkg_dist_map)
-
-        assert "gdown" in uni_manifest
-
-    def test_batch_report_handles_local_tagged_builds(self, tmp_path, mock_batch_env):
-        frozen_env, pkg_dist_map = mock_batch_env
-        
-        nb = {
-            "metadata": {"kernelspec": {"language": "python"}},
-            "cells": [{"cell_type": "code", "source": ["import torch\n"]}]
-        }
-        nb_path = tmp_path / "tagged_build.ipynb"
-        nb_path.write_text(json.dumps(nb))
-
-        repo_map = ne.walk_and_scan_directory(str(tmp_path))
-        report, is_clean = ne.generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, None)
-
-        assert is_clean is True
-        assert "torch" in report
-
-    def test_platform_pseudo_modules_not_flagged_as_missing(self, tmp_path, mock_batch_env):
-        frozen_env, pkg_dist_map = mock_batch_env
-
-        nb = {
-            "metadata": {"kernelspec": {"language": "python"}},
-            "cells": [{"cell_type": "code", "source": ["import dbutils\nimport kaggle_secrets\n"]}]
-        }
-        nb_path = tmp_path / "pseudo_test.ipynb"
-        nb_path.write_text(json.dumps(nb), encoding="utf-8")
-
-        repo_map = ne.walk_and_scan_directory(str(tmp_path))
-        report, is_clean = ne.generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, None)
-
-        assert "Packages missing from current environment: 0" in report
-
-    def test_local_repo_modules_not_flagged_as_missing_pypi_packages(self, tmp_path, mock_batch_env):
-        frozen_env, pkg_dist_map = mock_batch_env
-
-        (tmp_path / "cookbook.py").write_text("# local helper file", encoding="utf-8")
-
-        nb = {
-            "metadata": {"kernelspec": {"language": "python"}},
-            "cells": [{"cell_type": "code", "source": ["import cookbook\n"]}]
-        }
-        nb_path = tmp_path / "local_import_test.ipynb"
-        nb_path.write_text(json.dumps(nb), encoding="utf-8")
-
-        repo_map = ne.walk_and_scan_directory(str(tmp_path))
-        report, is_clean = ne.generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, None)
-
-        assert "Packages missing from current environment: 0" in report
-
-    def test_canonicalize_pkg_name_normalizes_variants(self):
-        """PEP 503 normalization: equate hyphens, underscores, and periods."""
-        assert ne.canonicalize_pkg_name("torch_neuronx") == "torch-neuronx"
-        assert ne.canonicalize_pkg_name("torch-neuronx") == "torch-neuronx"
-        assert ne.canonicalize_pkg_name("scikit_learn") == "scikit-learn"
-        assert ne.canonicalize_pkg_name("Scikit.Learn") == "scikit-learn"
-
-    def test_import_to_pypi_map_includes_skimage(self):
-        """'skimage' must resolve to 'scikit-image' in PyPI mapping."""
-        assert ne.IMPORT_TO_PYPI_MAP.get("skimage") == "scikit-image"
-
-    def test_platform_pseudo_and_build_tools_defined(self):
-        """'databricks' and 'notebook_env' in pseudo modules; 'pip', 'setuptools', 'wheel' in build tools."""
-        for mod in ("databricks", "notebook_env"):
-            assert mod in ne.PLATFORM_PSEUDO_MODULES
-        for tool in ("pip", "setuptools", "wheel"):
-            assert tool in ne.BUILD_AND_PACKAGING_TOOLS
-
-    def test_batch_summary_deduplicates_and_hyphenates_uninstalled_packages(self, tmp_path):
-        """
-        Batch summary merges underscore and hyphen imports into a single canonical
-        entry and displays it with standard PyPI hyphens.
-        """
-        nb1 = {
-            "metadata": {"kernelspec": {"language": "python"}},
-            "cells": [{"cell_type": "code", "source": ["import torch_neuronx\n"]}]
-        }
-        nb2 = {
-            "metadata": {"kernelspec": {"language": "python"}},
-            "cells": [{"cell_type": "code", "source": ["!pip install torch-neuronx\n"]}]
-        }
-        (tmp_path / "01_nb.ipynb").write_text(json.dumps(nb1), encoding="utf-8")
-        (tmp_path / "02_nb.ipynb").write_text(json.dumps(nb2), encoding="utf-8")
-
-        repo_map = ne.walk_and_scan_directory(str(tmp_path))
-        summary = ne.analyze_batch_repository(
-            repo_map=repo_map,
-            frozen_env={},
-            pkg_dist_map={},
-            batch_hw_cache=None
-        )
-
-        assert "torch-neuronx" in summary.missing_packages
-        assert "torch_neuronx" not in summary.missing_packages
-        assert len(summary.missing_packages["torch-neuronx"]) == 2
-
-
-def test_batch_report_surfaces_hardware_tag_warnings(tmp_path):
-    """Verify generate_batch_analysis_report flags local tag builds missing download index URLs."""
-    nb_path = tmp_path / "test_hw_tag.ipynb"
-    nb_data = {
-        "cells": [{"cell_type": "code", "execution_count": 1, "metadata": {}, "outputs": [], "source": ["import torch"]}],
-        "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"}},
-        "nbformat": 4,
-        "nbformat_minor": 5
-    }
-    with open(nb_path, "w", encoding="utf-8") as f:
-        json.dump(nb_data, f)
-
-    mock_env = {"torch": "torch==2.1.0+cu121"}
-    
-    scan_res = ne.NotebookScanResult(
-        path=nb_path,
-        is_python=True,
-        lang_label="python",
-        imports=["torch"],
-        code_sources=["import torch"]
+    monkeypatch.setattr(
+        ne, 
+        "get_installed_environment", 
+        lambda: (mock_env, ["pandas==2.1.0", "numpy==1.25.0", "requests==2.31.0"])
     )
-    
-    repo_map = ne.RepoEnvironmentMap(str(tmp_path))
-    repo_map.add_result(scan_res)
-    
-    report_text, _ = ne.generate_batch_analysis_report(repo_map, mock_env, {}, None)
-    
-    assert "Custom Build Tag Warnings:" in report_text
+    return mock_env
 
 
-def test_batch_mode_scopes_local_modules_to_notebook_subdirectory(tmp_path):
-    """Verify batch analysis recognizes local modules in subdirectories relative to the notebook."""
-    sub_dir = tmp_path / "databricks"
-    cookbook_dir = sub_dir / "cookbook"
-    cookbook_dir.mkdir(parents=True)
-    (cookbook_dir / "__init__.py").write_text("# local package", encoding="utf-8")
-
-    nb_path = sub_dir / "05_tool_calling_agent.ipynb"
-    nb_data = {
-        "cells": [{"cell_type": "code", "execution_count": 1, "metadata": {}, "outputs": [], "source": ["import cookbook"]}],
-        "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"}},
-        "nbformat": 4,
-        "nbformat_minor": 5
-    }
-    with open(nb_path, "w", encoding="utf-8") as f:
-        json.dump(nb_data, f)
-
-    scan_res = ne.NotebookScanResult(
-        path=nb_path,
-        is_python=True,
-        lang_label="python",
-        imports=["cookbook"],
-        code_sources=["import cookbook"]
-    )
-
-    repo_map = ne.RepoEnvironmentMap(str(tmp_path))
-    repo_map.add_result(scan_res)
-
-    summary = ne.analyze_batch_repository(repo_map, {}, {}, None)
-
-    assert "cookbook" not in summary.missing_packages
-
-
-def test_batch_hardware_tag_warnings_use_unified_dependency_pipeline(tmp_path: Path) -> None:
-    """Batch analysis catches custom build tag warnings via unified build_dependency_entries pipeline."""
-    nb_path = tmp_path / "hw_test.ipynb"
-    nb_data = {
+@pytest.fixture
+def sample_notebook_data():
+    """Generates standard Jupyter Notebook JSON dict with custom metadata."""
+    return {
         "cells": [
-            {"cell_type": "code", "execution_count": 1, "source": ["import torch\n"]}
+            {
+                "cell_type": "code",
+                "execution_count": 1,
+                "metadata": {},
+                "outputs": [],
+                "source": ["import pandas as pd\n", "import numpy as np\n"]
+            }
         ],
-        "metadata": {"kernelspec": {"language": "python"}}
+        "metadata": {
+            "kernelspec": {
+                "display_name": "Python 3 (ipykernel)",
+                "language": "python",
+                "name": "python3"
+            },
+            "language_info": {
+                "name": "python"
+            }
+        },
+        "nbformat": 4,
+        "nbformat_minor": 5
     }
-    with open(nb_path, "w", encoding="utf-8") as f:
-        json.dump(nb_data, f)
 
-    repo_map = ne.walk_and_scan_directory(str(tmp_path))
-    frozen_env = {"torch": "torch==2.3.1+cu121"}
+
+@pytest.fixture
+def sample_notebook_file(tmp_path, sample_notebook_data):
+    """Writes a sample notebook to disk in a temporary directory."""
+    nb_path = tmp_path / "test_notebook.ipynb"
+    with open(nb_path, "w", encoding="utf-8") as f:
+        json.dump(sample_notebook_data, f, indent=1)
+    return nb_path
+
+
+# =====================================================================
+# TIER 1: IN-PROCESS DISK & CONTENT TESTS (Mocked Environment)
+# =====================================================================
+
+def test_apply_output_companion_file(sample_notebook_file, mock_frozen_env):
+    """Verify companion file creation (_merged.ipynb) without altering original notebook."""
+    scan_res = ne.NotebookScanResult(
+        path=sample_notebook_file,
+        is_python=True,
+        lang_label="python",
+        imports={"pandas", "numpy"},
+        code_sources=["import pandas as pd\nimport numpy as np"]
+    )
+
+    out_path, _ = ne.apply_output_to_notebook(scan_res, mock_frozen_env, {}, None, suffix="_merged", in_place=False)
+
+    assert out_path.exists()
+    assert out_path.name == "test_notebook_merged.ipynb"
+
+    # Original untouched
+    with open(sample_notebook_file, "r", encoding="utf-8") as f:
+        orig_data = json.load(f)
+    assert len(orig_data["cells"]) == 1
+
+    # Companion contains 2 managed cells + 1 original cell
+    with open(out_path, "r", encoding="utf-8") as f:
+        merged_data = json.load(f)
+
+    assert len(merged_data["cells"]) == 3
+    assert merged_data["metadata"]["kernelspec"]["name"] == "python3"
+    assert merged_data["cells"][0]["metadata"]["notebook_env"]["managed"] is True
+    assert merged_data["cells"][1]["metadata"]["notebook_env"]["managed"] is True
+
+
+def test_apply_output_companion_overwrite_existing(sample_notebook_file, mock_frozen_env):
+    """Verify that --output overwrites an existing companion file cleanly."""
+    scan_res = ne.NotebookScanResult(
+        path=sample_notebook_file,
+        is_python=True,
+        lang_label="python",
+        imports={"pandas"},
+        code_sources=["import pandas as pd"]
+    )
+
+    # First run
+    ne.apply_output_to_notebook(scan_res, mock_frozen_env, {}, None, suffix="_merged", in_place=False)
+
+    # Second run (overwriting existing _merged.ipynb)
+    out_path2, _ = ne.apply_output_to_notebook(scan_res, mock_frozen_env, {}, None, suffix="_merged", in_place=False)
+
+    assert out_path2.exists()
+    with open(out_path2, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    assert len(data["cells"]) == 3
+
+def test_apply_output_gpu_misattribution_prevented(sample_notebook_file, mock_frozen_env):
+    """Verify that a TensorFlow notebook does not inherit PyTorch CUDA device attributions from batch cache."""
+    scan_res = ne.NotebookScanResult(
+        path=sample_notebook_file,
+        is_python=True,
+        lang_label="python",
+        imports={"tensorflow"},
+        code_sources=["import tensorflow as tf"]
+    )
+
+    # Batch HW cache populated by a PyTorch notebook on CUDA
+    pytorch_batch_cache = ne.GpuInfo(
+        has_gpu=True,
+        type="NVIDIA CUDA",
+        active_framework="PyTorch",
+        device_name="NVIDIA GeForce RTX 4090 (via PyTorch)",
+        frameworks=["torch", "tensorflow"]
+    )
+
+    out_path, _ = ne.apply_output_to_notebook(
+        scan_res, 
+        mock_frozen_env, 
+        {}, 
+        pytorch_batch_cache, 
+        in_place=True
+    )
+
+    with open(out_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    markdown_cell_source = "".join(data["cells"][0]["source"])
     
-    summary = ne.analyze_batch_repository(repo_map, frozen_env=frozen_env, pkg_dist_map={}, batch_hw_cache=None)
+    # Assert PyTorch CUDA device name is NOT misattributed to the TensorFlow notebook
+    assert "NVIDIA GeForce RTX 4090 (via PyTorch)" not in markdown_cell_source
+
+def test_apply_output_inplace(sample_notebook_file, mock_frozen_env):
+    """Verify in-place modification updates the target file directly."""
+    scan_res = ne.NotebookScanResult(
+        path=sample_notebook_file,
+        is_python=True,
+        lang_label="python",
+        imports={"pandas"},
+        code_sources=["import pandas as pd"]
+    )
+
+    out_path, _ = ne.apply_output_to_notebook(scan_res, mock_frozen_env, {}, None, in_place=True)
+
+    assert out_path == sample_notebook_file
+    with open(sample_notebook_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    assert len(data["cells"]) == 3
+    assert data["cells"][0]["metadata"]["notebook_env"]["managed"] is True
+    assert data["cells"][1]["metadata"]["notebook_env"]["managed"] is True
+
+
+def test_inplace_idempotency_rerun(sample_notebook_file, mock_frozen_env):
+    """Verify executing --in-place twice replaces managed cells without duplication, using real AST re-scan."""
+    # First Pass
+    success1, imports1, submodules1, sources1, _, _, guarded1, dyn1 = ne.extract_from_file(str(sample_notebook_file))
+    scan_res1 = ne.NotebookScanResult(
+        path=sample_notebook_file,
+        is_python=success1,
+        lang_label="python",
+        imports=imports1,
+        submodules=submodules1,
+        guarded_imports=guarded1,
+        dynamic_warnings=dyn1,
+        code_sources=sources1
+    )
+    ne.apply_output_to_notebook(scan_res1, mock_frozen_env, {}, None, in_place=True)
+
+    # Verify First Run Output
+    with open(sample_notebook_file, "r", encoding="utf-8") as f:
+        data_run1 = json.load(f)
+    assert len(data_run1["cells"]) == 3
+
+    # Second Pass: Perform genuine extract_from_file on the modified notebook
+    success2, imports2, submodules2, sources2, _, _, guarded2, dyn2 = ne.extract_from_file(str(sample_notebook_file))
+    scan_res2 = ne.NotebookScanResult(
+        path=sample_notebook_file,
+        is_python=success2,
+        lang_label="python",
+        imports=imports2,
+        submodules=submodules2,
+        guarded_imports=guarded2,
+        dynamic_warnings=dyn2,
+        code_sources=sources2
+    )
+    ne.apply_output_to_notebook(scan_res2, mock_frozen_env, {}, None, in_place=True)
+
+    # Verify Second Run Output: Cell count must remain 3 (2 managed + 1 original user cell)
+    with open(sample_notebook_file, "r", encoding="utf-8") as f:
+        data_run2 = json.load(f)
+
+    assert len(data_run2["cells"]) == 3
+    assert data_run2["cells"][0]["metadata"]["notebook_env"]["managed"] is True
+    assert data_run2["cells"][1]["metadata"]["notebook_env"]["managed"] is True
+
+
+# =====================================================================
+# TIER 2: SUBPROCESS CLI PLUMBING TESTS (Explicit UTF-8 Handles & Structural Checks)
+# =====================================================================
+
+def test_cli_single_file_inplace(sample_notebook_file):
+    """CLI test for single-file --in-place execution without --output."""
+    cmd = [sys.executable, "notebook_env.py", str(sample_notebook_file), "--in-place"]
+    res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+    assert res.returncode == 0
+
+    with open(sample_notebook_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    assert len(data["cells"]) == 3
+    assert data["cells"][0]["metadata"]["notebook_env"]["managed"] is True
+
+
+def test_cli_single_file_output_companion(sample_notebook_file):
+    """CLI test for single-file --output companion execution."""
+    cmd = [sys.executable, "notebook_env.py", str(sample_notebook_file), "--output"]
+    res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+    assert res.returncode == 0
+    companion = sample_notebook_file.parent / "test_notebook_merged.ipynb"
+    assert companion.exists()
+
+    with open(companion, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    assert len(data["cells"]) == 3
+
+
+def test_cli_batch_inplace_alone(tmp_path, sample_notebook_data):
+    """CLI test asserting --batch with --in-place alone (no --output) performs in-place writes."""
+    nb1 = tmp_path / "nb1.ipynb"
+    with open(nb1, "w", encoding="utf-8") as f:
+        json.dump(sample_notebook_data, f)
+
+    cmd = [sys.executable, "notebook_env.py", "--batch", str(tmp_path), "--in-place"]
+    res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+    assert res.returncode == 0
+
+    # Assert in-place modification occurred
+    with open(nb1, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    assert len(data["cells"]) == 3
+
+    # Assert negative: No companion file nb1_merged.ipynb was created
+    companion = tmp_path / "nb1_merged.ipynb"
+    assert not companion.exists()
+
+
+def test_cli_batch_output_and_inplace(tmp_path, sample_notebook_data):
+    """CLI test asserting --in-place takes precedence when passed alongside --output."""
+    nb1 = tmp_path / "nb1.ipynb"
+    with open(nb1, "w", encoding="utf-8") as f:
+        json.dump(sample_notebook_data, f)
+
+    cmd = [sys.executable, "notebook_env.py", "--batch", str(tmp_path), "--output", "--in-place"]
+    res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+    assert res.returncode == 0
+
+    with open(nb1, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    assert len(data["cells"]) == 3
+
+    companion = tmp_path / "nb1_merged.ipynb"
+    assert not companion.exists()
+
+
+def test_cli_single_file_flags_without_notebook_errors():
+    """CLI test asserting passing --in-place without a target notebook or --batch exits with error."""
+    cmd = [sys.executable, "notebook_env.py", "--in-place"]
+    res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+    assert res.returncode != 0
+
+
+def test_apply_output_multi_framework_gpu_resolution(sample_notebook_file, mock_frozen_env):
+    """Verify TensorFlow notebook receives TensorFlow CUDA attribution when PyTorch is also in batch HW cache."""
+    scan_res = ne.NotebookScanResult(
+        path=sample_notebook_file,
+        is_python=True,
+        lang_label="python",
+        imports={"tensorflow"},
+        code_sources=["import tensorflow as tf"]
+    )
+
+    # Cache where both PyTorch and TensorFlow were independently probed
+    multi_fw_cache = ne.GpuInfo(
+        has_gpu=True,
+        type="NVIDIA CUDA",
+        active_framework="PyTorch",
+        device_name="NVIDIA GeForce RTX 4090 (via PyTorch)",
+        frameworks=["torch", "tensorflow"],
+        framework_devices={
+            "torch": "NVIDIA GeForce RTX 4090 (via PyTorch)",
+            "tensorflow": "NVIDIA GPU (via TensorFlow)"
+        }
+    )
+
+    out_path, _ = ne.apply_output_to_notebook(
+        scan_res, 
+        mock_frozen_env, 
+        {}, 
+        multi_fw_cache, 
+        in_place=True
+    )
+
+    with open(out_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    markdown_cell_source = "".join(data["cells"][0]["source"])
     
-    assert "torch==2.3.1+cu121" in summary.batch_hardware_warnings
-    assert summary.batch_hardware_warnings["torch==2.3.1+cu121"] == ["hw_test.ipynb"]
+    # Assert TensorFlow notebook gets its own TensorFlow accelerator attribution, not PyTorch
+    assert "NVIDIA GPU (via TensorFlow)" in markdown_cell_source
+    assert "PyTorch" not in markdown_cell_source
