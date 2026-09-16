@@ -94,20 +94,50 @@ For all four: catching `Exception` broadly means a missing/uninstalled package (
 
 Motivating problem: pins prevent breakage from the environment moving out from under a notebook, but a pin itself can go stale over time (a pinned package gets yanked, a pinned pair of packages conflict, a pinned release no longer supports the notebook's `REQUIRED_PYTHON`). Nothing currently checks a pin against anything beyond the environment installed at generation time.
 
-**Manifest**: Cell 2's `DEPENDENCIES = [...]` literal becomes a uniquely-named structured literal (e.g. `NOTEBOOK_ENV_MANIFEST`) — Python version, pinned dependencies, GPU info, generation timestamp — built from `NotebookAnalysisReport`/`GpuInfo.to_dict()`. No external file: avoids Kaggle/Colab/offline path ambiguity and multi-notebook directory collisions. Should align with the `--format json` schema already implemented (see above) rather than invent a second shape, and — per the outstanding item above — should itself be a typed structure, not an inline dict.
+**Naming note**: avoid "stale" for this concept in code/docs — `test_live_kernel_stale_repin.py` already uses "stale" for a different, unrelated thing (a live kernel's cached module reference going stale mid-session after an interactive re-pin). Use "drift"/"freshness" for this feature to keep the two apart.
 
-**Batch drift-check subcommand**: given a directory of previously generated notebooks, parses the manifest back out of each `.ipynb` (no execution) and checks it against live PyPI metadata:
+**Manifest**: Cell 2's `DEPENDENCIES = [...]` literal becomes `STEADY_PY_MANIFEST` — a structured literal of type `SteadyPyManifest`, both names tied to the `steady-py` package name (settled). Built from `NotebookAnalysisReport`/`GpuInfo.to_dict()`. No external file: avoids Kaggle/Colab/offline path ambiguity and multi-notebook directory collisions. Should align with the `--format json` schema already implemented (see above) rather than invent a second shape, and — per the outstanding item above — should itself be a typed structure, not an inline dict.
 
+Fields: Python version, pinned dependencies, GPU info, `generated_at`, `tool_version`.
+
+**`dependency_hash`**: covers the *entire* manifest — content (deps, python version, GPU) and provenance (`generated_at`, `tool_version`) alike — via canonical serialization (e.g. sha256 over sorted-key JSON), independent of however the literal happens to be formatted in Cell 2. Purpose: detect hand-editing of the manifest, which invalidates any future check against it — including someone hand-editing the timestamp to hide age, which is exactly the kind of tampering this should catch, not exempt.
+
+**Two modes** — a middle "verify without changing pins" mode was considered and rejected: confirming pins still work requires actually running the code, and running the code means real installed versions now exist, which should simply become the new pins. There's no meaningful state between "unchanged, trusted" and "changed, replaced."
+
+- **Check** (new, read-only; this is "drift-check"): given a directory of previously generated notebooks (or plain `.py` files — this isn't notebook-restricted, just less critical there), parses the manifest back out of each artifact (no execution) and checks it against live PyPI metadata. Never touches the environment, never proposes new pins, never writes anything.
+- **Replace**: not new work — this is the existing generator (`main()`, both Path A saved-file and Path B live-kernel), pointed at an artifact that already has a manifest. **Unconditional**: always produces a fully new manifest (new `generated_at`, new `tool_version`, new hash) regardless of whether the content actually changed — no hash-comparison/preserve-old-timestamp logic, there is no conditional "regenerate" path. Like every other mode in this tool, it only produces new Cell 2 text; the tool never edits the user's file in place to insert it — that stays the user's action, consistent with how the tool has always worked. Pre-existing (pre-feature) notebooks aren't a special case — they just get a fresh manifest the same way any Replace does.
+
+**Check's signals**:
 - Pin-vs-pin conflicts among direct pinned packages (`requires_dist`).
-- Yanked packages — confirmed signal.
+- Yanked packages — confirmed signal. Distinct from **removed** (the whole project deleted from PyPI, not just one release) — different failure mode, needs its own handling since a removed package breaks the lookup itself, not just returns a flag.
 - Staleness (no recent release) — heuristic, not proof of breakage.
 - Newer major version available upstream — "worth reviewing," not "will break."
 - Pinned release no longer declares support for the notebook's `REQUIRED_PYTHON`.
-- Transitive dependencies — same metadata walk extended recursively through each pin's `requires_dist`, since a conflict/yank several levels down is invisible from direct pins alone.
+- Transitive dependencies — same metadata walk extended recursively through each pin's `requires_dist`, since a conflict/yank several levels down is invisible from direct pins alone. Needs a visited-set (cycles) and environment-marker evaluation (`; python_version>=...`).
 
 Output must distinguish confirmed signals (yanked, declared incompatibility) from heuristic ones (staleness, major bump) — flagging both at equal severity risks false alarms eroding trust, per this project's own "false success is worse than doing nothing" principle.
 
+**CLI exit codes — required, not deferred**: 0 (clean), 1 (drift found), 2 (error/exception during check). This is also what makes the feature usable from cron/GitHub Actions/any scheduler without any scheduling logic of its own — Check already produces `--format json` and a clean exit code, which is everything an external scheduler needs; no scheduled-mode feature belongs in this tool itself.
+
+**From `depcheck` — added to the plan** (beyond what's already listed above):
+- `why <package>`: trace which pin(s) pulled a package in. Near-free once the transitive walk (signal 6 above) exists.
+- Diff between two manifest snapshots of the same notebook (this run vs. a prior run) — reuses the same manifest-parsing already built for Check; answers "what changed" more directly than a flat report.
+- Changelog/homepage link on the major-bump signal — PyPI's `project_urls` field is already part of the same metadata fetch, so this is close to free.
+- Semver-tiered classification (major/minor/patch) instead of a flat "major bump available," with rough risk framing per tier.
+
+**Deferred as future options, alongside CVE/vulnerability data** (see limitation above): license compliance checking. Same reasoning as CVE — a real, useful, but distinct capability, not core to drift detection, and shouldn't block v1.
+
+**Memoization**: keyed on `(package_name, exact_pinned_version)` — PyPI metadata for an exact version is invariant regardless of which notebook/directory references it, unlike `resolve_pypi_package_and_extras`'s directory-scoped caching. Two levels: the raw metadata fetch, and the transitive closure per `(package, version)` node, so a shared dependency isn't re-walked per top-level pin. Scoped to a single run only, never persisted across days — `yanked` status and "latest version" are exactly what this feature exists to catch changing over time; a cross-run cache would silently reintroduce that staleness.
+
+**CVE/vulnerability data — deferred, not in scope for v1.** Discovered PyPI's own JSON API already returns a `vulnerabilities` array (sourced from OSV) on the same per-release response already being fetched for `requires_dist`/`yanked`/`requires_python` — free to add later, no separate tool or library needed. Deliberately left out of v1: precision is fine (curated per-package, not fuzzy CPE matching like typical SCA tools), but relevance isn't — a correctly-matched CVE in an unreachable code path is still noise for a one-off notebook that never runs a network service, and mixing it with the "this will not install" signals above (which are unambiguous) would undermine trust in those. If added later, keep it a separately-labeled signal, e.g. `--format json` only.
+
 **Known limitation**: metadata-based checking cannot catch runtime/API breakage that isn't expressible as a version constraint (code that installs cleanly but errors or behaves differently at call time). Only real execution would catch that; this feature doesn't attempt it — a pip dry-run resolves against the local machine, not the target platform (Kaggle/Colab), so it isn't ground truth for what this feature needs anyway.
+
+**Explicitly rejected/out of scope**: SBOM export, license compliance, dependency graph visualization (wrong audience — enterprise supply-chain tooling, real build cost, not asked for). A scheduled/watch mode (already decided against — the check mode is a manually-invoked CLI subcommand only; a hosted version is a plausible future paid product, not part of this tool).
+
+**Competitive landscape (checked, not reused)**: `pip-audit`/`safety` are vulnerability-only, don't touch drift. Dependabot/Renovate are hosted GitHub bots requiring a repo + CI, not invokable as a library/CLI against arbitrary pins. `depcheck` (PyPI: `depdoctor`) is a closer match for the *plain-Python-project* case — outdated/unmaintained/yanked/removed/CVE checks against `requirements.txt`/`pyproject.toml`/`Pipfile` — but single-maintainer, first release June 2026, unproven, and it doesn't solve the notebook problem: it has no generated, portable artifact (Cell 2's actual distinguishing feature) — every future check requires the tool itself reinstalled and rerun. Worth testing against a real project before deciding whether this tool should ever do general project-level scanning; the more distinctive gap it surfaced — a generated, zero-dependency standalone check script for plain Python projects, committed alongside `requirements.txt` — is a genuinely different, separate idea, noted here but not planned.
+
+**Still open, not yet decided**: none — naming, hash scope, mode behavior, and CLI exit codes are all settled as of this session.
 
 ## Real-world validation plan (in progress)
 
