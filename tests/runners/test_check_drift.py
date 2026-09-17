@@ -1,164 +1,136 @@
 #!/usr/bin/env python3
+"""End-to-end test for the --check-drift CLI.
+
+Executes real subprocesses against actual notebook files on disk to verify
+CLI argument handling, process exit codes, and manifest drift detection.
 """
-End-to-end test for the --check-drift CLI, run as real subprocesses against
-a real notebook file on disk -- not in-process function calls.
 
-test_manifest_roundtrip_e2e.py (pytest, tests/) already covers generation,
-extraction, and check-drift by calling the Python functions directly. That
-can never verify the actual CLI plumbing itself: argparse parsing real
-sys.argv, sys.exit() producing a real OS-level process exit code, the two
-invocations (generate, then check) genuinely being separate processes
-against the same file on disk. This script exists specifically to prove
-that plumbing, which a direct function call structurally cannot.
+from __future__ import annotations
 
-Invoked directly (matches this directory's other runners, not pytest):
-    python tests/runners/test_check_drift.py
-
-Named test_check_drift.py despite not being pytest-discoverable content --
-none of the callables below start with test_, specifically so bare pytest
-cannot accidentally collect and run them (which would bypass main()'s
-sequencing and, critically, its cleanup -- these mutate the real
-environment with real pip install/uninstall calls, unlike everything in
-tests/*.py).
-"""
-import sys
-import json
-import subprocess
 import os
+from pathlib import Path
+import sys
 
-FIXTURE_PATH = "tests/fixtures/temp_check_drift_fixture.ipynb"
-MERGED_PATH = "tests/fixtures/temp_check_drift_fixture_merged.ipynb"
-NO_MANIFEST_PATH = "tests/fixtures/temp_check_drift_no_manifest.ipynb"
+from e2e_harness import (
+    FIXTURES_DIR,
+    fail_test,
+    run_cli_command,
+    run_notebook_env,
+    temp_notebook,
+)
 
-# requests==2.32.0 is permanently yanked (CVE-2024-35195 mitigation conflict) --
-# a durable, verified-earlier fact, safe to assert against real PyPI without
-# this test breaking on schedule rather than on regression.
+FIXTURE_PATH = FIXTURES_DIR / "temp_check_drift_fixture.ipynb"
+MERGED_PATH = FIXTURES_DIR / "temp_check_drift_fixture_merged.ipynb"
+NO_MANIFEST_PATH = FIXTURES_DIR / "temp_check_drift_no_manifest.ipynb"
+
 YANKED_PACKAGE = "requests"
 YANKED_VERSION = "2.32.0"
 
 
-def _write_notebook(path, cell_source):
-    content = {
-        "cells": [{"cell_type": "code", "source": [cell_source], "metadata": {}}],
-        "metadata": {}, "nbformat": 4, "nbformat_minor": 5,
-    }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(content, f)
+def cleanup_pip_package() -> None:
+    """Removes the yanked package from the test environment."""
+    run_cli_command([sys.executable, "-m", "pip", "uninstall", "-y", "-q", YANKED_PACKAGE])
 
 
-def _cleanup():
-    for path in (FIXTURE_PATH, MERGED_PATH, NO_MANIFEST_PATH):
-        if os.path.exists(path):
-            os.remove(path)
-    subprocess.run(
-        [sys.executable, "-m", "pip", "uninstall", "-y", "-q", YANKED_PACKAGE],
-        capture_output=True, text=True,
-    )
+def run_generate_then_check_drift() -> None:
+    """Tests generating a manifest and detecting drift with a yanked package."""
+    print(f"1. Installing {YANKED_PACKAGE}=={YANKED_VERSION} (yanked release)...")
+    install = run_cli_command([sys.executable, "-m", "pip", "install", "--quiet", f"{YANKED_PACKAGE}=={YANKED_VERSION}"])
+    if not install.ok:
+        fail_test(
+            "Install Yanked Package",
+            f"Failed to install {YANKED_PACKAGE}=={YANKED_VERSION}",
+            stdout=install.stdout,
+            stderr=install.stderr,
+        )
+
+    with temp_notebook(FIXTURE_PATH, [f"import {YANKED_PACKAGE}"]):
+        print("2. Generating (notebook_env.py <fixture> --output)...")
+        gen = run_notebook_env(str(FIXTURE_PATH), "--output")
+        if not gen.ok:
+            fail_test(
+                "Generate Manifest Subprocess",
+                f"notebook_env exited with status {gen.returncode}",
+                stdout=gen.stdout,
+                stderr=gen.stderr,
+            )
+
+        if not MERGED_PATH.exists():
+            fail_test("Merged File Generation", f"Expected output file not found: {MERGED_PATH}")
+
+        try:
+            print("   PASS: generation succeeded, merged file written.")
+
+            print("3. Checking drift (notebook_env.py <merged> --check-drift)...")
+            check = run_notebook_env(str(MERGED_PATH), "--check-drift")
+            if check.returncode != 1:
+                fail_test(
+                    "Check Drift Status Code",
+                    f"Expected exit code 1, received {check.returncode}",
+                    stdout=check.stdout,
+                    stderr=check.stderr,
+                )
+
+            if "[yanked]" not in check.stdout:
+                fail_test(
+                    "Check Drift Findings",
+                    "Expected '[yanked]' finding not present in output.",
+                    stdout=check.stdout,
+                    stderr=check.stderr,
+                )
+            print("   PASS: check-drift correctly exited 1 with a real [yanked] finding.")
+
+            print("5. Hand-editing the merged file on disk, then re-checking...")
+            content = MERGED_PATH.read_text(encoding="utf-8")
+            tampered = content.replace(f"'{YANKED_VERSION}'", "'2.32.1'")
+            if tampered == content:
+                fail_test("Tampering Setup", "Replacement target not found in generated manifest.")
+            MERGED_PATH.write_text(tampered, encoding="utf-8")
+
+            tamper_check = run_notebook_env(str(MERGED_PATH), "--check-drift")
+            if tamper_check.returncode != 1:
+                fail_test(
+                    "Tampering Detection Exit Code",
+                    f"Expected exit code 1 for tampered manifest, received {tamper_check.returncode}",
+                    stdout=tamper_check.stdout,
+                    stderr=tamper_check.stderr,
+                )
+
+            if "[tampered]" not in tamper_check.stdout:
+                fail_test(
+                    "Tampering Detection Findings",
+                    "Expected '[tampered]' finding not present in output.",
+                    stdout=tamper_check.stdout,
+                    stderr=tamper_check.stderr,
+                )
+            print("   PASS: check-drift correctly detected hand-edited manifest on disk.")
+        finally:
+            if MERGED_PATH.exists():
+                MERGED_PATH.unlink()
 
 
-def run_generate_then_check_drift() -> int:
-    """Real generate, real check-drift, two separate processes, same file."""
-    print(f"1. Installing {YANKED_PACKAGE}=={YANKED_VERSION} (a real, permanently-yanked release)...")
-    install = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--quiet", f"{YANKED_PACKAGE}=={YANKED_VERSION}"],
-        capture_output=True, text=True,
-    )
-    if install.returncode != 0:
-        print(f"FAIL: could not install {YANKED_PACKAGE}=={YANKED_VERSION}.\n{install.stderr}")
-        return 1
-
-    _write_notebook(FIXTURE_PATH, f"import {YANKED_PACKAGE}")
-
-    print("2. Generating (real subprocess: notebook_env.py <fixture> --output)...")
-    gen = subprocess.run(
-        [sys.executable, "notebook_env.py", FIXTURE_PATH, "--output"],
-        capture_output=True, text=True,
-    )
-    if gen.returncode != 0:
-        print(f"FAIL: generation subprocess exited {gen.returncode}.\n{gen.stderr}\n{gen.stdout}")
-        return 1
-    if not os.path.exists(MERGED_PATH):
-        print(f"FAIL: expected merged output at {MERGED_PATH}, not found.")
-        return 1
-    print("   PASS: generation succeeded, merged file written.")
-
-    print("3. Checking drift (real subprocess: notebook_env.py <merged> --check-drift)...")
-    check = subprocess.run(
-        [sys.executable, "notebook_env.py", MERGED_PATH, "--check-drift"],
-        capture_output=True, text=True,
-    )
-    if check.returncode != 1:
-        print(f"FAIL: expected real exit code 1 (confirmed drift), got {check.returncode}.\n{check.stdout}\n{check.stderr}")
-        return 1
-    if "[yanked]" not in check.stdout:
-        print(f"FAIL: expected '[yanked]' finding in check-drift output, not found.\n{check.stdout}")
-        return 1
-    print("   PASS: check-drift correctly exited 1 with a real [yanked] finding.")
-    return 0
-
-
-def run_check_drift_no_manifest() -> int:
-    """A real file with no STEADY_PY_MANIFEST -- real subprocess, real exit 0."""
+def run_check_drift_no_manifest() -> None:
+    """Verifies that running check-drift on an unmanaged notebook exits cleanly."""
     print("4. Checking drift against a real file with no manifest present...")
-    _write_notebook(NO_MANIFEST_PATH, "print('no manifest here')")
-
-    check = subprocess.run(
-        [sys.executable, "notebook_env.py", NO_MANIFEST_PATH, "--check-drift"],
-        capture_output=True, text=True,
-    )
-    if check.returncode != 0:
-        print(f"FAIL: expected real exit code 0 (nothing to check), got {check.returncode}.\n{check.stdout}\n{check.stderr}")
-        return 1
-    print("   PASS: check-drift correctly exited 0 with no manifest present.")
-    return 0
-
-
-def run_check_drift_tampering() -> int:
-    """Hand-edit the real merged file on disk after generation, then re-check via
-    a fresh subprocess -- proves tampering detection survives an actual
-    generate-then-edit-then-check workflow, not just an in-memory round trip."""
-    print("5. Hand-editing the merged file on disk, then re-checking...")
-    if not os.path.exists(MERGED_PATH):
-        print(f"FAIL: {MERGED_PATH} does not exist -- run generation step first.")
-        return 1
-
-    with open(MERGED_PATH, "r", encoding="utf-8") as f:
-        content = f.read()
-    tampered = content.replace(f"'{YANKED_VERSION}'", "'2.32.1'")
-    if tampered == content:
-        print("FAIL: tampering replacement did not match anything in the merged file.")
-        return 1
-    with open(MERGED_PATH, "w", encoding="utf-8") as f:
-        f.write(tampered)
-
-    check = subprocess.run(
-        [sys.executable, "notebook_env.py", MERGED_PATH, "--check-drift"],
-        capture_output=True, text=True,
-    )
-    if check.returncode != 1:
-        print(f"FAIL: expected real exit code 1 (tampering is a confirmed finding), got {check.returncode}.\n{check.stdout}")
-        return 1
-    if "[tampered]" not in check.stdout:
-        print(f"FAIL: expected '[tampered]' finding in check-drift output, not found.\n{check.stdout}")
-        return 1
-    print("   PASS: check-drift correctly detected hand-edited manifest on disk.")
-    return 0
+    with temp_notebook(NO_MANIFEST_PATH, ["print('no manifest here')"]):
+        check = run_notebook_env(str(NO_MANIFEST_PATH), "--check-drift")
+        if not check.ok:
+            fail_test(
+                "Unmanaged Notebook Check",
+                f"Expected exit code 0, received {check.returncode}",
+                stdout=check.stdout,
+                stderr=check.stderr,
+            )
+        print("   PASS: check-drift correctly exited 0 with no manifest present.")
 
 
-def main() -> int:
+def main() -> None:
     try:
-        for run_fn in (
-            run_generate_then_check_drift,
-            run_check_drift_no_manifest,
-            run_check_drift_tampering,
-        ):
-            result = run_fn()
-            if result != 0:
-                return result
-        return 0
+        run_generate_then_check_drift()
+        run_check_drift_no_manifest()
     finally:
-        _cleanup()
+        cleanup_pip_package()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
