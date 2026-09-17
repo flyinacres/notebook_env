@@ -199,6 +199,8 @@ def run_docker(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
     )
 
@@ -223,8 +225,6 @@ def cleanup_artifacts(*paths: Path) -> None:
 
 
 def verify_positive_notebook(notebook_path: Path, patterns: Sequence[str]) -> None:
-    if not patterns:
-        return
     if not notebook_path.exists():
         raise RuntimeError(f"Expected output notebook was not generated: {notebook_path}")
 
@@ -232,15 +232,24 @@ def verify_positive_notebook(notebook_path: Path, patterns: Sequence[str]) -> No
         nb_data = json.load(f)
 
     collected_text: list[str] = []
-    for cell in nb_data.get("cells", []):
+    for cell_idx, cell in enumerate(nb_data.get("cells", [])):
         for output in cell.get("outputs", []):
             output_type = output.get("output_type")
+            if output_type == "error":
+                ename = output.get("ename", "Error")
+                evalue = output.get("evalue", "")
+                raise AssertionError(
+                    f"Unexpected cell execution error in {notebook_path.name} (cell {cell_idx}): {ename}: {evalue}"
+                )
             if output_type == "stream":
                 text = output.get("text", "")
                 collected_text.append("".join(text) if isinstance(text, list) else text)
             elif output_type in {"execute_result", "display_data"}:
                 data_text = output.get("data", {}).get("text/plain", "")
                 collected_text.append("".join(data_text) if isinstance(data_text, list) else data_text)
+
+    if not patterns:
+        return
 
     all_output = strip_ansi("\n".join(collected_text))
     for pattern in patterns:
@@ -250,7 +259,6 @@ def verify_positive_notebook(notebook_path: Path, patterns: Sequence[str]) -> No
                 f"Missing expected pattern:\n  '{pattern}'\n"
                 f"Searched outputs:\n{all_output}"
             )
-
 
 def verify_negative_notebook(
     notebook_path: Path,
