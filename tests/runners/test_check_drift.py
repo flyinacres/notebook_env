@@ -12,7 +12,14 @@ against the same file on disk. This script exists specifically to prove
 that plumbing, which a direct function call structurally cannot.
 
 Invoked directly (matches this directory's other runners, not pytest):
-    python tests/runners/test_check_drift_e2e.py
+    python tests/runners/test_check_drift.py
+
+Named test_check_drift.py despite not being pytest-discoverable content --
+none of the callables below start with test_, specifically so bare pytest
+cannot accidentally collect and run them (which would bypass main()'s
+sequencing and, critically, its cleanup -- these mutate the real
+environment with real pip install/uninstall calls, unlike everything in
+tests/*.py).
 """
 import sys
 import json
@@ -49,7 +56,7 @@ def _cleanup():
     )
 
 
-def test_generate_then_check_drift_real_subprocesses() -> int:
+def run_generate_then_check_drift() -> int:
     """Real generate, real check-drift, two separate processes, same file."""
     print(f"1. Installing {YANKED_PACKAGE}=={YANKED_VERSION} (a real, permanently-yanked release)...")
     install = subprocess.run(
@@ -90,7 +97,7 @@ def test_generate_then_check_drift_real_subprocesses() -> int:
     return 0
 
 
-def test_check_drift_no_manifest_exits_zero() -> int:
+def run_check_drift_no_manifest() -> int:
     """A real file with no STEADY_PY_MANIFEST -- real subprocess, real exit 0."""
     print("4. Checking drift against a real file with no manifest present...")
     _write_notebook(NO_MANIFEST_PATH, "print('no manifest here')")
@@ -106,7 +113,7 @@ def test_check_drift_no_manifest_exits_zero() -> int:
     return 0
 
 
-def test_check_drift_tampering_real_subprocess() -> int:
+def run_check_drift_tampering() -> int:
     """Hand-edit the real merged file on disk after generation, then re-check via
     a fresh subprocess -- proves tampering detection survives an actual
     generate-then-edit-then-check workflow, not just an in-memory round trip."""
@@ -140,12 +147,12 @@ def test_check_drift_tampering_real_subprocess() -> int:
 
 def main() -> int:
     try:
-        for test_fn in (
-            test_generate_then_check_drift_real_subprocesses,
-            test_check_drift_no_manifest_exits_zero,
-            test_check_drift_tampering_real_subprocess,
+        for run_fn in (
+            run_generate_then_check_drift,
+            run_check_drift_no_manifest,
+            run_check_drift_tampering,
         ):
-            result = test_fn()
+            result = run_fn()
             if result != 0:
                 return result
         return 0

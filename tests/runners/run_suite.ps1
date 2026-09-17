@@ -187,18 +187,18 @@ function Invoke-CommonTests {
     Write-Host "Running Phase 5k: Local Package Pin-and-Verify (1.0.0 -> 2.0.0)..." -ForegroundColor Cyan
     $repinNb = "tests/fixtures/e2e/test_local_pkg_pin_and_verify.ipynb"
     $repinMerged = $repinNb -replace '\.ipynb$', '_merged.ipynb'
-    $repinCmd = "pip install --no-cache-dir ipykernel nbconvert==7.17.1 -q && " + `
-            "python -m ipykernel install --user --name python3 && " + `
-            "PIP_NO_INDEX=1 PIP_FIND_LINKS=/workspace/tests/fixtures/local_test_pkg/dist pip install --no-cache-dir local_test_pkg==1.0.0 packaging resolvelib && " + `
-            "PIP_NO_INDEX=1 PIP_FIND_LINKS=/workspace/tests/fixtures/local_test_pkg/dist python notebook_env.py `"$repinNb`" --output && " + `
-            "pip uninstall -y local_test_pkg && " + `
-            "PIP_NO_INDEX=1 PIP_FIND_LINKS=/workspace/tests/fixtures/local_test_pkg/dist jupyter nbconvert --to notebook --execute `"$repinMerged`" --output /tmp/out_v1.ipynb --ExecutePreprocessor.timeout=300 --ExecutePreprocessor.kernel_name=python3 && " + `
-            "cat /tmp/out_v1.ipynb && " + `
-            "PIP_NO_INDEX=1 PIP_FIND_LINKS=/workspace/tests/fixtures/local_test_pkg/dist pip install --no-cache-dir local_test_pkg==2.0.0 packaging resolvelib && " + `
-            "PIP_NO_INDEX=1 PIP_FIND_LINKS=/workspace/tests/fixtures/local_test_pkg/dist python notebook_env.py `"$repinNb`" --output && " + `
-            "pip uninstall -y local_test_pkg && " + `
-            "PIP_NO_INDEX=1 PIP_FIND_LINKS=/workspace/tests/fixtures/local_test_pkg/dist jupyter nbconvert --to notebook --execute `"$repinMerged`" --output /tmp/out_v2.ipynb --ExecutePreprocessor.timeout=300 --ExecutePreprocessor.kernel_name=python3 && " + `
-            "cat /tmp/out_v2.ipynb"
+    $repinCmd = "pip install --no-cache-dir ipykernel nbconvert==7.17.1 packaging resolvelib -q && " + `
+        "python -m ipykernel install --user --name python3 && " + `
+        "PIP_NO_INDEX=1 PIP_FIND_LINKS=/workspace/tests/fixtures/local_test_pkg/dist pip install --no-cache-dir local_test_pkg==1.0.0 && " + `
+        "PIP_NO_INDEX=1 PIP_FIND_LINKS=/workspace/tests/fixtures/local_test_pkg/dist python notebook_env.py `"$repinNb`" --output && " + `
+        "pip uninstall -y local_test_pkg && " + `
+        "PIP_NO_INDEX=1 PIP_FIND_LINKS=/workspace/tests/fixtures/local_test_pkg/dist jupyter nbconvert --to notebook --execute `"$repinMerged`" --output /tmp/out_v1.ipynb --ExecutePreprocessor.timeout=300 --ExecutePreprocessor.kernel_name=python3 && " + `
+        "cat /tmp/out_v1.ipynb && " + `
+        "PIP_NO_INDEX=1 PIP_FIND_LINKS=/workspace/tests/fixtures/local_test_pkg/dist pip install --no-cache-dir local_test_pkg==2.0.0 && " + `
+        "PIP_NO_INDEX=1 PIP_FIND_LINKS=/workspace/tests/fixtures/local_test_pkg/dist python notebook_env.py `"$repinNb`" --output && " + `
+        "pip uninstall -y local_test_pkg && " + `
+        "PIP_NO_INDEX=1 PIP_FIND_LINKS=/workspace/tests/fixtures/local_test_pkg/dist jupyter nbconvert --to notebook --execute `"$repinMerged`" --output /tmp/out_v2.ipynb --ExecutePreprocessor.timeout=300 --ExecutePreprocessor.kernel_name=python3 && " + `
+        "cat /tmp/out_v2.ipynb"
  
     try {
         $repinOutput = docker run --rm --pull missing `

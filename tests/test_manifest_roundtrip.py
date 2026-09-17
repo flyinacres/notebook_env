@@ -23,7 +23,7 @@ import pytest
 import notebook_env as ne
 
 
-FIXTURE_DIR = Path(__file__).parent / "fixtures"
+FIXTURE_DIR = Path("tests/fixtures")
 KITCHEN_SINK_PATH = FIXTURE_DIR / "unit" / "kitchen_sink.ipynb"
 
 
@@ -60,6 +60,23 @@ class TestManifestRoundTrip:
         assert extracted.dependency_hash == original.dependency_hash
         assert extracted.tool_version == original.tool_version
         assert extracted.generated_at == original.generated_at
+
+    def test_raw_installs_round_trip(self, tmp_path):
+        """raw_installs (git/URL/local-path) must survive generate -> write -> extract intact."""
+        result = ne.generate_production_blueprint([], raw_installs=["git+https://github.com/foo/bar.git@v1.2.0"])
+        nb = {
+            "cells": [{"cell_type": "code", "source": [result["step2_code"]],
+                       "metadata": {}, "outputs": [], "execution_count": None}],
+            "metadata": {}, "nbformat": 4, "nbformat_minor": 5,
+        }
+        path = tmp_path / "raw_install.ipynb"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(nb, f)
+
+        extracted, error = ne.extract_manifest_from_file(str(path))
+        assert error is None
+        assert extracted.raw_installs == ["git+https://github.com/foo/bar.git@v1.2.0"]
+        assert extracted.dependency_hash == result["drift_report"].manifest.dependency_hash
 
     def test_no_manifest_present_on_real_pre_feature_fixture(self):
         """kitchen_sink.ipynb predates this feature -- extraction must report
