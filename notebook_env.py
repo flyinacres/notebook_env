@@ -304,6 +304,7 @@ class SteadyPyManifest:
     generated_at: str
     tool_version: str = TOOL_VERSION
     dependency_hash: str = ""
+    raw_installs: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -313,6 +314,7 @@ class SteadyPyManifest:
             "generated_at": self.generated_at,
             "tool_version": self.tool_version,
             "dependency_hash": self.dependency_hash,
+            "raw_installs": self.raw_installs,
         }
 
     def compute_and_set_hash(self) -> str:
@@ -388,6 +390,7 @@ class NotebookScanResult:
     scoped_flags: Dict[str, List[str]] = field(default_factory=dict)
     magic_warnings: List[DiagnosticEvent] = field(default_factory=list)
     magic_notices: List[DiagnosticEvent] = field(default_factory=list)
+    raw_installs: List[str] = field(default_factory=list)
 
     def __post_init__(self):
         if self.harvested_urls is None:
@@ -434,6 +437,7 @@ class HarvestResult:
     magic_warnings: List[DiagnosticEvent] = field(default_factory=list)
     magic_notices: List[DiagnosticEvent] = field(default_factory=list)
     scoped_flags: Dict[str, List[str]] = field(default_factory=dict)
+    raw_installs: List[str] = field(default_factory=list)
 
     def __iter__(self):
         """Legacy tuple-unpacking fallback for backward compatibility."""
@@ -1041,12 +1045,21 @@ def classify_cell_source(source: str) -> Tuple[str, str]:
 
     return "PYTHON", source
 
-def harvest_pip_install_occurrences(code_sources: List[str]) -> List[PipInstallOccurrence]:
+def harvest_pip_install_occurrences(code_sources: List[str]) -> Tuple[List[PipInstallOccurrence], List[str]]:
     """
     Walks all cell lines and extracts structured PipInstallOccurrence records.
     Filters out %%writefile cells completely.
+
+    Also returns raw_installs: the exact original text of any token that's a
+    VCS/URL/local-path install (git+, http(s)://, ./path, etc). These can't be
+    decomposed into a name+version pin without actually running pip -- a bare
+    git URL has no name until cloned -- so they're preserved verbatim instead
+    of being forced into the wrong shape. Previously these were silently
+    dropped entirely, meaning the generated Cell 2 would never attempt to
+    install them at all.
     """
     occurrences: List[PipInstallOccurrence] = []
+    raw_installs: List[str] = []
 
     for cell_idx, source in enumerate(code_sources):
         cell_type, clean_body = classify_cell_source(source)
@@ -1095,6 +1108,7 @@ def harvest_pip_install_occurrences(code_sources: List[str]) -> List[PipInstallO
                         i += 1
                         continue
                     elif any(token.lower().startswith(p) for p in VCS_OR_PATH_PREFIXES):
+                        raw_installs.append(token.strip("'\""))
                         i += 1
                         continue
 
@@ -1123,7 +1137,7 @@ def harvest_pip_install_occurrences(code_sources: List[str]) -> List[PipInstallO
                         )
                     )
 
-    return occurrences
+    return occurrences, raw_installs
 
 
 def resolve_pip_occurrences(
@@ -1181,7 +1195,7 @@ def resolve_pip_occurrences(
 
 def harvest_scoped_cell_flags(code_sources: List[str]) -> Dict[str, List[str]]:
     """Convenience delegate returning harvested scoped flags map directly."""
-    occurrences = harvest_pip_install_occurrences(code_sources)
+    occurrences, _raw_installs = harvest_pip_install_occurrences(code_sources)
     resolved, _ = resolve_pip_occurrences(occurrences)
     return {pkg: occ.flags for pkg, occ in resolved.items()}
 
@@ -1196,7 +1210,7 @@ def harvest_cell_magics_and_commands(
     code_sources: List[str]
 ) -> HarvestResult:
     """Scans code sources for cell magics, index URLs, auxiliary tools, and shell commands."""
-    occurrences = harvest_pip_install_occurrences(code_sources)
+    occurrences, raw_installs = harvest_pip_install_occurrences(code_sources)
     resolved_occs, magic_warnings = resolve_pip_occurrences(occurrences)
 
     harvested_packages: Set[str] = set()
@@ -1204,6 +1218,20 @@ def harvest_cell_magics_and_commands(
     extra_index_urls: Set[str] = set()
     magic_notices: List[DiagnosticEvent] = []
     scoped_flags: Dict[str, List[str]] = {}
+
+    for raw_spec in raw_installs:
+        magic_notices.append(
+            DiagnosticEvent(
+                type="raw_install",
+                detail=f"'{raw_spec}' is installed from a non-standard source (git/URL/local file), not PyPI. "
+                       f"It will still be installed exactly as specified, but can't be verified or checked for "
+                       f"drift -- you're responsible for ensuring anyone running this notebook has access to "
+                       f"the same resource.",
+                cell_idx=0,
+                line_idx=0,
+                level="notice"
+            )
+        )
 
     for occ in occurrences:
         harvested_packages.add(occ.name)
@@ -1274,7 +1302,8 @@ def harvest_cell_magics_and_commands(
         extra_index_urls=extra_index_urls,
         magic_warnings=magic_warnings,
         magic_notices=magic_notices,
-        scoped_flags=scoped_flags
+        scoped_flags=scoped_flags,
+        raw_installs=raw_installs
     )
 
 
@@ -1295,7 +1324,7 @@ def build_unified_timeline(
     - Bare AST imports only anchor position if no explicit install was found anywhere in the notebook.
     Returns a structured TimelineResult payload.
     """
-    pip_occs = harvest_pip_install_occurrences(code_sources)
+    pip_occs, _raw_installs = harvest_pip_install_occurrences(code_sources)
     resolved_pips, conflict_warnings = resolve_pip_occurrences(pip_occs, is_execution_ordered=is_execution_ordered)
 
     all_import_occs: List[ImportOccurrence] = []
@@ -1905,6 +1934,21 @@ def _split_pin_name(name: str) -> Tuple[str, Optional[str]]:
         return name, None
 
 
+def _pip_env_hint() -> str:
+    """Checks the CURRENT process's environment for pip index-related variables
+    that could explain a package resolving locally despite PyPI having no record
+    of it. This only describes THIS environment -- it says nothing about whether
+    anyone else running the notebook would have the same variables set, which is
+    exactly why the underlying finding stays confirmed regardless of this hint.
+    """
+    relevant = ["PIP_FIND_LINKS", "PIP_NO_INDEX", "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL"]
+    set_vars = [(k, os.environ[k]) for k in relevant if os.environ.get(k)]
+    if not set_vars:
+        return ""
+    parts = ", ".join(f"{k}={v}" for k, v in set_vars)
+    return f" Note: {parts} is set in this environment, which may explain this."
+
+
 def _has_local_version_identifier(version: str) -> bool:
     """True if this pin has a PEP 440 local version segment (e.g. '2.3.1+cu121').
 
@@ -1971,9 +2015,16 @@ def check_yanked_or_removed(name: str, version: str) -> List[DriftFinding]:
             package=name, version=version, signal="removed", severity="confirmed",
             message=f"{name}=={version} no longer exists on PyPI, though {name} itself is still published",
         )]
+
+    env_hint = _pip_env_hint()
     return [DriftFinding(
-        package=name, version=version, signal="removed", severity="confirmed",
-        message=f"{name} has been removed from PyPI entirely",
+        package=name, version=version, signal="not_found_on_pypi", severity="confirmed",
+        message=(
+            f"{name} could not be found on PyPI. It may be a private, local-only, or custom-index "
+            f"package that ships alongside this notebook (if so, no action needed), or the name may "
+            f"be misspelled.{env_hint}"
+        ),
+        details={"pip_env_hint": env_hint} if env_hint else {},
     )]
 
 
@@ -2669,7 +2720,8 @@ def generate_production_blueprint(
     full_freeze_lines: Optional[List[str]] = None, 
     local_tagged_info: Optional[List[Tuple[str, List[str]]]] = None, 
     gpu_info: Optional[GpuInfo] = None,
-    install_timeout: int = 120
+    install_timeout: int = 120,
+    raw_installs: Optional[List[str]] = None
 ) -> BlueprintResult:
     """Assembles Cell 1 Markdown and Cell 2 Python code using structured DependencyEntry objects."""
     py_major, py_minor = sys.version_info.major, sys.version_info.minor
@@ -2741,8 +2793,31 @@ def generate_production_blueprint(
         dependencies=normalized_items,
         gpu=gpu_info.to_dict() if gpu_info else None,
         generated_at=timestamp,
+        raw_installs=list(raw_installs) if raw_installs else [],
     )
     manifest.compute_and_set_hash()
+
+    raw_installs_block = ""
+    if manifest.raw_installs:
+        raw_installs_block = f'''
+print("\\n📎 Installing non-standard sources (git/URL/local file)...")
+print("   These are installed exactly as specified but can't be verified against PyPI.")
+print("   You are responsible for ensuring anyone running this notebook has access to the same resource.\\n")
+for raw_idx, raw_spec in enumerate(STEADY_PY_MANIFEST.get("raw_installs", []), start=1):
+    print(f"[{{raw_idx}}] 📦 Installing (raw): {{raw_spec}}")
+    sys.stdout.flush()
+    raw_cmd = [sys.executable, "-m", "pip", "install", "--no-input", "--disable-pip-version-check", "--no-warn-script-location", raw_spec]
+    raw_returncode, raw_captured = _run_pip_subprocess(raw_cmd, {install_timeout})
+
+    if raw_returncode == 0:
+        passed_count += 1
+        print(f"    ✅ {{raw_spec}} installed successfully")
+    else:
+        failed_packages.append((raw_spec, "", [], "\\n".join(raw_captured)))
+        print(f"    ❌ {{raw_spec}} failed to install (exit code {{raw_returncode}})")
+
+total_deps += len(STEADY_PY_MANIFEST.get("raw_installs", []))
+'''
 
     # Check pins against live PyPI at generation time, not only via a later,
     # separate --check-drift run -- catching a bad pin now is strictly better
@@ -2812,6 +2887,29 @@ failed_packages = []
 total_deps = len(STEADY_PY_MANIFEST["dependencies"])
 installed_baseline = {{}}
 
+def _run_pip_subprocess(cmd, timeout):
+    captured = []
+    returncode = 0
+    try:
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as tmp_out:
+            proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=tmp_out, stderr=subprocess.STDOUT, timeout=timeout)
+            returncode = proc.returncode
+            tmp_out.seek(0)
+            for line in tmp_out.read().splitlines():
+                if line.strip():
+                    captured.append(line)
+                    print(f"    {{line}}")
+            sys.stdout.flush()
+    except subprocess.TimeoutExpired:
+        returncode = -1
+        captured.append(f"Error: installation exceeded per-package timeout limit ({{timeout}}s).")
+        print(f"    ❌ Installation timed out after {{timeout}}s.")
+    except Exception as exc:
+        returncode = -1
+        captured.append(f"Execution failed: {{exc}}")
+        print(f"    ❌ Execution failed: {{exc}}")
+    return returncode, captured
+
 for idx, item in enumerate(STEADY_PY_MANIFEST["dependencies"], start=1):
     name = item["name"]
     ver = item.get("version", "")
@@ -2850,38 +2948,7 @@ for idx, item in enumerate(STEADY_PY_MANIFEST["dependencies"], start=1):
     print(f"[{{idx}}/{{total_deps}}] 📦 Installing {{specifier}}...")
     sys.stdout.flush()
 
-    captured_output = []
-    returncode = 0
-
-    try:
-        with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as tmp_out:
-            proc = subprocess.run(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=tmp_out,
-                stderr=subprocess.STDOUT,
-                timeout={install_timeout}
-            )
-            returncode = proc.returncode
-            tmp_out.seek(0)
-            raw_text = tmp_out.read()
-            for line in raw_text.splitlines():
-                if line.strip():
-                    captured_output.append(line)
-                    print(f"    {{line}}")
-            sys.stdout.flush()
-    except subprocess.TimeoutExpired:
-        returncode = -1
-        timeout_msg = "Error: Subprocess installation exceeded per-package timeout limit ({install_timeout}s)."
-        captured_output.append(timeout_msg)
-        print("    ❌ Installation timed out after {install_timeout}s.")
-        sys.stdout.flush()
-    except Exception as exc:
-        returncode = -1
-        err_msg = f"Execution failed: {{exc}}"
-        captured_output.append(err_msg)
-        print(f"    ❌ {{err_msg}}")
-        sys.stdout.flush()
+    returncode, captured_output = _run_pip_subprocess(cmd, {install_timeout})
 
     if returncode == 0:
         passed_count += 1
@@ -2912,7 +2979,7 @@ for idx, item in enumerate(STEADY_PY_MANIFEST["dependencies"], start=1):
         if flags:
             print(f"       ├─ Scoped Flags: {{' '.join(flags)}}")
         print(f"       └─ Error: {{err_snippet}}\\n")
-
+{raw_installs_block}
 print("\\n" + "=" * 60)
 if not failed_packages:
     print(f"✅ Setup complete! All {{passed_count}}/{{total_deps}} dependencies verified.")
@@ -3068,7 +3135,8 @@ def walk_and_scan_directory(target_dir: str, skip_suffix: Optional[str] = None) 
                     extra_index_urls=h_res.extra_index_urls,
                     scoped_flags=h_res.scoped_flags,
                     magic_warnings=h_res.magic_warnings,
-                    magic_notices=h_res.magic_notices
+                    magic_notices=h_res.magic_notices,
+                    raw_installs=h_res.raw_installs
                 )
                 repo_map.add_result(res)
 
@@ -3463,7 +3531,7 @@ def apply_output_to_notebook(
     
     gpu_info = resolve_notebook_gpu_info(scan_res.imports, batch_hw_cache)
 
-    blueprint = generate_production_blueprint(all_dep_entries, local_tagged_info=local_tagged, gpu_info=gpu_info, install_timeout=install_timeout)
+    blueprint = generate_production_blueprint(all_dep_entries, local_tagged_info=local_tagged, gpu_info=gpu_info, install_timeout=install_timeout, raw_installs=scan_res.raw_installs)
     managed_cells = create_managed_cells(blueprint)
 
     with open(scan_res.path, 'r', encoding='utf-8') as f:
@@ -3652,7 +3720,8 @@ def run_single_file_pipeline(
         extra_index_urls=extra_urls,
         scoped_flags=h_res.scoped_flags,
         magic_warnings=magic_warns,
-        magic_notices=magic_notices
+        magic_notices=magic_notices,
+        raw_installs=h_res.raw_installs
     )
 
     nb_report = build_single_notebook_report(
@@ -3731,7 +3800,8 @@ def run_single_file_pipeline(
         nb_report.dependencies, 
         full_freeze_lines=full_freeze_lines, 
         gpu_info=gpu_info,
-        install_timeout=args.timeout
+        install_timeout=args.timeout,
+        raw_installs=single_res.raw_installs
     )
 
     print("--- [ STEP 1: PASTE INTO CELL 1 (MARKDOWN) ] ---\n")

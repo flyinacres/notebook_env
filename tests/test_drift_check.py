@@ -235,11 +235,24 @@ class TestYankedOrRemoved:
         assert findings[0].signal == "removed"
         assert "still published" in findings[0].message
 
-    def test_whole_project_removed(self):
+    def test_whole_project_never_found_on_pypi(self):
+        """Neutral wording: never presumes the package once existed (it may never have)."""
         findings = ne.check_yanked_or_removed("fake-package-xyz", "1.0.0")
         assert len(findings) == 1
-        assert findings[0].signal == "removed"
-        assert "entirely" in findings[0].message
+        assert findings[0].signal == "not_found_on_pypi"
+        assert findings[0].severity == "confirmed"
+        assert "could not be found on PyPI" in findings[0].message
+
+    def test_pip_env_hint_appended_when_set(self, monkeypatch):
+        monkeypatch.setenv("PIP_FIND_LINKS", "/some/local/dist")
+        findings = ne.check_yanked_or_removed("fake-package-xyz", "1.0.0")
+        assert "PIP_FIND_LINKS=/some/local/dist" in findings[0].message
+
+    def test_pip_env_hint_absent_when_not_set(self, monkeypatch):
+        for var in ("PIP_FIND_LINKS", "PIP_NO_INDEX", "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL"):
+            monkeypatch.delenv(var, raising=False)
+        findings = ne.check_yanked_or_removed("fake-package-xyz", "1.0.0")
+        assert "Note:" not in findings[0].message
 
     def test_network_error_reported_not_silenced(self):
         findings = ne.check_yanked_or_removed("flaky-package", "1.0.0")
