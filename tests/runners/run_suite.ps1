@@ -110,22 +110,24 @@ function Strip-AnsiCodes($text) {
 function Build-DockerCmd($tierName, $nb, $mergedNb) {
     switch ($tierName) {
         "python3.11" {
-            return "pip install --no-cache-dir ipykernel nbconvert==7.17.1 humanize==4.16.0 tabulate==0.9.0 numpy==1.23.5 && " + `
+            return "pip install --no-cache-dir ipykernel nbconvert==7.17.1 humanize==4.16.0 tabulate==0.9.0 numpy==1.23.5 packaging resolvelib && " + `
                    "python -m ipykernel install --user --name python3 && " + `
                    "python notebook_env.py `"$nb`" --output && " + `
                    "jupyter nbconvert --to notebook --execute `"$mergedNb`" --output `"/tmp/out.ipynb`" --ExecutePreprocessor.timeout=300 --ExecutePreprocessor.kernel_name=python3"
         }
         "kaggle" {
-            return "python3 -m venv --system-site-packages --without-pip --clear /tmp/run_env && " + `
+            return "pip install --quite packaging resolvelib && " + `
+                   "python3 -m venv --system-site-packages --without-pip --clear /tmp/run_env && " + `
                    "/tmp/run_env/bin/python notebook_env.py `"$nb`" --output && " + `
                    "/tmp/run_env/bin/python -m jupyter nbconvert --to notebook --execute `"$mergedNb`" --output `"/tmp/executed_kaggle.ipynb`" --ExecutePreprocessor.timeout=300"
         }
         "colab" {
-            return "python3 notebook_env.py `"$nb`" --output && " + `
+            return "pip install --quite packaging resolvelib && " + `
+                   "python3 notebook_env.py `"$nb`" --output && " + `
                    "jupyter nbconvert --to notebook --execute `"$mergedNb`" --output `"/tmp/out.ipynb`" --ExecutePreprocessor.timeout=300 --ExecutePreprocessor.kernel_name=python3"
         }
         "local_pkg" {
-            return "pip install --no-cache-dir ipykernel nbconvert==7.17.1 -q && " + `
+            return "pip install --no-cache-dir ipykernel nbconvert==7.17.1 packaging resolvelib -q && " + `
                    "python -m ipykernel install --user --name python3 && " + `
                    "PIP_NO_INDEX=1 PIP_FIND_LINKS=/workspace/tests/fixtures/local_test_pkg/bootstrap pip install --no-cache-dir setuptools wheel && " + `
                    "SEED_VER=`$(grep -oE 'local_test_pkg==[0-9.]+' `"$nb`" | head -1 | cut -d= -f3) && " + `
@@ -145,8 +147,16 @@ function Invoke-CommonTests {
     Write-Host " Running tier-independent tests"
     Write-Host "============================================================"
 
+    Write-Host "Running Check-Drift E2E Test (generate + check-drift subprocesses)..." -ForegroundColor Cyan
+    docker run --rm --pull missing -v "${REPO_ROOT}:/workspace" -w /workspace -e PYTHONPATH="/workspace" -e PYTHONUNBUFFERED=1 -e PIP_ROOT_USER_ACTION=ignore --entrypoint /bin/bash python:3.11-slim -c "pip install --no-cache-dir packaging resolvelib -q && python tests/runners/test_check_drift.py"
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Check-drift e2e test failed"
+    }
+    Write-Host "PASS: Check-drift e2e test`n" -ForegroundColor Green
+
     Write-Host "Running Phase 5g: Live-Kernel Stale Module Test..." -ForegroundColor Cyan
-    docker run --rm --pull missing -v "${REPO_ROOT}:/workspace" -w /workspace -e PYTHONPATH="/workspace" -e PYTHONUNBUFFERED=1 -e PIP_ROOT_USER_ACTION=ignore --entrypoint /bin/bash python:3.11-slim -c "pip install --no-cache-dir jupyter_client ipykernel numpy==1.26.4 -q && python -m ipykernel install --user --name python3 && python tests/runners/test_live_kernel_stale_repin.py"
+    docker run --rm --pull missing -v "${REPO_ROOT}:/workspace" -w /workspace -e PYTHONPATH="/workspace" -e PYTHONUNBUFFERED=1 -e PIP_ROOT_USER_ACTION=ignore --entrypoint /bin/bash python:3.11-slim -c "pip install --no-cache-dir  packaging resolvelib jupyter_client ipykernel numpy==1.26.4 -q && python -m ipykernel install --user --name python3 && python tests/runners/test_live_kernel_stale_repin.py"
 
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Live-kernel stale module test failed"
@@ -154,7 +164,7 @@ function Invoke-CommonTests {
     Write-Host "PASS: Live-kernel stale module test`n" -ForegroundColor Green
 
     Write-Host "Running Phase 5g: Live-Kernel Phase 0 Regressions..." -ForegroundColor Cyan
-    docker run --rm --pull missing -v "${REPO_ROOT}:/workspace" -w /workspace -e PYTHONPATH="/workspace" -e PYTHONUNBUFFERED=1 -e PIP_ROOT_USER_ACTION=ignore --entrypoint /bin/bash python:3.11-slim -c "pip install --no-cache-dir jupyter_client ipykernel -q && python -m ipykernel install --user --name python3 && python tests/runners/test_live_kernel_phase0_regressions.py"
+    docker run --rm --pull missing -v "${REPO_ROOT}:/workspace" -w /workspace -e PYTHONPATH="/workspace" -e PYTHONUNBUFFERED=1 -e PIP_ROOT_USER_ACTION=ignore --entrypoint /bin/bash python:3.11-slim -c "pip install --no-cache-dir  packaging resolvelib jupyter_client ipykernel packaging resolvelib -q && python -m ipykernel install --user --name python3 && python tests/runners/test_live_kernel_phase0_regressions.py"
 
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Live-kernel Phase 0 regressions test failed"
@@ -162,15 +172,13 @@ function Invoke-CommonTests {
     Write-Host "PASS: Live-kernel Phase 0 regressions test`n" -ForegroundColor Green
 
     Write-Host "Running Phase 5f: Hardware Mocking (CUDA)..." -ForegroundColor Cyan
-    docker run --rm --pull missing -v "${REPO_ROOT}:/workspace" -w /workspace -e PYTHONPATH="/workspace/tests/fixtures/mock_pkgs:/workspace" -e PYTHONUNBUFFERED=1 -e TEST_HW_MODE="cuda" -e MOCK_CUDA_AVAILABLE="1" -e MOCK_MPS_AVAILABLE="0" python:3.11-slim python tests/runners/test_hardware_mock.py
-
+    docker run --rm --pull missing -v "${REPO_ROOT}:/workspace" -w /workspace -e PYTHONPATH="/workspace/tests/fixtures/mock_pkgs:/workspace" -e PYTHONUNBUFFERED=1 -e TEST_HW_MODE="cuda" -e MOCK_CUDA_AVAILABLE="1" -e MOCK_MPS_AVAILABLE="0" --entrypoint /bin/bash python:3.11-slim -c "pip install --no-cache-dir packaging resolvelib -q && python tests/runners/test_hardware_mock.py"
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Hardware mocking test (CUDA) failed"
     }
 
     Write-Host "Running Phase 5f: Hardware Mocking (MPS)..." -ForegroundColor Cyan
-    docker run --rm -v "${REPO_ROOT}:/workspace" -w /workspace -e PYTHONPATH="/workspace/tests/fixtures/mock_pkgs:/workspace" -e PYTHONUNBUFFERED=1 -e TEST_HW_MODE="mps" -e MOCK_CUDA_AVAILABLE="0" -e MOCK_MPS_AVAILABLE="1" python:3.11-slim python tests/runners/test_hardware_mock.py
-
+    docker run --rm -v "${REPO_ROOT}:/workspace" -w /workspace -e PYTHONPATH="/workspace/tests/fixtures/mock_pkgs:/workspace" -e PYTHONUNBUFFERED=1 -e TEST_HW_MODE="mps" -e MOCK_CUDA_AVAILABLE="0" -e MOCK_MPS_AVAILABLE="1" --entrypoint /bin/bash python:3.11-slim -c "pip install --no-cache-dir packaging resolvelib -q && python tests/runners/test_hardware_mock.py"
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Hardware mocking test (MPS) failed"
     }
@@ -179,7 +187,7 @@ function Invoke-CommonTests {
     Write-Host "Running Phase 5k: Local Package Pin-and-Verify (1.0.0 -> 2.0.0)..." -ForegroundColor Cyan
     $repinNb = "tests/fixtures/e2e/test_local_pkg_pin_and_verify.ipynb"
     $repinMerged = $repinNb -replace '\.ipynb$', '_merged.ipynb'
-    $repinCmd = "pip install --no-cache-dir ipykernel nbconvert==7.17.1 -q && " + `
+    $repinCmd = "pip install --no-cache-dir  packaging resolvelib ipykernel nbconvert==7.17.1 -q && " + `
                 "python -m ipykernel install --user --name python3 && " + `
                 "PIP_NO_INDEX=1 PIP_FIND_LINKS=/workspace/tests/fixtures/local_test_pkg/dist pip install --no-cache-dir local_test_pkg==1.0.0 && " + `
                 "python notebook_env.py `"$repinNb`" --output && " + `
