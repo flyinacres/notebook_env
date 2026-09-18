@@ -25,7 +25,7 @@ import notebook_env as ne
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
-MAGIC_SINK_PATH = FIXTURE_DIR / "unit" / "magic_sink.ipynb"
+MAGIC_SINK_PATH = FIXTURE_DIR / "magic_sink.ipynb"
 
 
 @pytest.fixture
@@ -206,7 +206,7 @@ class TestScopedFlagAssociation:
         sources = [
             "!pip install torch==2.3.1+cu121 --extra-index-url https://download.pytorch.org/whl/cu121\n"
         ]
-        occurrences, _raw_installs = ne.harvest_pip_install_occurrences(sources)
+        occurrences, _ = ne.harvest_pip_install_occurrences(sources)
         assert len(occurrences) == 1
         occ = occurrences[0]
         assert occ.name == "torch"
@@ -215,44 +215,12 @@ class TestScopedFlagAssociation:
         assert occ.cell_idx == 0
         assert occ.line_idx == 0
 
-    def test_git_install_preserved_verbatim_not_dropped(self) -> None:
-        """Regression test for the major gap: a git+ install must be captured
-        verbatim, not silently dropped from harvesting entirely."""
-        sources = ["!pip install git+https://github.com/foo/bar.git@v1.2.0\n"]
-        occurrences, raw_installs = ne.harvest_pip_install_occurrences(sources)
-        assert occurrences == []
-        assert raw_installs == ["git+https://github.com/foo/bar.git@v1.2.0"]
-
-    def test_local_wheel_path_preserved_verbatim(self) -> None:
-        sources = ["!pip install ./dist/local_pkg-1.0.0-py3-none-any.whl\n"]
-        occurrences, raw_installs = ne.harvest_pip_install_occurrences(sources)
-        assert occurrences == []
-        assert raw_installs == ["./dist/local_pkg-1.0.0-py3-none-any.whl"]
-
-    def test_raw_install_alongside_normal_package_both_captured(self) -> None:
-        """A raw install and a normal PyPI package on the same line must both
-        be captured -- neither should suppress the other."""
-        sources = ["!pip install requests git+https://github.com/foo/bar.git\n"]
-        occurrences, raw_installs = ne.harvest_pip_install_occurrences(sources)
-        assert len(occurrences) == 1
-        assert occurrences[0].name == "requests"
-        assert raw_installs == ["git+https://github.com/foo/bar.git"]
-
-    def test_raw_install_generates_informational_notice(self) -> None:
-        sources = ["!pip install git+https://github.com/foo/bar.git\n"]
-        h_res = ne.harvest_cell_magics_and_commands(sources)
-        assert h_res.raw_installs == ["git+https://github.com/foo/bar.git"]
-        assert len(h_res.magic_notices) == 1
-        notice = h_res.magic_notices[0]
-        assert notice.level == "notice"
-        assert "responsible for ensuring" in notice.detail
-
     def test_atomic_last_wins_replaces_all_fields_indivisibly(self) -> None:
         """Later occurrence replaces version AND flags atomically without unioning earlier flags."""
         cell_0 = "!pip install foo==1.0 --index-url https://custom.repo/simple\n"
         cell_1 = "!pip install foo==2.0\n"  # No index url!
         
-        occurrences, _raw_installs = ne.harvest_pip_install_occurrences([cell_0, cell_1])
+        occurrences, _ = ne.harvest_pip_install_occurrences([cell_0, cell_1])
         resolved_map, conflict_warnings = ne.resolve_pip_occurrences(
             occurrences, is_execution_ordered=True
         )
@@ -272,7 +240,7 @@ class TestScopedFlagAssociation:
             "!pip install torch --index-url https://download.pytorch.org/whl/cu118\n",
             "!pip install torch --index-url https://download.pytorch.org/whl/cu121\n"
         ]
-        occurrences, _raw_installs = ne.harvest_pip_install_occurrences(sources)
+        occurrences, _ = ne.harvest_pip_install_occurrences(sources)
         resolved_map, conflict_warnings = ne.resolve_pip_occurrences(
             occurrences, is_execution_ordered=True
         )

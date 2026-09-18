@@ -807,18 +807,17 @@ class TestIntegrationAndFormatting:
         assert "requests==2.31.0" in entries[1].comment_text
         assert "imported inside script generated via %%writefile" in entries[1].comment_text
 
-def test_discover_local_repo_modules_top_level(tmp_path):
-    """Verify discover_local_repo_modules recognizes top-level modules and package directories."""
+def test_resolve_local_module_top_level(tmp_path):
+    """Verify resolve_local_module recognizes top-level modules and package directories,
+    but not modules nested inside a subpackage (matching plain `import <name>` semantics)."""
     src_dir = tmp_path / "src" / "utils"
     src_dir.mkdir(parents=True)
     (src_dir / "helpers.py").write_text("# helper module", encoding="utf-8")
     (tmp_path / "root_script.py").write_text("# root script", encoding="utf-8")
 
-    discovered = ne.discover_local_repo_modules(str(tmp_path))
-
-    assert "src" in discovered
-    assert "root_script" in discovered
-    assert "helpers" not in discovered
+    assert ne.resolve_local_module("src", str(tmp_path)) == "notebook_dir"
+    assert ne.resolve_local_module("root_script", str(tmp_path)) == "notebook_dir"
+    assert ne.resolve_local_module("helpers", str(tmp_path)) is None
 
 def test_production_blueprint_failure_message_dynamic():
     """Verify Cell 2 failure advice adaptively includes user troubleshooting steps and HELP_URL link."""
@@ -836,80 +835,70 @@ def test_production_blueprint_failure_message_dynamic():
 class TestMemoizeForRun:
     """
     Tests for the _memoize_for_run decorator and its use on
-    get_notebook_local_modules / build_manifest_entries.
+    resolve_local_module / build_manifest_entries.
 
-    Covers the three properties that matter for a shared, mutable-return-type
-    cache: (1) repeated identical calls actually skip recomputation,
-    (2) distinct inputs are never conflated into the same cache entry, and
-    (3) callers can't corrupt the cache by mutating a returned value.
+    Covers the properties that matter for a shared cache: (1) repeated
+    identical calls actually skip recomputation, (2) distinct inputs are
+    never conflated into the same cache entry. A defensive-copy test isn't
+    needed for resolve_local_module specifically -- unlike the old
+    Set-returning get_notebook_local_modules, it returns an immutable
+    Optional[str], which callers can't mutate to corrupt the cache; that
+    property is still covered below for build_manifest_entries, which does
+    return mutable list/dict values.
     """
 
-    def test_local_modules_dedupes_identical_calls(self, tmp_path, monkeypatch):
-        nb_path = tmp_path / "nb.ipynb"
-        nb_path.touch()
+    def test_local_module_dedupes_identical_calls(self, tmp_path, monkeypatch):
+        (tmp_path / "helper.py").write_text("# helper", encoding="utf-8")
 
         call_count = {"n": 0}
-        real_discover = ne.discover_local_repo_modules
+        real_found = ne._found_in_dir
 
-        def counting_discover(*args, **kwargs):
+        def counting_found(*args, **kwargs):
             call_count["n"] += 1
-            return real_discover(*args, **kwargs)
+            return real_found(*args, **kwargs)
 
-        monkeypatch.setattr(ne, "discover_local_repo_modules", counting_discover)
-        ne.get_notebook_local_modules.cache_clear()
+        monkeypatch.setattr(ne, "_found_in_dir", counting_found)
+        ne.resolve_local_module.cache_clear()
 
-        r1 = ne.get_notebook_local_modules(nb_path, str(tmp_path))
+        r1 = ne.resolve_local_module("helper", str(tmp_path))
         calls_after_first = call_count["n"]
-        r2 = ne.get_notebook_local_modules(nb_path, str(tmp_path))
+        r2 = ne.resolve_local_module("helper", str(tmp_path))
 
-        assert r1 == r2
-        assert call_count["n"] == calls_after_first, "second identical call should not re-scan the filesystem"
+        assert r1 == r2 == "notebook_dir"
+        assert call_count["n"] == calls_after_first, "second identical call should not re-probe the filesystem"
 
-    def test_local_modules_different_notebooks_not_conflated(self, tmp_path):
-        """Distinct (path, root_dir) inputs must never share a cache entry, even
-        under the id()-keying scheme — each notebook has its own Path object."""
+    def test_local_module_different_dirs_not_conflated(self, tmp_path):
+        """Distinct (name, notebook_dir) inputs must never share a cache entry."""
         dir_a, dir_b = tmp_path / "a", tmp_path / "b"
         dir_a.mkdir()
         dir_b.mkdir()
         (dir_a / "helper_a.py").write_text("# a", encoding="utf-8")
         (dir_b / "helper_b.py").write_text("# b", encoding="utf-8")
 
-        ne.get_notebook_local_modules.cache_clear()
-        result_a = ne.get_notebook_local_modules(dir_a / "nb.ipynb", str(dir_a))
-        result_b = ne.get_notebook_local_modules(dir_b / "nb.ipynb", str(dir_b))
+        ne.resolve_local_module.cache_clear()
 
-        assert "helper_a" in result_a and "helper_a" not in result_b
-        assert "helper_b" in result_b and "helper_b" not in result_a
+        assert ne.resolve_local_module("helper_a", str(dir_a)) == "notebook_dir"
+        assert ne.resolve_local_module("helper_a", str(dir_b)) is None
+        assert ne.resolve_local_module("helper_b", str(dir_b)) == "notebook_dir"
+        assert ne.resolve_local_module("helper_b", str(dir_a)) is None
 
-    def test_local_modules_returns_defensive_copy(self, tmp_path):
-        nb_path = tmp_path / "nb.ipynb"
-        nb_path.touch()
-        ne.get_notebook_local_modules.cache_clear()
-
-        r1 = ne.get_notebook_local_modules(nb_path, str(tmp_path))
-        r1.add("INJECTED_BY_TEST")
-        r2 = ne.get_notebook_local_modules(nb_path, str(tmp_path))
-
-        assert "INJECTED_BY_TEST" not in r2, "mutating one caller's result must not corrupt the cached value"
-
-    def test_local_modules_cache_clear_forces_recompute(self, tmp_path, monkeypatch):
-        nb_path = tmp_path / "nb.ipynb"
-        nb_path.touch()
+    def test_local_module_cache_clear_forces_recompute(self, tmp_path, monkeypatch):
+        (tmp_path / "helper.py").write_text("# helper", encoding="utf-8")
 
         call_count = {"n": 0}
-        real_discover = ne.discover_local_repo_modules
+        real_found = ne._found_in_dir
 
-        def counting_discover(*args, **kwargs):
+        def counting_found(*args, **kwargs):
             call_count["n"] += 1
-            return real_discover(*args, **kwargs)
+            return real_found(*args, **kwargs)
 
-        monkeypatch.setattr(ne, "discover_local_repo_modules", counting_discover)
-        ne.get_notebook_local_modules.cache_clear()
+        monkeypatch.setattr(ne, "_found_in_dir", counting_found)
+        ne.resolve_local_module.cache_clear()
 
-        ne.get_notebook_local_modules(nb_path, str(tmp_path))
+        ne.resolve_local_module("helper", str(tmp_path))
         calls_before_clear = call_count["n"]
-        ne.get_notebook_local_modules.cache_clear()
-        ne.get_notebook_local_modules(nb_path, str(tmp_path))
+        ne.resolve_local_module.cache_clear()
+        ne.resolve_local_module("helper", str(tmp_path))
 
         assert call_count["n"] == calls_before_clear * 2, "cache_clear() must force a real recompute, not return stale data"
 
@@ -1019,7 +1008,7 @@ class TestMemoizeForRun:
         long-lived kernel session never returns stale results after the user
         edits files on disk between calls to ne.main()."""
         cleared = {"local_modules": False, "manifest": False}
-        monkeypatch.setattr(ne.get_notebook_local_modules, "cache_clear", lambda: cleared.__setitem__("local_modules", True))
+        monkeypatch.setattr(ne.resolve_local_module, "cache_clear", lambda: cleared.__setitem__("local_modules", True))
         monkeypatch.setattr(ne.build_manifest_entries, "cache_clear", lambda: cleared.__setitem__("manifest", True))
 
         # --output with no notebook/--batch target hits main()'s validation
