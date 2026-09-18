@@ -463,8 +463,9 @@ class BatchAnalysisSummary:
     non_python_languages: Dict[str, int] = field(default_factory=dict)
     companion_skipped_count: int = 0
     parse_errors: List[Dict[str, str]] = field(default_factory=list)
-    matched_packages: Set[str] = field(default_factory=set)
+    matched_packages: Set[str] = field(default_factory=set)    
     missing_packages: Dict[str, List[str]] = field(default_factory=dict)
+    guarded_packages: Dict[str, List[str]] = field(default_factory=dict)
     promotions: List[PromotionDetail] = field(default_factory=list)
     dynamic_warnings: List[DiagnosticEvent] = field(default_factory=list)
     magic_warnings: List[DiagnosticEvent] = field(default_factory=list)
@@ -3287,6 +3288,7 @@ def analyze_batch_repository(
 
     canonical_to_display: Dict[str, str] = {}
     canonical_missing_map: Dict[str, List[str]] = {}
+    canonical_guarded_map: Dict[str, List[str]] = {}
 
     for res in repo_map.scan_results:
         nb_local_mods = get_notebook_local_modules(res.path, repo_map.target_dir)
@@ -3308,7 +3310,8 @@ def analyze_batch_repository(
                 pypi_name = dep.name or (dep.comment_text.split()[1] if len(dep.comment_text.split()) > 1 else "")
                 if pypi_name:
                     canon = canonicalize_pkg_name(pypi_name)
-                    canonical_missing_map.setdefault(canon, []).append(Path(nb_report.notebook_path).name)
+                    target_map = canonical_guarded_map if dep.status == "guarded" else canonical_missing_map
+                    target_map.setdefault(canon, []).append(Path(nb_report.notebook_path).name)
                     display_name = pypi_name.replace("_", "-")
                     canonical_to_display.setdefault(canon, display_name)
             elif dep.name:
@@ -3333,6 +3336,10 @@ def analyze_batch_repository(
     for canon, nbs in canonical_missing_map.items():
         disp_name = canonical_to_display.get(canon, canon)
         summary.missing_packages[disp_name] = sorted(list(set(nbs)))
+
+    for canon, nbs in canonical_guarded_map.items():
+        disp_name = canonical_to_display.get(canon, canon)
+        summary.guarded_packages[disp_name] = sorted(list(set(nbs)))
 
     primary_url, url_reason = select_primary_index_url(repo_map.url_to_notebooks)
     summary.primary_url = primary_url
@@ -3386,6 +3393,13 @@ def format_console_report(summary: BatchAnalysisSummary) -> str:
             out.append(f"      - {pkg} (imported in: {nb_list}{more})")
     else:
         out.append("  • Packages missing from current environment: 0")
+
+    if summary.guarded_packages:
+        out.append(f"  • Guarded/optional imports (inside try/except): {len(summary.guarded_packages)}")
+        for pkg, nbs in sorted(summary.guarded_packages.items()):
+            nb_list = ", ".join(sorted(set(nbs))[:3])
+            more = f", +{len(set(nbs))-3} more" if len(set(nbs)) > 3 else ""
+            out.append(f"      - {pkg} (imported in: {nb_list}{more})")
     out.append("")
 
     if summary.dynamic_warnings or summary.magic_warnings:
@@ -3465,6 +3479,7 @@ def format_json_batch_report(summary: BatchAnalysisSummary, artifacts_written: O
             "parse_errors": summary.parse_errors,
             "matched_packages": sorted(list(summary.matched_packages)),
             "missing_packages": summary.missing_packages,
+            "guarded_packages": summary.guarded_packages,
             "hardware_warnings": summary.batch_hardware_warnings,
             "promotions": [p.to_dict() for p in summary.promotions],
             "primary_index_url": summary.primary_url,
