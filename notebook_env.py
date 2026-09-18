@@ -2939,6 +2939,7 @@ print("💡 Note: Dependencies are installed sequentially to prevent index confl
 
 passed_count = 0
 failed_packages = []
+any_install_performed = False
 total_deps = len(STEADY_PY_MANIFEST["dependencies"])
 installed_baseline = {{}}
 
@@ -3007,6 +3008,7 @@ for idx, item in enumerate(STEADY_PY_MANIFEST["dependencies"], start=1):
 
     if returncode == 0:
         passed_count += 1
+        any_install_performed = True
         print(f"    ✅ {{specifier}} installed successfully")
         
         # Real-time drift audit across previously installed dependencies
@@ -3048,7 +3050,8 @@ else:
     print("2. Unpinned Installs: Test installing failed libraries manually: '!pip install <pkg>'")
     print(f"3. Troubleshooting Steps: For a detailed guide on resolving setup errors, see: {HELP_URL}")
 
-print("\\n⚠️ Note: You may need to restart the kernel to use updated packages.")
+if any_install_performed:
+    print("\\n⚠️ Note: You may need to restart the kernel to use updated packages.")
 print("=" * 60)"""
 
     return {
