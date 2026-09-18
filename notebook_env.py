@@ -629,26 +629,6 @@ def get_ordered_code_cells(cells: List[Dict[str, Any]]) -> Tuple[List[Tuple[int,
     return code_cells, False
 
 
-def discover_local_repo_modules(target_dir: str) -> Set[str]:
-    """Scans target_dir for valid top-level Python modules and packages to prevent false-positive PyPI warnings."""
-    local_mods: Set[str] = set()
-    target_path = Path(target_dir)
-    if not target_path.exists():
-        return local_mods
-
-    try:
-        for entry in target_path.iterdir():
-            if entry.is_file() and entry.suffix == ".py" and entry.stem != "__init__":
-                local_mods.add(entry.stem)
-            elif entry.is_dir() and entry.name not in DEFAULT_IGNORED_DIRS and not entry.name.startswith('.'):
-                if any(entry.rglob("*.py")):
-                    local_mods.add(entry.name)
-    except Exception as e:
-        logger.debug(f"[AST/ModuleScan] Failed scanning '{target_dir}' for local modules: {e}")
-
-    return local_mods
-
-
 def _memoize_for_run(func: Callable) -> Callable:
     """Memoizes functions scoped to a single run, handling Set, List, and Dict arguments."""
     cache: Dict[Tuple[Any, ...], Any] = {}
@@ -689,13 +669,66 @@ def _memoize_for_run(func: Callable) -> Callable:
     return wrapper
 
 
+class LocalModuleContext(NamedTuple):
+    """Carries the two directories local-sibling-module resolution may check against."""
+    notebook_dir: Optional[str] = None
+    root_dir: Optional[str] = None
+
+
+def _found_in_dir(name: str, directory: Optional[str]) -> bool:
+    """Checks whether `name` resolves as a top-level module/package inside `directory`,
+    without executing any code (top-level find_spec never runs __init__.py)."""
+    if not directory or not Path(directory).exists():
+        return False
+    try:
+        return importlib.machinery.PathFinder.find_spec(name, path=[directory]) is not None
+    except Exception as e:
+        logger.debug(f"[ModuleScan] find_spec probe failed for '{name}' in '{directory}': {e}")
+        return False
+
+
 @_memoize_for_run
-def get_notebook_local_modules(notebook_path: Path, root_dir: Optional[str] = None) -> Set[str]:
-    """Discovers local repo modules scoped to both the notebook's immediate parent directory and repository root."""
-    local_mods = discover_local_repo_modules(str(notebook_path.parent))
-    if root_dir and Path(root_dir).exists():
-        local_mods.update(discover_local_repo_modules(root_dir))
-    return local_mods
+def resolve_local_module(name: str, notebook_dir: Optional[str], root_dir: Optional[str] = None) -> Optional[str]:
+    """
+    Checks whether `name` resolves as a local sibling module, using the most
+    accurate mechanism available for how this process is running:
+
+    - Live IPython/Jupyter kernel (is_running_in_ipython() True): the tool's own
+      process IS (or is running inside) a real, already-verified environment, so
+      this asks the live interpreter directly via an unrestricted find_spec --
+      real sys.path, no guessing, correctly reflects platform-injected paths
+      (Databricks Repos root, PYTHONPATH, editable installs, etc.).
+    - External CLI/batch invocation: no live kernel exists for the target
+      notebook, so this checks only the two directories that are actually
+      knowable from outside -- the notebook's own directory and an optional
+      declared root_dir -- via PathFinder, without executing any code and
+      without mutating sys.path.
+
+    Returns the anchor it resolved against ("notebook_dir" or "root_dir"), or
+    None if not found by either. Only ever checks the top-level segment of a
+    dotted name, matching how import classification already operates elsewhere
+    in this file, and consistent with never executing package __init__ code.
+    """
+    top_level = name.split(".", 1)[0]
+
+    if is_running_in_ipython():
+        try:
+            spec = importlib.util.find_spec(top_level)
+        except Exception as e:
+            logger.debug(f"[ModuleScan] live find_spec failed for '{top_level}': {e}")
+            spec = None
+        if spec is None:
+            return None
+        if _found_in_dir(top_level, notebook_dir):
+            return "notebook_dir"
+        return "root_dir"
+
+    if _found_in_dir(top_level, notebook_dir):
+        return "notebook_dir"
+    if _found_in_dir(top_level, root_dir):
+        return "root_dir"
+    return None
+
 
 
 # =====================================================================
@@ -1319,7 +1352,7 @@ def build_unified_timeline(
     frozen_env: Dict[str, str],
     pkg_dist_map: Optional[Dict[str, List[str]]] = None,
     is_execution_ordered: bool = True,
-    local_repo_modules: Optional[Set[str]] = None
+    local_ctx: Optional[LocalModuleContext] = None
 ) -> TimelineResult:
     """
     Constructs the master sequence of DependencyEntry objects:
@@ -1380,7 +1413,7 @@ def build_unified_timeline(
         if kind == "PIP":
             occ = resolved_pips[canon_name]
             dep_entry, promo = resolve_pypi_package_and_extras(
-                occ.name, submods, frozen_env, pkg_dist_map=pkg_dist_map, is_guarded=is_guarded, local_repo_modules=local_repo_modules
+                occ.name, submods, frozen_env, pkg_dist_map=pkg_dist_map, is_guarded=is_guarded, local_ctx=local_ctx
             )
             dep_entry.source = "pip_command"
             if occ.version_spec and not dep_entry.is_comment:
@@ -1400,7 +1433,7 @@ def build_unified_timeline(
                 promotion_notices.append(promo)
         else:
             dep_entry, promo = resolve_pypi_package_and_extras(
-                pkg_name, submods, frozen_env, pkg_dist_map=pkg_dist_map, is_guarded=is_guarded, local_repo_modules=local_repo_modules
+                pkg_name, submods, frozen_env, pkg_dist_map=pkg_dist_map, is_guarded=is_guarded, local_ctx=local_ctx
             )
             dep_entry.source = "import"
             dependencies.append(dep_entry)
@@ -1521,7 +1554,7 @@ def resolve_pypi_package_and_extras(
     frozen_env: Dict[str, str], 
     pkg_dist_map: Optional[Dict[str, List[str]]] = None,
     is_guarded: bool = False,
-    local_repo_modules: Optional[Set[str]] = None
+    local_ctx: Optional[LocalModuleContext] = None
 ) -> Tuple[DependencyEntry, Optional[PromotionDetail]]:
     """Resolves top-level import to a DependencyEntry."""
     if imp in PLATFORM_PSEUDO_MODULES:
@@ -1540,7 +1573,7 @@ def resolve_pypi_package_and_extras(
             comment_text=f"# {imp} (core Python build/packaging tool; excluded from requirement lockfiles)"
         ), None
 
-    if local_repo_modules and imp in local_repo_modules:
+    if local_ctx and resolve_local_module(imp, local_ctx.notebook_dir, local_ctx.root_dir):
         return DependencyEntry(
             name=imp,
             status="local_module",
@@ -1633,11 +1666,11 @@ def build_manifest_entries(
     frozen_env: Dict[str, str], 
     pkg_dist_map: Optional[Dict[str, List[str]]] = None,
     guarded_imports: Optional[Set[str]] = None,
-    local_repo_modules: Optional[Set[str]] = None
+    local_ctx: Optional[LocalModuleContext] = None
 ) -> Tuple[List[str], List[str]]:
     """Builds string-formatted manifest lines for legacy/batch consumers while preserving order."""
     entries, promotions = build_dependency_objects(
-        imports, submodules, frozen_env, pkg_dist_map, guarded_imports, local_repo_modules
+        imports, submodules, frozen_env, pkg_dist_map, guarded_imports, local_ctx
     )
     pinned_manifest = [e.specifier for e in entries]
     notices = [p.detail for p in promotions if p.detail]
@@ -1650,7 +1683,7 @@ def build_dependency_objects(
     frozen_env: Dict[str, str], 
     pkg_dist_map: Optional[Dict[str, List[str]]] = None,
     guarded_imports: Optional[Set[str]] = None,
-    local_repo_modules: Optional[Set[str]] = None
+    local_ctx: Optional[LocalModuleContext] = None
 ) -> Tuple[List[DependencyEntry], List[PromotionDetail]]:
     """Generates typed DependencyEntry instances in first-encountered order."""
     entries: List[DependencyEntry] = []
@@ -1663,7 +1696,7 @@ def build_dependency_objects(
         submods = submodules.get(imp, set())
         is_guarded = imp in guarded_set
         dep_entry, promo = resolve_pypi_package_and_extras(
-            imp, submods, frozen_env, pkg_dist_map=pkg_dist_map, is_guarded=is_guarded, local_repo_modules=local_repo_modules
+            imp, submods, frozen_env, pkg_dist_map=pkg_dist_map, is_guarded=is_guarded, local_ctx=local_ctx
         )
         entries.append(dep_entry)
         if promo and promo not in promotions:
@@ -3107,7 +3140,6 @@ class RepoEnvironmentMap:
         self.package_to_notebooks: Dict[str, List[Path]] = {}
         self.harvested_packages_to_notebooks: Dict[str, List[Path]] = {}
         self.url_to_notebooks: Dict[str, List[Path]] = {}
-        self.local_repo_modules: Set[str] = discover_local_repo_modules(target_dir)
 
     def add_result(self, result: NotebookScanResult) -> None:
         if result.parse_error:
@@ -3210,17 +3242,16 @@ def build_single_notebook_report(
     frozen_env: Dict[str, str],
     pkg_dist_map: Dict[str, List[str]],
     gpu_info: Optional[GpuInfo],
-    local_repo_modules: Optional[Set[str]] = None
+    root_dir: Optional[str] = None
 ) -> NotebookAnalysisReport:
     """Builds a complete NotebookAnalysisReport object for a single notebook."""
-    if local_repo_modules is None:
-        local_repo_modules = get_notebook_local_modules(scan_res.path)
+    local_ctx = LocalModuleContext(str(scan_res.path.parent), root_dir)
 
     timeline_res = build_unified_timeline(
         scan_res.code_sources,
         frozen_env=frozen_env,
         pkg_dist_map=pkg_dist_map,
-        local_repo_modules=local_repo_modules
+        local_ctx=local_ctx
     )
 
     timeline_pkgs = {canonicalize_pkg_name(d.name) for d in timeline_res.dependencies if d.name}
@@ -3240,7 +3271,10 @@ def build_single_notebook_report(
     all_warnings.extend(timeline_res.conflict_warnings)
     all_warnings.extend(hw_warnings)
 
-    local_mods_detected = sorted(list(local_repo_modules.intersection(set(scan_res.imports))))
+    local_mods_detected = sorted([
+        imp for imp in set(scan_res.imports)
+        if resolve_local_module(imp, local_ctx.notebook_dir, local_ctx.root_dir)
+    ])
     pseudo_mods_detected = sorted(list(PLATFORM_PSEUDO_MODULES.intersection(set(scan_res.imports))))
     build_tools_detected = sorted(list(BUILD_AND_PACKAGING_TOOLS.intersection(set(scan_res.imports))))
 
@@ -3291,11 +3325,10 @@ def analyze_batch_repository(
     canonical_guarded_map: Dict[str, List[str]] = {}
 
     for res in repo_map.scan_results:
-        nb_local_mods = get_notebook_local_modules(res.path, repo_map.target_dir)
         nb_gpu_info = resolve_notebook_gpu_info(res.imports, batch_hw_cache)
 
         nb_report = build_single_notebook_report(
-            res, frozen_env, pkg_dist_map, nb_gpu_info, local_repo_modules=nb_local_mods
+            res, frozen_env, pkg_dist_map, nb_gpu_info, root_dir=repo_map.target_dir
         )
         summary.notebooks.append(nb_report)
 
@@ -3548,14 +3581,14 @@ def generate_universal_manifest(
 
     pinned_entries_set: Set[str] = set()
     for res in repo_map.scan_results:
-        nb_local_mods = get_notebook_local_modules(res.path, repo_map.target_dir)
+        nb_local_ctx = LocalModuleContext(str(res.path.parent), repo_map.target_dir)
         entries, _ = build_manifest_entries(
             res.imports, 
             res.submodules, 
             frozen_env, 
             pkg_dist_map, 
             guarded_imports=res.guarded_imports,
-            local_repo_modules=nb_local_mods
+            local_ctx=nb_local_ctx
         )
         pinned_entries_set.update(entries)
 
@@ -3577,21 +3610,19 @@ def apply_output_to_notebook(
     batch_hw_cache: Optional[GpuInfo], 
     suffix: Optional[str] = None, 
     in_place: bool = False,
-    local_repo_modules: Optional[Set[str]] = None,
     root_dir: Optional[str] = None,
     output_dir: Optional[str] = None,
     install_timeout: int = 120
 ) -> Tuple[Path, "DriftCheckReport"]:
     """Writes per-notebook locked file or replaces setup cells in-place idempotently.
     Returns the written path and the generation-time drift-check report."""
-    if local_repo_modules is None:
-        local_repo_modules = get_notebook_local_modules(scan_res.path, root_dir)
+    local_ctx = LocalModuleContext(str(scan_res.path.parent), root_dir)
 
     timeline_res = build_unified_timeline(
         scan_res.code_sources,
         frozen_env=frozen_env,
         pkg_dist_map=pkg_dist_map,
-        local_repo_modules=local_repo_modules
+        local_ctx=local_ctx
     )
 
     timeline_pkgs = {canonicalize_pkg_name(d.name) for d in timeline_res.dependencies if d.name}
@@ -3699,7 +3730,6 @@ def run_batch_pipeline(
         logger.info(f"\n🚀 Writing per-notebook locked files ({loc_desc})...")
         written_files = []
         for res in repo_map.scan_results:
-            nb_local_mods = get_notebook_local_modules(res.path, repo_map.target_dir)
             written_path, drift_report = apply_output_to_notebook(
                 res, 
                 frozen_env, 
@@ -3707,7 +3737,6 @@ def run_batch_pipeline(
                 batch_hw_cache, 
                 suffix=args.suffix, 
                 in_place=args.in_place,
-                local_repo_modules=nb_local_mods,
                 root_dir=repo_map.target_dir,
                 output_dir=args.output_dir,
                 install_timeout=args.timeout
@@ -3741,7 +3770,6 @@ def run_single_file_pipeline(
     is_json = getattr(args, "format", "text") == "json"
 
     target_single_file_dir = str(Path(args.notebook).parent) if (args.notebook and not os.path.isdir(args.notebook)) else "."
-    single_file_local_modules = discover_local_repo_modules(target_single_file_dir)
 
     if args.notebook and not os.path.isdir(args.notebook):
         logger.info(f"🔍 [Path A] Analyzing saved notebook file '{args.notebook}' via AST...")
@@ -3801,7 +3829,7 @@ def run_single_file_pipeline(
     )
 
     nb_report = build_single_notebook_report(
-        single_res, frozen_env, pkg_dist_map, gpu_info, local_repo_modules=single_file_local_modules
+        single_res, frozen_env, pkg_dist_map, gpu_info, root_dir=target_single_file_dir
     )
 
     if not is_json:
@@ -3850,7 +3878,6 @@ def run_single_file_pipeline(
             gpu_info,
             suffix=args.suffix,
             in_place=args.in_place,
-            local_repo_modules=single_file_local_modules,
             root_dir=target_single_file_dir,
             output_dir=args.output_dir,
             install_timeout=args.timeout
@@ -3894,7 +3921,7 @@ def run_single_file_pipeline(
 
 def main() -> None:
     """CLI entrypoint and dispatch router for single notebook or batch analysis modes."""
-    get_notebook_local_modules.cache_clear()
+    resolve_local_module.cache_clear()
     build_manifest_entries.cache_clear()
 
     parser = argparse.ArgumentParser(description="Generate environment lockfiles for Jupyter Notebooks.")
