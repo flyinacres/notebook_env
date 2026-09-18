@@ -25,7 +25,7 @@ import notebook_env as ne
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
-MAGIC_SINK_PATH = FIXTURE_DIR / "magic_sink.ipynb"
+MAGIC_SINK_PATH = FIXTURE_DIR / "unit" / "magic_sink.ipynb"
 
 
 @pytest.fixture

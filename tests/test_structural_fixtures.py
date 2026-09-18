@@ -168,7 +168,7 @@ def assert_case4(out: str, output_dir: Path, **_) -> None:
 def _missing_block(out: str) -> str:
     """Isolate the 'Packages missing from current environment' section so
     matches don't accidentally hit an unrelated part of the report."""
-    marker = "Packages missing from current environment"
+    marker = "Packages not resolvable via pip-freeze or local file scan"
     idx = out.find(marker)
     return out[idx:] if idx != -1 else ""
 
