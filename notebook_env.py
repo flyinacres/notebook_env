@@ -305,6 +305,7 @@ class SteadyPyManifest:
     tool_version: str = TOOL_VERSION
     dependency_hash: str = ""
     raw_installs: List[str] = field(default_factory=list)
+    custom_sourced: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -315,6 +316,7 @@ class SteadyPyManifest:
             "tool_version": self.tool_version,
             "dependency_hash": self.dependency_hash,
             "raw_installs": self.raw_installs,
+            "custom_sourced": self.custom_sourced,
         }
 
     def compute_and_set_hash(self) -> str:
@@ -2212,6 +2214,12 @@ def resolve_transitive_graph(
         if _has_local_version_identifier(version):
             continue  # not on PyPI by definition -- can't be a root requirement here
         name, _extra = _split_pin_name(raw_name)
+        if fetch_pypi_package_metadata(name).status != "found":
+            # Custom-index/local-only package: not resolvable via this PyPI-only
+            # provider, and not a real conflict -- check_yanked_or_removed already
+            # reports on it directly (not_found_on_pypi), so silently excluding it
+            # from the graph here avoids a false ResolutionImpossible.
+            continue
         try:
             root_reqs.append(Requirement(f"{name}=={version}"))
         except InvalidRequirement:
@@ -2788,12 +2796,26 @@ def generate_production_blueprint(
     if comment_lines:
         comments_block = "\n# Informational notes & uninstalled fallbacks:\n" + "\n".join(comment_lines) + "\n"
 
+    # Classify custom-sourced pins (local-version-identifier or not found on PyPI)
+    # up front so the runtime failure path can point to the right guidance if
+    # install ever fails. fetch_pypi_package_metadata is memoized, so this costs
+    # nothing extra -- the generation_findings loop below reaches the same pins.
+    custom_sourced_names: List[str] = []
+    for dep in normalized_items:
+        name, version = dep.get("name"), dep.get("version")
+        if not name or not version:
+            continue
+        bare_name, _extra = _split_pin_name(name)
+        if _has_local_version_identifier(version) or fetch_pypi_package_metadata(bare_name).status != "found":
+            custom_sourced_names.append(name)
+
     manifest = SteadyPyManifest(
         python_version={"major": py_major, "minor": py_minor},
         dependencies=normalized_items,
         gpu=gpu_info.to_dict() if gpu_info else None,
         generated_at=timestamp,
         raw_installs=list(raw_installs) if raw_installs else [],
+        custom_sourced=custom_sourced_names,
     )
     manifest.compute_and_set_hash()
 
@@ -2815,6 +2837,8 @@ for raw_idx, raw_spec in enumerate(STEADY_PY_MANIFEST.get("raw_installs", []), s
     else:
         failed_packages.append((raw_spec, "", [], "\\n".join(raw_captured)))
         print(f"    ❌ {{raw_spec}} failed to install (exit code {{raw_returncode}})")
+        print(f"       ⚠️ This is a custom-specified source (git/URL/local file), not a standard PyPI package.")
+        print(f"          If it's unreachable, contact the notebook's author for its current location.")
 
 total_deps += len(STEADY_PY_MANIFEST.get("raw_installs", []))
 '''
@@ -2975,6 +2999,9 @@ for idx, item in enumerate(STEADY_PY_MANIFEST["dependencies"], start=1):
         err_snippet = captured_output[-1] if captured_output else "Unknown pip error"
         failed_packages.append((specifier, ver, flags, "\\n".join(captured_output)))
         print(f"    ❌ {{specifier}} failed to install (exit code {{returncode}})")
+        if name in STEADY_PY_MANIFEST.get("custom_sourced", []):
+            print(f"       ⚠️ This package is custom-specified by the notebook's author (not on public PyPI).")
+            print(f"          If it's unavailable, contact the author for its current location.")
         print(f"       ├─ Author Verified Version: {{ver or 'unspecified'}}")
         if flags:
             print(f"       ├─ Scoped Flags: {{' '.join(flags)}}")
