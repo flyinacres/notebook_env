@@ -1982,6 +1982,36 @@ def _marker_environment(required_python: Dict[str, int], extra: Optional[str]) -
     return env
 
 
+def _local_find_links_artifact_hint(name: str, version: str) -> str:
+    """Checks PIP_FIND_LINKS for a local directory that actually contains a
+    matching wheel/sdist for this pin, so the not-found-on-PyPI message can
+    state a verified fact instead of only noting that an env var is set.
+
+    Local paths only -- no network. PIP_FIND_LINKS may also list URLs; those
+    are left untouched (verifying them would require a network probe, which
+    is a separate, deferred concern with its own risk profile).
+    """
+    find_links = os.environ.get("PIP_FIND_LINKS", "")
+    if not find_links:
+        return ""
+    normalized = name.replace("-", "_").replace(".", "_")
+    for target in find_links.split():
+        if target.startswith(("http://", "https://")):
+            continue
+        target_dir = Path(target)
+        if not target_dir.is_dir():
+            continue
+        matches = (
+            list(target_dir.glob(f"{normalized}-{version}*.whl"))
+            + list(target_dir.glob(f"{name}-{version}*.tar.gz"))
+            + list(target_dir.glob(f"{name}-{version}*.zip"))
+        )
+        if matches:
+            return f" Verified present in {target}: {matches[0].name}."
+        return f" Checked {target} -- no matching artifact for {name}=={version} found there."
+    return ""
+
+
 def check_yanked_or_removed(name: str, version: str) -> List[DriftFinding]:
     """Distinguishes: pin still resolvable -> yanked or clean; pin gone but project alive -> removed;
     whole project gone -> removed (project-level); any network failure -> check_error, not silence.
@@ -2019,14 +2049,15 @@ def check_yanked_or_removed(name: str, version: str) -> List[DriftFinding]:
         )]
 
     env_hint = _pip_env_hint()
+    local_hint = _local_find_links_artifact_hint(name, version)
     return [DriftFinding(
         package=name, version=version, signal="not_found_on_pypi", severity="confirmed",
         message=(
             f"{name} could not be found on PyPI. It may be a private, local-only, or custom-index "
             f"package that ships alongside this notebook (if so, no action needed), or the name may "
-            f"be misspelled.{env_hint}"
+            f"be misspelled.{env_hint}{local_hint}"
         ),
-        details={"pip_env_hint": env_hint} if env_hint else {},
+        details={"pip_env_hint": env_hint, "local_artifact_hint": local_hint} if (env_hint or local_hint) else {},
     )]
 
 

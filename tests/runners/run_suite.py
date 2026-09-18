@@ -224,7 +224,11 @@ def cleanup_artifacts(*paths: Path) -> None:
                 print(f"Warning: Failed to remove artifact {path}: {err}", file=sys.stderr)
 
 
-def verify_positive_notebook(notebook_path: Path, patterns: Sequence[str]) -> None:
+def _collect_notebook_outputs(notebook_path: Path) -> tuple[list[str], list[dict]]:
+    """Walks a notebook's cell outputs once. Returns (stream/result text per
+    cell, error outputs with their cell index) so callers can check either or
+    both without re-parsing the notebook.
+    """
     if not notebook_path.exists():
         raise RuntimeError(f"Expected output notebook was not generated: {notebook_path}")
 
@@ -232,21 +236,31 @@ def verify_positive_notebook(notebook_path: Path, patterns: Sequence[str]) -> No
         nb_data = json.load(f)
 
     collected_text: list[str] = []
+    error_outputs: list[dict] = []
     for cell_idx, cell in enumerate(nb_data.get("cells", [])):
         for output in cell.get("outputs", []):
             output_type = output.get("output_type")
             if output_type == "error":
-                ename = output.get("ename", "Error")
-                evalue = output.get("evalue", "")
-                raise AssertionError(
-                    f"Unexpected cell execution error in {notebook_path.name} (cell {cell_idx}): {ename}: {evalue}"
-                )
-            if output_type == "stream":
+                error_outputs.append({"cell": cell_idx, "output": output})
+            elif output_type == "stream":
                 text = output.get("text", "")
                 collected_text.append("".join(text) if isinstance(text, list) else text)
             elif output_type in {"execute_result", "display_data"}:
                 data_text = output.get("data", {}).get("text/plain", "")
                 collected_text.append("".join(data_text) if isinstance(data_text, list) else data_text)
+    return collected_text, error_outputs
+
+
+def verify_positive_notebook(notebook_path: Path, patterns: Sequence[str]) -> None:
+    collected_text, error_outputs = _collect_notebook_outputs(notebook_path)
+
+    if error_outputs:
+        first = error_outputs[0]
+        ename = first["output"].get("ename", "Error")
+        evalue = first["output"].get("evalue", "")
+        raise AssertionError(
+            f"Unexpected cell execution error in {notebook_path.name} (cell {first['cell']}): {ename}: {evalue}"
+        )
 
     if not patterns:
         return
@@ -265,17 +279,7 @@ def verify_negative_notebook(
     expected_ename: str,
     expected_evalue_substring: str,
 ) -> None:
-    if not notebook_path.exists():
-        raise RuntimeError(f"Expected output notebook was not generated: {notebook_path}")
-
-    with notebook_path.open("r", encoding="utf-8") as f:
-        nb_data = json.load(f)
-
-    error_outputs: list[dict] = []
-    for cell_idx, cell in enumerate(nb_data.get("cells", [])):
-        for output in cell.get("outputs", []):
-            if output.get("output_type") == "error":
-                error_outputs.append({"cell": cell_idx, "output": output})
+    _, error_outputs = _collect_notebook_outputs(notebook_path)
 
     if len(error_outputs) != 1:
         raise AssertionError(
@@ -294,6 +298,40 @@ def verify_negative_notebook(
         raise AssertionError(
             f"Cell error evalue mismatch: expected substring '{expected_evalue_substring}', found '{evalue}'"
         )
+
+
+def verify_expected_failure_notebook(
+    notebook_path: Path,
+    stream_patterns: Sequence[str],
+    expected_ename: str,
+) -> None:
+    """For a scenario where Cell 2 is expected to print failure guidance (a
+    caught, non-raising install failure) and a downstream cell is expected to
+    then raise as a real consequence (e.g. importing a package that never
+    installed). Checks the guidance text appears in stream output, and that
+    exactly one cell error occurred, of the expected type.
+    """
+    collected_text, error_outputs = _collect_notebook_outputs(notebook_path)
+
+    if len(error_outputs) != 1:
+        raise AssertionError(
+            f"Expected exactly one cell error in {notebook_path.name}, but found {len(error_outputs)}."
+        )
+
+    ename = error_outputs[0]["output"].get("ename", "")
+    if ename != expected_ename:
+        raise AssertionError(
+            f"Cell error ename mismatch: expected '{expected_ename}', found '{ename}'"
+        )
+
+    all_output = strip_ansi("\n".join(collected_text))
+    for pattern in stream_patterns:
+        if pattern not in all_output:
+            raise AssertionError(
+                f"Verification failed for {notebook_path.name}.\n"
+                f"Missing expected pattern:\n  '{pattern}'\n"
+                f"Searched outputs:\n{all_output}"
+            )
 
 
 def run_common_tests() -> None:
@@ -366,6 +404,7 @@ def run_common_tests() -> None:
     repin_merged = repin_nb.with_name(repin_nb.stem + "_merged.ipynb")
     out_v1 = SCRATCH_DIR / "out_v1.ipynb"
     out_v2 = SCRATCH_DIR / "out_v2.ipynb"
+    out_v3 = SCRATCH_DIR / "out_v3.ipynb"
     SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
 
     repin_cmd = (
@@ -388,18 +427,43 @@ def run_common_tests() -> None:
         "PIP_NO_INDEX=1 PIP_FIND_LINKS=/workspace/tests/fixtures/local_test_pkg/dist "
         f'jupyter nbconvert --to notebook --execute "{repin_merged.as_posix()}" '
         f'--output "/workspace/{out_v2.relative_to(REPO_ROOT).as_posix()}" '
-        "--ExecutePreprocessor.timeout=300 --ExecutePreprocessor.kernel_name=python3"
+        "--ExecutePreprocessor.timeout=300 --ExecutePreprocessor.kernel_name=python3 && "
+        "pip uninstall -y local_test_pkg && "
+        "mkdir -p /tmp/empty_dist && "
+        "PIP_NO_INDEX=1 PIP_FIND_LINKS=/tmp/empty_dist "
+        f'jupyter nbconvert --to notebook --execute "{repin_merged.as_posix()}" '
+        f'--output "/workspace/{out_v3.relative_to(REPO_ROOT).as_posix()}" '
+        "--ExecutePreprocessor.timeout=300 --ExecutePreprocessor.kernel_name=python3 "
+        "--ExecutePreprocessor.allow_errors=True"
     )
 
     try:
-        exit_code, _ = run_docker("python:3.11-slim", repin_cmd)
+        exit_code, repin_output = run_docker("python:3.11-slim", repin_cmd)
         if exit_code != 0:
             raise RuntimeError("Local package pin-and-verify run failed.")
 
+        clean_repin_output = strip_ansi(repin_output)
+        for expected in (
+            "Verified present in /workspace/tests/fixtures/local_test_pkg/dist: local_test_pkg-1.0.0",
+            "Verified present in /workspace/tests/fixtures/local_test_pkg/dist: local_test_pkg-2.0.0",
+        ):
+            if expected not in clean_repin_output:
+                raise AssertionError(
+                    f"Missing expected local-artifact verification message: '{expected}'"
+                )
+
         verify_positive_notebook(out_v1, ("Pinned install verification passed: local_test_pkg 1.0.0 active",))
         verify_positive_notebook(out_v2, ("Pinned install verification passed: local_test_pkg 2.0.0 active",))
+        verify_expected_failure_notebook(
+            out_v3,
+            stream_patterns=(
+                "This package is custom-specified by the notebook's author (not on public PyPI).",
+                "If it's unavailable, contact the author for its current location.",
+            ),
+            expected_ename="ModuleNotFoundError",
+        )
     finally:
-        cleanup_artifacts(REPO_ROOT / repin_merged, out_v1, out_v2)
+        cleanup_artifacts(REPO_ROOT / repin_merged, out_v1, out_v2, out_v3)
 
     print("\033[92mPASS: Local package pin-and-verify test\n\033[0m")
 
