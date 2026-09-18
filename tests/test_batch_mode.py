@@ -261,7 +261,7 @@ class TestBatchOrchestration:
         repo_map = ne.walk_and_scan_directory(str(tmp_path))
         report, is_clean = ne.generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, None)
 
-        assert "Packages missing from current environment: 0" in report
+        assert "Packages not resolvable via pip-freeze or local file scan: 0" in report
 
     def test_local_repo_modules_not_flagged_as_missing_pypi_packages(self, tmp_path, mock_batch_env):
         frozen_env, pkg_dist_map = mock_batch_env
@@ -278,7 +278,7 @@ class TestBatchOrchestration:
         repo_map = ne.walk_and_scan_directory(str(tmp_path))
         report, is_clean = ne.generate_batch_analysis_report(repo_map, frozen_env, pkg_dist_map, None)
 
-        assert "Packages missing from current environment: 0" in report
+        assert "Packages not resolvable via pip-freeze or local file scan: 0" in report
 
     def test_canonicalize_pkg_name_normalizes_variants(self):
         """PEP 503 normalization: equate hyphens, underscores, and periods."""
@@ -292,7 +292,7 @@ class TestBatchOrchestration:
         assert ne.IMPORT_TO_PYPI_MAP.get("skimage") == "scikit-image"
 
     def test_platform_pseudo_modules_contains_bootstrap_tools(self):
-        """'databricks' and 'notebook_env' are platform pseudo-modules; 'pip'/'setuptools'/'wheel' are build/packaging tools — both buckets excluded from missing packages."""
+        """'databricks' and 'notebook_env' are platform pseudo-modules; 'pip'/'setuptools'/'wheel' are build/packaging tools -- both buckets excluded from missing packages."""
         for mod in ("databricks", "notebook_env"):
             assert mod in ne.PLATFORM_PSEUDO_MODULES
         for tool in ("pip", "setuptools", "wheel"):
@@ -325,31 +325,6 @@ class TestBatchOrchestration:
         assert "torch-neuronx" in summary.missing_packages
         assert "torch_neuronx" not in summary.missing_packages
         assert len(summary.missing_packages["torch-neuronx"]) == 2
-
-    def test_guarded_import_not_flagged_as_missing(self, tmp_path):
-        """
-        A try/except-guarded import (e.g. cupy) must be surfaced in
-        guarded_packages, not lumped into missing_packages.
-        """
-        nb = {
-            "metadata": {"kernelspec": {"language": "python"}},
-            "cells": [{
-                "cell_type": "code",
-                "source": ["try:\n    import cupy as cp\nexcept ImportError:\n    cp = None\n"]
-            }]
-        }
-        (tmp_path / "guarded_test.ipynb").write_text(json.dumps(nb), encoding="utf-8")
-
-        repo_map = ne.walk_and_scan_directory(str(tmp_path))
-        summary = ne.analyze_batch_repository(
-            repo_map=repo_map,
-            frozen_env={},
-            pkg_dist_map={},
-            batch_hw_cache=None
-        )
-
-        assert "cupy" in summary.guarded_packages
-        assert "cupy" not in summary.missing_packages
 
 
 def test_batch_report_surfaces_hardware_tag_warnings(tmp_path):

@@ -1624,7 +1624,7 @@ def resolve_pypi_package_and_extras(
             version="",
             status="pinned",
             is_comment=True,
-            comment_text=f"# {pypi_name} (imported as '{imp}', not currently found in active env)"
+            comment_text=f"# {pypi_name} (imported as '{imp}'; not found via pip-freeze or local file scan -- verify before assuming this is truly missing)"
         ), None
 
     pkg_part, ver_part = matched_pin.split("==", 1)
@@ -3418,14 +3418,18 @@ def format_console_report(summary: BatchAnalysisSummary) -> str:
     out.append(f"  • Installed & Verified: {len(matched_list)} packages ({', '.join(matched_list[:5])}{'...' if len(matched_list) > 5 else ''})")
     
     if summary.missing_packages:
-        out.append(f"  • Packages missing from current environment: {len(summary.missing_packages)}")
-        out.append("    (Action: Run 'pip install <package>' in active environment before generating lockfiles)")
+        out.append(f"  • Packages not resolvable via pip-freeze or local file scan: {len(summary.missing_packages)}")
+        out.append("    (Not found installed, nor as a sibling file/package next to the notebook or in the declared")
+        out.append("     root dir. If any of these resolve via a custom sys.path setup -- PYTHONPATH, an IDE project")
+        out.append("     root, an editable install, or a platform like Databricks Repos -- this is a false positive;")
+        out.append("     verify by running the notebook directly before assuming a real gap. Otherwise, run")
+        out.append("     'pip install <package>'.)")
         for pkg, nbs in sorted(summary.missing_packages.items()):
             nb_list = ", ".join(sorted(set(nbs))[:3])
             more = f", +{len(set(nbs))-3} more" if len(set(nbs)) > 3 else ""
             out.append(f"      - {pkg} (imported in: {nb_list}{more})")
     else:
-        out.append("  • Packages missing from current environment: 0")
+        out.append("  • Packages not resolvable via pip-freeze or local file scan: 0")
 
     if summary.guarded_packages:
         out.append(f"  • Guarded/optional imports (inside try/except): {len(summary.guarded_packages)}")
