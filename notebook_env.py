@@ -4,7 +4,7 @@
 notebook_env.py (v44)
 Headless Jupyter Notebook Dependency Scanner & Lockfile Generator.
 
-Standalone, zero-dependency utility for analyzing notebook environments,
+Standalone utility (requires `packaging` and `resolvelib`) for analyzing notebook environments,
 detecting GPU/accelerator requirements, harvesting scoped index URLs, and emitting
 reproducible lockfile manifests and isolated sequential installation blueprints.
 
