@@ -397,3 +397,94 @@ class TestCheckTransitiveSignals:
         ]
         findings = ne.check_transitive_signals(deps, REQ_PY_311)
         assert all(f.signal == "conflict" for f in findings)
+
+
+class TestLocalModuleDriftCheck:
+    """
+    Unit coverage for check_local_modules -- pure filesystem existence checks,
+    no PyPI/network involved. Covers all real outcomes: still found (no
+    finding), genuinely gone (confirmed), and unverifiable (error) in both
+    ways that can happen -- no root_dir supplied, or the anchor directory
+    itself no longer exists.
+    """
+
+    def _manifest_with(self, local_modules):
+        return ne.SteadyPyManifest(
+            python_version={"major": 3, "minor": 11},
+            dependencies=[],
+            gpu=None,
+            generated_at="2026-01-01 00:00:00",
+            local_modules=local_modules,
+        )
+
+    def test_notebook_dir_module_still_present_no_finding(self, tmp_path):
+        (tmp_path / "cookbook.py").write_text("# helper", encoding="utf-8")
+        manifest = self._manifest_with([{"name": "cookbook", "anchor": "notebook_dir"}])
+
+        findings = ne.check_local_modules(manifest, notebook_dir=str(tmp_path))
+        assert findings == []
+
+    def test_notebook_dir_module_missing_is_confirmed(self, tmp_path):
+        """Module never existed at this path (or was removed) -- notebook_dir
+        itself always exists here since we're checking against a real tmp_path,
+        so this must land as a genuine confirmed finding, not unverifiable."""
+        manifest = self._manifest_with([{"name": "cookbook", "anchor": "notebook_dir"}])
+
+        findings = ne.check_local_modules(manifest, notebook_dir=str(tmp_path))
+        assert len(findings) == 1
+        assert findings[0].signal == "local_module_missing"
+        assert findings[0].severity == "confirmed"
+        assert "cookbook" in findings[0].message
+
+    def test_root_dir_module_not_supplied_is_unverifiable(self, tmp_path):
+        manifest = self._manifest_with([{"name": "shared_utils", "anchor": "root_dir"}])
+
+        findings = ne.check_local_modules(manifest, notebook_dir=str(tmp_path), root_dir=None)
+        assert len(findings) == 1
+        assert findings[0].signal == "local_module_unverifiable"
+        assert findings[0].severity == "error"
+        assert "none was supplied" in findings[0].message
+
+    def test_root_dir_module_still_present_no_finding(self, tmp_path):
+        (tmp_path / "shared_utils.py").write_text("# shared", encoding="utf-8")
+        manifest = self._manifest_with([{"name": "shared_utils", "anchor": "root_dir"}])
+
+        findings = ne.check_local_modules(manifest, notebook_dir=str(tmp_path / "nb_dir"), root_dir=str(tmp_path))
+        assert findings == []
+
+    def test_root_dir_module_deleted_is_confirmed(self, tmp_path):
+        manifest = self._manifest_with([{"name": "shared_utils", "anchor": "root_dir"}])
+
+        findings = ne.check_local_modules(manifest, notebook_dir=str(tmp_path / "nb_dir"), root_dir=str(tmp_path))
+        assert len(findings) == 1
+        assert findings[0].signal == "local_module_missing"
+        assert findings[0].severity == "confirmed"
+
+    def test_root_dir_itself_gone_is_unverifiable_not_confirmed(self, tmp_path):
+        """Distinguishes 'the whole project moved' from 'this one file is gone' --
+        must not be reported as a confirmed missing module, since the module
+        may well still exist at wherever the project moved to."""
+        missing_root = str(tmp_path / "does_not_exist")
+        manifest = self._manifest_with([{"name": "shared_utils", "anchor": "root_dir"}])
+
+        findings = ne.check_local_modules(manifest, notebook_dir=str(tmp_path), root_dir=missing_root)
+        assert len(findings) == 1
+        assert findings[0].signal == "local_module_unverifiable"
+        assert findings[0].severity == "error"
+        assert "no longer exists" in findings[0].message
+
+    def test_multiple_entries_each_get_independent_findings(self, tmp_path):
+        (tmp_path / "present.py").write_text("# present", encoding="utf-8")
+        manifest = self._manifest_with([
+            {"name": "present", "anchor": "notebook_dir"},
+            {"name": "absent", "anchor": "notebook_dir"},
+        ])
+
+        findings = ne.check_local_modules(manifest, notebook_dir=str(tmp_path))
+        assert len(findings) == 1
+        assert findings[0].package == "absent"
+
+    def test_entry_missing_name_key_is_skipped_not_crashed(self, tmp_path):
+        manifest = self._manifest_with([{"anchor": "notebook_dir"}])
+        findings = ne.check_local_modules(manifest, notebook_dir=str(tmp_path))
+        assert findings == []

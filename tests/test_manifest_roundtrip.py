@@ -150,3 +150,109 @@ class TestCheckDriftPipelineE2E:
     def test_no_manifest_exits_zero(self):
         exit_code = ne.run_check_drift_pipeline(str(KITCHEN_SINK_PATH))
         assert exit_code == 0
+
+
+def _write_and_generate_real_notebook(tmp_path, cell_source, filename="local_mod_test.ipynb"):
+    """Builds a real .ipynb with the given cell source, runs it through the actual
+    scan -> generate -> write pipeline (apply_output_to_notebook), and returns the
+    written path plus the generation-time drift report -- no hand-built
+    DependencyEntry objects, so this exercises real local-module classification,
+    not just the manifest plumbing in isolation."""
+    nb = {
+        "metadata": {"kernelspec": {"language": "python"}},
+        "cells": [{"cell_type": "code", "source": [cell_source]}],
+    }
+    nb_path = tmp_path / filename
+    nb_path.write_text(json.dumps(nb), encoding="utf-8")
+
+    ext_res = ne.extract_from_file(str(nb_path))
+    scan_res = ne.NotebookScanResult(
+        path=nb_path,
+        is_python=True,
+        lang_label="python",
+        imports=ext_res.imports,
+        submodules=ext_res.submodules,
+        guarded_imports=ext_res.guarded_imports,
+        code_sources=ext_res.code_sources,
+    )
+    written_path, drift_report = ne.apply_output_to_notebook(scan_res, {}, {}, None, in_place=True)
+    return written_path, drift_report
+
+
+class TestLocalModulePersistence:
+    """
+    Phase C coverage: local-module classification must be captured in
+    SteadyPyManifest.local_modules (for drift-check to later re-verify by
+    existence), kept out of the pinned dependencies list (never PyPI-installable),
+    covered by tamper-hash detection like every other manifest field, and
+    backward-compatible with manifests generated before this field existed.
+    """
+
+    def test_local_module_captured_and_excluded_from_dependencies(self, tmp_path):
+        (tmp_path / "cookbook.py").write_text("# local helper", encoding="utf-8")
+        written_path, drift_report = _write_and_generate_real_notebook(tmp_path, "import cookbook\n")
+
+        manifest = drift_report.manifest
+        assert manifest.local_modules == [{"name": "cookbook", "anchor": "notebook_dir"}]
+        assert manifest.dependencies == []
+
+    def test_local_module_survives_write_then_extract_round_trip(self, tmp_path):
+        (tmp_path / "cookbook.py").write_text("# local helper", encoding="utf-8")
+        written_path, _ = _write_and_generate_real_notebook(tmp_path, "import cookbook\n")
+
+        extracted, error = ne.extract_manifest_from_file(str(written_path))
+        assert error is None
+        assert extracted.local_modules == [{"name": "cookbook", "anchor": "notebook_dir"}]
+
+    def test_root_dir_anchor_recorded_without_any_path(self, tmp_path):
+        """A module found only via root_dir must record just the anchor tag --
+        never a path -- so a shared notebook can't leak directory structure
+        that sits outside the notebook's own folder."""
+        nb_dir = tmp_path / "notebooks"
+        nb_dir.mkdir()
+        (tmp_path / "shared_utils.py").write_text("# shared", encoding="utf-8")
+
+        nb = {
+            "metadata": {"kernelspec": {"language": "python"}},
+            "cells": [{"cell_type": "code", "source": ["import shared_utils\n"]}],
+        }
+        nb_path = nb_dir / "uses_root.ipynb"
+        nb_path.write_text(json.dumps(nb), encoding="utf-8")
+
+        ext_res = ne.extract_from_file(str(nb_path))
+        scan_res = ne.NotebookScanResult(
+            path=nb_path, is_python=True, lang_label="python",
+            imports=ext_res.imports, submodules=ext_res.submodules,
+            guarded_imports=ext_res.guarded_imports, code_sources=ext_res.code_sources,
+        )
+        _, drift_report = ne.apply_output_to_notebook(scan_res, {}, {}, None, in_place=True, root_dir=str(tmp_path))
+
+        assert drift_report.manifest.local_modules == [{"name": "shared_utils", "anchor": "root_dir"}]
+
+    def test_local_modules_covered_by_tamper_hash(self, tmp_path):
+        (tmp_path / "cookbook.py").write_text("# local helper", encoding="utf-8")
+        _, drift_report = _write_and_generate_real_notebook(tmp_path, "import cookbook\n")
+
+        manifest = drift_report.manifest
+        stored_hash = manifest.dependency_hash
+        manifest.local_modules.append({"name": "injected", "anchor": "notebook_dir"})
+        recomputed = manifest.compute_and_set_hash()
+
+        assert recomputed != stored_hash, "mutating local_modules must invalidate the tamper hash like any other field"
+
+    def test_manifest_without_local_modules_key_still_parses(self):
+        """A notebook generated before this field existed has no 'local_modules'
+        key in its persisted STEADY_PY_MANIFEST literal at all -- must still
+        parse cleanly and default to an empty list, not crash."""
+        pre_existing_shape = {
+            "python_version": {"major": 3, "minor": 11},
+            "dependencies": [{"name": "requests", "version": "2.32.1", "flags": []}],
+            "gpu": None,
+            "generated_at": "2025-01-01 00:00:00",
+            "tool_version": "40",
+            "dependency_hash": "irrelevant_for_this_test",
+            "raw_installs": [],
+            "custom_sourced": [],
+        }
+        manifest = ne.SteadyPyManifest(**pre_existing_shape)
+        assert manifest.local_modules == []

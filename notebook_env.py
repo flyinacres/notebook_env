@@ -213,6 +213,10 @@ class DependencyEntry:
         status: Semantic category ('pinned', 'guarded', 'platform_pseudo_module', 'build_tool', 'local_module', 'auxiliary_tool', 'writefile_script').
         is_comment: True if this entry represents a comment, platform pseudo-module, or uninstalled fallback.
         comment_text: Full string representation when is_comment is True.
+        anchor: Which directory a 'local_module' status entry resolved against
+            ('notebook_dir' or 'root_dir'); empty for every other status. Never
+            carries a path -- only the anchor name -- so a shared notebook never
+            bakes in the creator's directory structure (see SteadyPyManifest.local_modules).
     """
     name: str = ""
     version: str = ""
@@ -221,6 +225,7 @@ class DependencyEntry:
     status: str = "pinned"
     is_comment: bool = False
     comment_text: str = ""
+    anchor: str = ""
 
     @property
     def specifier(self) -> str:
@@ -297,6 +302,12 @@ class SteadyPyManifest:
 
     Also the payload drift-check parses back out of a notebook/.py file to
     evaluate pins against live PyPI metadata (no execution, no installs).
+
+    local_modules records local sibling modules found at generation time, for
+    drift-check to re-verify by existence (not a PyPI check -- these were never
+    pip-installable). Each entry is {"name": ..., "anchor": "notebook_dir" |
+    "root_dir"} -- never a path, so a shared notebook never bakes in the
+    creator's directory structure.
     """
     python_version: Dict[str, int]
     dependencies: List[Dict[str, Any]]
@@ -306,6 +317,7 @@ class SteadyPyManifest:
     dependency_hash: str = ""
     raw_installs: List[str] = field(default_factory=list)
     custom_sourced: List[str] = field(default_factory=list)
+    local_modules: List[Dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -317,6 +329,7 @@ class SteadyPyManifest:
             "dependency_hash": self.dependency_hash,
             "raw_installs": self.raw_installs,
             "custom_sourced": self.custom_sourced,
+            "local_modules": self.local_modules,
         }
 
     def compute_and_set_hash(self) -> str:
@@ -1573,12 +1586,14 @@ def resolve_pypi_package_and_extras(
             comment_text=f"# {imp} (core Python build/packaging tool; excluded from requirement lockfiles)"
         ), None
 
-    if local_ctx and resolve_local_module(imp, local_ctx.notebook_dir, local_ctx.root_dir):
+    resolved_anchor = resolve_local_module(imp, local_ctx.notebook_dir, local_ctx.root_dir) if local_ctx else None
+    if resolved_anchor:
         return DependencyEntry(
             name=imp,
             status="local_module",
             is_comment=True,
-            comment_text=f"# {imp} (local folder/file next to notebook; ensure sibling files were shared)"
+            comment_text=f"# {imp} (local folder/file next to notebook; ensure sibling files were shared)",
+            anchor=resolved_anchor
         ), None
 
     pypi_name = None
@@ -2539,7 +2554,63 @@ def extract_manifest_from_file(path: str) -> Tuple[Optional[SteadyPyManifest], O
 
 # --- Check-drift pipeline ----------------------------------------------------
 
-def run_check_drift_pipeline(target: str, output_format: str = "text") -> int:
+def check_local_modules(
+    manifest: SteadyPyManifest, notebook_dir: Optional[str], root_dir: Optional[str] = None
+) -> List[DriftFinding]:
+    """Re-verifies each local module recorded at generation time by plain
+    filesystem existence -- never by import resolution, since drift-check must
+    give the same answer regardless of the environment it happens to run in.
+
+    Three outcomes per entry:
+    - still found at its recorded anchor -> no finding.
+    - anchor directory itself is gone (or a root_dir-anchored entry has no
+      root_dir supplied here) -> "error" severity: genuinely unverifiable,
+      not necessarily broken (the project may have just moved).
+    - anchor directory intact but this specific name is gone -> "confirmed"
+      severity: a real, specific finding.
+    """
+    findings: List[DriftFinding] = []
+
+    for entry in manifest.local_modules:
+        name = entry.get("name")
+        anchor = entry.get("anchor")
+        if not name:
+            continue
+
+        if anchor == "root_dir":
+            if root_dir is None:
+                findings.append(DriftFinding(
+                    package=name, version="", signal="local_module_unverifiable", severity="error",
+                    message=f"'{name}' was recorded via a root_dir at generation time; none was supplied "
+                            f"for this check, so it can't be verified.",
+                ))
+                continue
+            anchor_dir = root_dir
+        else:
+            anchor_dir = notebook_dir
+
+        if not anchor_dir or not Path(anchor_dir).exists():
+            findings.append(DriftFinding(
+                package=name, version="", signal="local_module_unverifiable", severity="error",
+                message=f"Cannot verify '{name}': the recorded location's directory no longer exists. "
+                        f"If the project was moved, re-run generation to update.",
+            ))
+            continue
+
+        if _found_in_dir(name, anchor_dir):
+            continue
+
+        findings.append(DriftFinding(
+            package=name, version="", signal="local_module_missing", severity="confirmed",
+            message=f"'{name}' was originally found at {anchor_dir}; it can no longer be found there. "
+                    f"Check that it will still be available to users, or re-run generation if the "
+                    f"project structure changed.",
+        ))
+
+    return findings
+
+
+def run_check_drift_pipeline(target: str, output_format: str = "text", root_dir: Optional[str] = None) -> int:
     """Orchestrates Check mode end to end: extract -> run all checks -> report.
 
     Returns the process exit code: 0 clean, 1 drift found (confirmed or
@@ -2570,6 +2641,8 @@ def run_check_drift_pipeline(target: str, output_format: str = "text") -> int:
             message=f"Manifest hash mismatch in {target} -- it may have been hand-edited since generation.",
             details={"stored_hash": stored_hash, "recomputed_hash": recomputed_hash},
         ))
+
+    findings.extend(check_local_modules(manifest, notebook_dir=str(Path(target).parent), root_dir=root_dir))
 
     for dep in manifest.dependencies:
         name, version = dep.get("name"), dep.get("version")
@@ -2802,11 +2875,14 @@ def generate_production_blueprint(
 
     normalized_items: List[Dict[str, Any]] = []
     comment_lines: List[str] = []
+    local_modules_captured: List[Dict[str, str]] = []
 
     for item in manifest_items:
         if isinstance(item, DependencyEntry):
             if item.is_comment:
                 comment_lines.append(item.comment_text)
+                if item.status == "local_module" and item.anchor:
+                    local_modules_captured.append({"name": item.name, "anchor": item.anchor})
             else:
                 normalized_items.append(item.to_dict())
         elif isinstance(item, dict):
@@ -2881,6 +2957,7 @@ def generate_production_blueprint(
         generated_at=timestamp,
         raw_installs=list(raw_installs) if raw_installs else [],
         custom_sourced=custom_sourced_names,
+        local_modules=local_modules_captured,
     )
     manifest.compute_and_set_hash()
 
@@ -3936,6 +4013,7 @@ def main() -> None:
     parser.add_argument("--quiet", action="store_true", help="Suppress diagnostic and status logging outputs.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose debug output.")
     parser.add_argument("--check-drift", action="store_true", help="Read-only: check an existing notebook's pinned manifest for drift against live PyPI, instead of generating a new one.")
+    parser.add_argument("--root-dir", metavar="DIR", help="Root directory to re-verify root_dir-anchored local modules against during --check-drift; without it, those entries are reported as unverifiable, not silently skipped.")
 
     # Batch / Output Flags
     parser.add_argument("--batch", metavar="DIR", help="Run in batch mode across all notebooks in specified directory.")
@@ -3969,7 +4047,7 @@ def main() -> None:
             if is_running_in_ipython():
                 return
             sys.exit(2)
-        exit_code = run_check_drift_pipeline(args.notebook, output_format=args.format)
+        exit_code = run_check_drift_pipeline(args.notebook, output_format=args.format, root_dir=args.root_dir)
         if is_running_in_ipython():
             return
         sys.exit(exit_code)
