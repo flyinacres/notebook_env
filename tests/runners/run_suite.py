@@ -180,6 +180,8 @@ def run_docker(
         "PYDEVD_DISABLE_FILE_VALIDATION=1",
         "-e",
         "PIP_ROOT_USER_ACTION=ignore",
+        "-e",
+        "PIP_DISABLE_PIP_VERSION_CHECK=1",
     ]
 
     if env:
@@ -347,6 +349,17 @@ def run_common_tests() -> None:
     if exit_code != 0:
         raise RuntimeError("Check-drift e2e test failed.")
     print("\033[92mPASS: Check-drift e2e test\n\033[0m")
+
+    print("\033[96mRunning raw_installs E2E (explicit path, inferred URL, unreachable source, inferred local path)...\033[0m")
+    exit_code, _ = run_docker(
+        "python:3.11-slim",
+        "pip install --no-cache-dir packaging resolvelib jupyter_client ipykernel -q && "
+        "python -m ipykernel install --user --name python3 && "
+        "python tests/runners/test_raw_installs.py",
+    )
+    if exit_code != 0:
+        raise RuntimeError("raw_installs e2e test failed.")
+    print("\033[92mPASS: raw_installs e2e test\n\033[0m")
 
     print("\033[96mRunning Phase 5g: Live-Kernel Stale Module Test...\033[0m")
     exit_code, _ = run_docker(

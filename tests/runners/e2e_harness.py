@@ -219,11 +219,19 @@ class InteractiveKernel:
         self.kernel_name = kernel_name
         self._km: Any = None
         self._client: Any = None
+        self._devnull: Any = None
 
-    def start(self, ready_timeout: int = 10) -> None:
+    def start(self, ready_timeout: int = 10, quiet: bool = False) -> None:
+        """quiet=True discards the kernel process's own stderr (for example ipykernel's
+        "running over TCP without encryption" warning). Errors raised by executed code
+        still arrive through execute()."""
         import jupyter_client
         self._km = jupyter_client.KernelManager(kernel_name=self.kernel_name)
-        self._km.start_kernel()
+        if quiet:
+            self._devnull = open(os.devnull, "w")
+            self._km.start_kernel(stderr=self._devnull)
+        else:
+            self._km.start_kernel()
         self._client = self._km.client()
         self._client.start_channels()
         self._client.wait_for_ready(timeout=ready_timeout)
@@ -235,6 +243,9 @@ class InteractiveKernel:
         if self._km:
             self._km.shutdown_kernel()
             self._km = None
+        if self._devnull:
+            self._devnull.close()
+            self._devnull = None
 
     def execute(self, code: str, timeout: int = 30) -> KernelExecutionResult:
         """Executes code in the active kernel and captures stdout and errors."""
@@ -277,10 +288,11 @@ class InteractiveKernel:
 def interactive_kernel(
     kernel_name: str = "python3",
     ready_timeout: int = 10,
+    quiet: bool = False,
 ) -> Generator[InteractiveKernel, None, None]:
     """Context manager for an interactive kernel session with deterministic shutdown."""
     session = InteractiveKernel(kernel_name=kernel_name)
-    session.start(ready_timeout=ready_timeout)
+    session.start(ready_timeout=ready_timeout, quiet=quiet)
     try:
         yield session
     finally:
