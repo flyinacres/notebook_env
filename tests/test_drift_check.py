@@ -7,6 +7,7 @@ no real network calls in this suite, but the actual JSON-parsing logic in
 both fetch functions still runs and is exercised, not bypassed.
 """
 
+import argparse
 import hashlib
 import json
 
@@ -1030,3 +1031,118 @@ class TestKnownCustomSources:
         assert [f["signal"] for f in report["confirmed"]] == ["not_found_on_pypi"]
         assert report["notices"] == []
         assert exit_code == 1
+
+
+# ---------------------------------------------------------------------------
+# Stable finding keys in JSON, and the batch aggregate validation section
+# ---------------------------------------------------------------------------
+
+class TestFindingKeyInJson:
+    @pytest.mark.parametrize("finding,expected", [
+        (ne.DriftFinding("requests", "2.32.0", "yanked", "confirmed", "m"), ["yanked", "requests", "2.32.0"]),
+        (ne.DriftFinding("stale-package", "1.0.0", "stale", "heuristic", "m", {"days_since_last_release": 9}),
+         ["stale", "stale-package"]),
+        (ne.DriftFinding("", "", "tampered", "confirmed", "m"), ["tampered", "", ""]),
+        (ne.DriftFinding("cookbook", "", "local_module_missing", "confirmed", "m"), ["local_module_missing", "cookbook", ""]),
+        (ne.DriftFinding("numpy", "1.26.4", "check_error", "error", "m"), ["check_error", "numpy", "1.26.4"]),
+    ])
+    def test_every_finding_serializes_a_key(self, finding, expected):
+        assert finding.to_dict()["key"] == expected
+
+    def test_key_ignores_the_volatile_parts_of_a_finding(self):
+        a = ne.DriftFinding("p", "1", "stale", "heuristic", "no release in 800 days", {"days_since_last_release": 800})
+        b = ne.DriftFinding("p", "1", "stale", "heuristic", "no release in 900 days", {"days_since_last_release": 900})
+        assert a.to_dict()["key"] == b.to_dict()["key"] and a.to_dict()["message"] != b.to_dict()["message"]
+
+    def test_check_drift_json_carries_keys(self, tmp_path, capsys):
+        path, _ = _generate_file(tmp_path, [dict(REQUESTS_YANKED)])
+        _, report = _check(path, capsys)
+        assert [f["key"] for f in report["confirmed"]] == [["yanked", "requests", "2.32.0"]]
+        assert [f["key"] for f in report["heuristic"]] == [["stale", "requests"]]
+
+
+FROZEN = {"requests": "requests==2.32.0", "numpy": "numpy==1.26.4", "core-dep": "core-dep==1.0.0"}
+
+
+def _make_batch(tmp_path):
+    def nb(rel, source):
+        target = tmp_path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps({
+            "cells": [{"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": [source]}],
+            "metadata": {"kernelspec": {"language": "python", "name": "python3", "display_name": "Python 3"},
+                         "language_info": {"name": "python"}},
+            "nbformat": 4, "nbformat_minor": 5,
+        }), encoding="utf-8")
+    nb("a.ipynb", "import requests\n")
+    nb("sub/b.ipynb", "import requests\n")
+    nb("c.ipynb", "import numpy\n")
+    nb("d.ipynb", "import core_dep\n")
+    return tmp_path
+
+
+def _run_batch(root, capsys, fmt="text", write=True, only=None):
+    args = argparse.Namespace(
+        suffix=None, in_place=False, universal=None, output=write, output_dir=None, timeout=300, format=fmt,
+    )
+    ne.run_batch_pipeline(str(root), args, dict(FROZEN), {}, None)
+    return capsys.readouterr().out
+
+
+class TestBatchAggregateValidation:
+    def test_json_groups_findings_across_notebooks(self, tmp_path, capsys):
+        out = _run_batch(_make_batch(tmp_path), capsys, fmt="json")
+        v = json.loads(out)["validation"]
+        assert v["notebooks_checked"] == 4
+        assert v["totals"] == {"confirmed": 1, "heuristic": 2, "errors": 0}
+
+        confirmed = [f for f in v["findings"] if f["severity"] == "confirmed"]
+        assert [(f["key"], f["notebooks"]) for f in confirmed] == [
+            (["yanked", "requests", "2.32.0"], ["a.ipynb", "sub/b.ipynb"]),
+        ]
+        heuristic = {tuple(f["key"]): f["notebooks"] for f in v["findings"] if f["severity"] == "heuristic"}
+        assert heuristic == {
+            ("stale", "requests"): ["a.ipynb", "sub/b.ipynb"],
+            ("major_bump", "numpy", "2"): ["c.ipynb"],
+        }
+
+    def test_json_lists_every_notebook_with_its_counts(self, tmp_path, capsys):
+        v = json.loads(_run_batch(_make_batch(tmp_path), capsys, fmt="json"))["validation"]
+        assert {n["path"]: (n["confirmed"], n["heuristic"], n["errors"]) for n in v["notebooks"]} == {
+            "a.ipynb": (1, 1, 0), "sub/b.ipynb": (1, 1, 0), "c.ipynb": (0, 1, 0), "d.ipynb": (0, 0, 0),
+        }
+
+    def test_validation_block_is_stable_and_machine_independent(self, tmp_path, capsys):
+        root = _make_batch(tmp_path)
+        first = json.loads(_run_batch(root, capsys, fmt="json"))["validation"]
+        second = json.loads(_run_batch(root, capsys, fmt="json"))["validation"]
+        assert first == second
+        assert str(tmp_path) not in json.dumps(first)  # relative paths only
+
+    def test_findings_are_ordered_confirmed_first(self, tmp_path, capsys):
+        v = json.loads(_run_batch(_make_batch(tmp_path), capsys, fmt="json"))["validation"]
+        severities = [f["severity"] for f in v["findings"]]
+        assert severities == sorted(severities, key=["confirmed", "heuristic", "error"].index)
+
+    def test_console_section_replaces_the_per_notebook_one_liners(self, tmp_path, capsys, monkeypatch):
+        warnings = []
+        monkeypatch.setattr(ne.logger, "warning", lambda msg, *a, **k: warnings.append(str(msg)))
+        out = _run_batch(_make_batch(tmp_path), capsys)
+        assert "BATCH DEPENDENCY VALIDATION" in out
+        assert "affects 2 notebook(s): a.ipynb, sub/b.ipynb" in out
+        assert out.index("CONFIRMED ISSUES") < out.index("WORTH REVIEWING")
+        assert not [w for w in warnings if "--check-drift on this file" in w]
+
+    def test_clean_batch_says_so_in_one_line(self, tmp_path, capsys):
+        root = _make_batch(tmp_path)
+        for rel in ("a.ipynb", "sub/b.ipynb", "c.ipynb"):
+            (root / rel).unlink()
+        out = _run_batch(root, capsys)
+        assert "1 notebook(s) checked, no issues found" in out
+        v = json.loads(_run_batch(root, capsys, fmt="json"))["validation"]
+        assert v["totals"] == {"confirmed": 0, "heuristic": 0, "errors": 0}
+
+    def test_analysis_only_batch_has_no_validation(self, tmp_path, capsys):
+        root = _make_batch(tmp_path)
+        assert json.loads(_run_batch(root, capsys, fmt="json", write=False))["validation"] is None
+        assert "BATCH DEPENDENCY VALIDATION" not in _run_batch(root, capsys, write=False)

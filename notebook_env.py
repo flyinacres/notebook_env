@@ -2157,6 +2157,7 @@ class DriftFinding:
             "severity": self.severity,
             "message": self.message,
             "details": self.details,
+            "key": finding_identity_key(self),
         }
         if self.baseline_status is not None:
             out["baseline_status"] = self.baseline_status
@@ -2646,6 +2647,13 @@ def finding_baseline_key(finding: DriftFinding) -> Optional[List[str]]:
     return None
 
 
+def finding_identity_key(finding: DriftFinding) -> List[str]:
+    """A stable identity for any finding, for comparing two reports without touching messages or
+    dates. Equal to the baseline key wherever one exists; findings with no baseline counterpart
+    (tamper, local-module, check-error) fall back to signal, package and version."""
+    return finding_baseline_key(finding) or [finding.signal, finding.package, finding.version]
+
+
 def build_baseline(findings: List[DriftFinding]) -> Dict[str, Any]:
     """Compact, sorted record of generation-time findings, plus the packages that could not
     be checked ("" means the transitive resolution itself failed)."""
@@ -2879,6 +2887,142 @@ def format_json_drift_report(report: DriftCheckReport) -> str:
         **report.to_dict(),
     }
     return json.dumps(payload, indent=2)
+
+
+# --- Batch aggregate validation ---------------------------------------------
+# Generation-time validation happens once per notebook when a batch writes its locked files.
+# This folds those per-notebook reports into one repository-level view: each distinct finding
+# once, with the notebooks it affects. Everything in it is deterministic (sorted, relative
+# paths, no timestamps), so two runs can be compared directly.
+
+_VALIDATION_SEVERITY_ORDER = ["confirmed", "heuristic", "error"]
+
+
+@dataclass
+class BatchFindingGroup:
+    """One distinct finding, and every notebook in the batch it appears in."""
+    key: List[str]
+    signal: str
+    severity: str
+    package: str
+    version: str
+    message: str
+    notebooks: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "key": self.key, "signal": self.signal, "severity": self.severity,
+            "package": self.package, "version": self.version, "message": self.message,
+            "notebooks": self.notebooks,
+        }
+
+
+@dataclass
+class BatchValidation:
+    findings: List[BatchFindingGroup]
+    notebooks: List[Dict[str, Any]]  # every notebook checked: {"path", "confirmed", "heuristic", "errors"}
+
+    @property
+    def notebooks_checked(self) -> int:
+        return len(self.notebooks)
+
+    def totals(self) -> Dict[str, int]:
+        return {
+            "confirmed": sum(1 for g in self.findings if g.severity == "confirmed"),
+            "heuristic": sum(1 for g in self.findings if g.severity == "heuristic"),
+            "errors": sum(1 for g in self.findings if g.severity == "error"),
+        }
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "notebooks_checked": self.notebooks_checked,
+            "totals": self.totals(),
+            "findings": [g.to_dict() for g in self.findings],
+            "notebooks": self.notebooks,
+        }
+
+
+def _relative_notebook_path(path: Path, root: str) -> str:
+    try:
+        return Path(path).relative_to(root).as_posix()
+    except ValueError:
+        return Path(path).name
+
+
+def build_batch_validation(reports: List[Tuple[str, "DriftCheckReport"]]) -> BatchValidation:
+    """Groups per-notebook validation reports, given as (relative path, report), by distinct finding.
+    Findings group on their identity key plus message: within one run the same package, version
+    and signal always produce the same message, and distinct errors on one package stay separate."""
+    groups: Dict[Tuple[str, Tuple[str, ...], str], BatchFindingGroup] = {}
+    notebooks: List[Dict[str, Any]] = []
+    for path, report in sorted(reports, key=lambda item: item[0]):
+        notebooks.append({
+            "path": path,
+            "confirmed": len(report.confirmed),
+            "heuristic": len(report.heuristic),
+            "errors": len(report.errors),
+        })
+        for f in report.confirmed + report.heuristic + report.errors:
+            key = finding_identity_key(f)
+            gkey = (f.severity, tuple(key), f.message)
+            group = groups.get(gkey)
+            if group is None:
+                group = groups[gkey] = BatchFindingGroup(
+                    key=key, signal=f.signal, severity=f.severity,
+                    package=f.package, version=f.version, message=f.message,
+                )
+            if path not in group.notebooks:
+                group.notebooks.append(path)
+
+    def order(g: BatchFindingGroup):
+        sev = _VALIDATION_SEVERITY_ORDER.index(g.severity) if g.severity in _VALIDATION_SEVERITY_ORDER else len(_VALIDATION_SEVERITY_ORDER)
+        return (sev, g.key, g.message)
+
+    return BatchValidation(findings=sorted(groups.values(), key=order), notebooks=notebooks)
+
+
+def format_console_batch_validation(validation: BatchValidation, max_names: int = 5) -> str:
+    """Human-readable aggregate section for the end of a batch run."""
+    n = validation.notebooks_checked
+    if not validation.findings:
+        return f"✅ Batch validation: {n} notebook(s) checked, no issues found in their pins."
+
+    out = ["=" * 80, "BATCH DEPENDENCY VALIDATION", f"Checked {n} notebook(s).", "=" * 80 + "\n"]
+    sections = [
+        ("confirmed", "🔴 CONFIRMED ISSUES"),
+        ("heuristic", "🟡 WORTH REVIEWING -- heuristic, not confirmed"),
+        ("error", "⚠️ COULD NOT CHECK"),
+    ]
+    for severity, title in sections:
+        groups = [g for g in validation.findings if g.severity == severity]
+        if not groups:
+            continue
+        out.append(f"{title} ({len(groups)}):")
+        for g in groups:
+            out.append(f"  • [{g.signal}] {g.message}")
+            shown = g.notebooks[:max_names]
+            extra = len(g.notebooks) - len(shown)
+            names = ", ".join(shown) + (f" (+{extra} more)" if extra else "")
+            out.append(f"      affects {len(g.notebooks)} notebook(s): {names}")
+        out.append("")
+
+    affected = [nb for nb in validation.notebooks if nb["confirmed"] or nb["heuristic"] or nb["errors"]]
+    out.append("NOTEBOOKS WITH FINDINGS:")
+    for nb in affected:
+        out.append(
+            f"  {nb['path']}: {nb['confirmed']} confirmed, {nb['heuristic']} worth reviewing, "
+            f"{nb['errors']} could not be checked"
+        )
+    totals = validation.totals()
+    parts = []
+    if totals["confirmed"]:
+        parts.append(f"{totals['confirmed']} distinct confirmed issue(s)")
+    if totals["heuristic"]:
+        parts.append(f"{totals['heuristic']} distinct item(s) worth reviewing")
+    if totals["errors"]:
+        parts.append(f"{totals['errors']} could not be checked")
+    out.extend(["", "-" * 80, f"STATUS: ⚠️ {'; '.join(parts)} -- in {len(affected)} of {n} notebook(s)", "=" * 80])
+    return "\n".join(out)
 
 
 # --- Manifest extraction ----------------------------------------------------
@@ -3983,7 +4127,11 @@ def format_batch_report(summary: BatchAnalysisSummary) -> str:
     return format_console_report(summary)
 
 
-def format_json_batch_report(summary: BatchAnalysisSummary, artifacts_written: Optional[Dict[str, Any]] = None) -> str:
+def format_json_batch_report(
+    summary: BatchAnalysisSummary,
+    artifacts_written: Optional[Dict[str, Any]] = None,
+    validation: Optional["BatchValidation"] = None,
+) -> str:
     """Formats a BatchAnalysisSummary into valid machine-readable JSON."""
     payload = {
         "schema_version": SCHEMA_VERSION,
@@ -4010,7 +4158,8 @@ def format_json_batch_report(summary: BatchAnalysisSummary, artifacts_written: O
             "primary_index_url_reason": summary.primary_url_reason
         },
         "notebooks": [nb.to_dict() for nb in summary.notebooks],
-        "artifacts_written": artifacts_written
+        "artifacts_written": artifacts_written,
+        "validation": validation.to_dict() if validation else None,
     }
     return json.dumps(payload, indent=2)
 
@@ -4196,6 +4345,7 @@ def run_batch_pipeline(
         sys.exit(1)
 
     artifacts_written: Dict[str, Any] = {}
+    validation: Optional[BatchValidation] = None
 
     if args.universal:
         manifest_filename = args.universal if isinstance(args.universal, str) else DEFAULT_UNIVERSAL_MANIFEST_NAME
@@ -4217,6 +4367,7 @@ def run_batch_pipeline(
 
         logger.info(f"\n🚀 Writing per-notebook locked files ({loc_desc})...")
         written_files = []
+        validation_reports: List[Tuple[str, DriftCheckReport]] = []
         for res in repo_map.scan_results:
             written_path, drift_report = apply_output_to_notebook(
                 res, 
@@ -4231,17 +4382,19 @@ def run_batch_pipeline(
             )
             written_files.append(str(written_path))
             logger.info(f"  • Updated '{written_path}'")
-            if drift_report.has_confirmed or drift_report.has_errors:
-                logger.warning(
-                    f"    ⚠️ {len(drift_report.confirmed)} confirmed issue(s), "
-                    f"{len(drift_report.errors)} pin(s) could not be checked -- "
-                    f"run --check-drift on this file for details."
-                )
+            validation_reports.append((_relative_notebook_path(res.path, repo_map.target_dir), drift_report))
         artifacts_written["locked_notebooks"] = written_files
         logger.info("✅ Batch output complete.")
+        validation = build_batch_validation(validation_reports)
+        if not is_json:
+            print(format_console_batch_validation(validation))
 
     if is_json:
-        print(format_json_batch_report(summary, artifacts_written=artifacts_written if artifacts_written else None))
+        print(format_json_batch_report(
+            summary,
+            artifacts_written=artifacts_written if artifacts_written else None,
+            validation=validation,
+        ))
 
     return
 
