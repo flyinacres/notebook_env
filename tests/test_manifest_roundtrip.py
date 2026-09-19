@@ -113,6 +113,24 @@ class TestManifestRoundTrip:
         assert manifest.dependencies == deps
 
 
+class TestBaselineE2E:
+    def test_yank_present_at_generation_is_known_at_check_time(self, tmp_path, capsys):
+        """requests==2.32.0 was yanked before this test existed (a permanent historical fact), so
+        generation records it, and a later check reports it as known -- still failing the check,
+        since a known confirmed finding is still a real problem."""
+        deps = [{"name": "requests", "version": "2.32.0", "flags": []}]
+        path, result = _write_notebook_with_manifest(tmp_path, deps)
+
+        assert ["yanked", "requests", "2.32.0"] in result["drift_report"].manifest.baseline["findings"]
+
+        exit_code = ne.run_check_drift_pipeline(str(path), output_format="json")
+        report = json.loads(capsys.readouterr().out)
+        yanked = [f for f in report["confirmed"] if f["signal"] == "yanked"]
+        assert [f["baseline_status"] for f in yanked] == ["known"]
+        assert report["baseline"]["recorded"] is True
+        assert exit_code == 1
+
+
 class TestTamperingDetectionE2E:
     def test_hand_edited_version_is_detected(self, tmp_path):
         """Real file, hand-edited on disk after generation -- hash mismatch fires."""

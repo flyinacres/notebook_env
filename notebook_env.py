@@ -320,6 +320,10 @@ class SteadyPyManifest:
     Also the payload drift-check parses back out of a notebook/.py file to
     evaluate pins against live PyPI metadata (no execution, no installs).
 
+    baseline records what generation-time validation found, as compact keys (see
+    build_baseline), so a later check can tell findings that were already present from
+    ones that are new. None means no baseline was recorded.
+
     local_modules records local sibling modules found at generation time, for
     drift-check to re-verify by existence (not a PyPI check -- these were never
     pip-installable). Each entry is {"name": ..., "anchor": "notebook_dir" |
@@ -335,6 +339,7 @@ class SteadyPyManifest:
     raw_installs: List[str] = field(default_factory=list)
     custom_sourced: List[str] = field(default_factory=list)
     local_modules: List[Dict[str, str]] = field(default_factory=list)
+    baseline: Optional[Dict[str, Any]] = None
     # Set only by from_literal: the hash recomputed over the fields exactly as they were
     # persisted. Never serialized, hashed or compared; it is not part of the manifest.
     verified_hash: Optional[str] = field(default=None, init=False, repr=False, compare=False)
@@ -362,6 +367,7 @@ class SteadyPyManifest:
             "raw_installs": self.raw_installs,
             "custom_sourced": self.custom_sourced,
             "local_modules": self.local_modules,
+            "baseline": self.baseline,
         }
 
     def compute_and_set_hash(self) -> str:
@@ -2135,13 +2141,16 @@ class DriftFinding:
     """
     package: str
     version: str
-    signal: str  # "conflict" | "yanked" | "removed" | "stale" | "major_bump" | "unsupported_python" | "check_error"
-    severity: str  # "confirmed" | "heuristic" | "error"
+    signal: str  # "conflict" | "yanked" | "removed" | "stale" | "major_bump" | "unsupported_python" | "check_error" | ...
+    severity: str  # "confirmed" | "heuristic" | "error" | "notice" (a known custom source; see classify_against_baseline)
     message: str
     details: Dict[str, Any] = field(default_factory=dict)
+    # Set only on a check-drift finding, and only when the manifest carries a usable baseline:
+    # "known" (present at generation), "new", or "not_checked_at_generation".
+    baseline_status: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        out = {
             "package": self.package,
             "version": self.version,
             "signal": self.signal,
@@ -2149,6 +2158,9 @@ class DriftFinding:
             "message": self.message,
             "details": self.details,
         }
+        if self.baseline_status is not None:
+            out["baseline_status"] = self.baseline_status
+        return out
 
 
 def _split_pin_extras(name: str) -> Tuple[str, FrozenSet[str]]:
@@ -2527,6 +2539,7 @@ def resolve_transitive_graph(
                     f"Unresolvable dependency graph: {cause.requirement} required by "
                     f"{cause.parent.name if cause.parent else 'a direct pin'}"
                 ),
+                details={"parent": cause.parent.name if cause.parent else ""},
             )
             for cause in e.causes
         ]
@@ -2598,6 +2611,99 @@ def run_pin_checks(dependencies: List[Dict[str, Any]], python_version: Dict[str,
     return findings
 
 
+# --- Generation-time baseline ------------------------------------------------
+# Generation records which findings already existed, as compact keys (never messages,
+# which embed changing dates and counts). A later check classifies each finding as
+# "known" (its key was recorded), "new", or "not_checked_at_generation" (its package
+# could not be checked back then, so "new" would be a claim we can't make). Each signal
+# keys on exactly the facts that define the problem: a changed fact is a new finding.
+
+BASELINE_FORMAT_VERSION = 1
+
+# Per-release facts: fixed for a given package version.
+_PER_VERSION_SIGNALS = frozenset({
+    "yanked", "removed", "not_found_on_pypi", "unsupported_python", "unverifiable_custom_index",
+})
+
+
+def finding_baseline_key(finding: DriftFinding) -> Optional[List[str]]:
+    """The facts that make this finding 'the same problem' across runs; None if it has no
+    generation-time counterpart (tamper, local-module and check-error findings)."""
+    signal = finding.signal
+    if signal in _PER_VERSION_SIGNALS:
+        return [signal, finding.package, finding.version]
+    if signal == "stale":
+        return [signal, finding.package]  # the day count changes every run; the problem doesn't
+    if signal == "major_bump":
+        latest = str(finding.details.get("latest_version", ""))
+        try:
+            major = str(Version(latest).major)
+        except InvalidVersion:
+            major = latest
+        return [signal, finding.package, major]  # a still-newer major is a different finding
+    if signal == "conflict":
+        return [signal, finding.package, finding.version, str(finding.details.get("parent", ""))]
+    return None
+
+
+def build_baseline(findings: List[DriftFinding]) -> Dict[str, Any]:
+    """Compact, sorted record of generation-time findings, plus the packages that could not
+    be checked ("" means the transitive resolution itself failed)."""
+    keys: List[List[str]] = []
+    errored: Set[str] = set()
+    for f in findings:
+        if f.severity == "error":
+            errored.add(f.package)
+            continue
+        key = finding_baseline_key(f)
+        if key is not None and key not in keys:
+            keys.append(key)
+    return {"version": BASELINE_FORMAT_VERSION, "findings": sorted(keys), "errors": sorted(errored)}
+
+
+def _parse_baseline(raw: Any) -> Optional[Tuple[Set[Tuple[str, ...]], Set[str]]]:
+    """(recorded keys, canonical names that errored), or None if absent or not a format we know."""
+    if not isinstance(raw, dict) or raw.get("version") != BASELINE_FORMAT_VERSION:
+        return None
+    try:
+        keys = {tuple(k) for k in raw.get("findings", [])}
+        errored = {canonicalize_pkg_name(e) if e else "" for e in raw.get("errors", [])}
+    except TypeError:
+        return None
+    return keys, errored
+
+
+def classify_against_baseline(findings: List[DriftFinding], manifest: SteadyPyManifest) -> bool:
+    """Sets baseline_status on every comparable finding. Returns False (and touches nothing)
+    when the manifest has no usable baseline."""
+    parsed = _parse_baseline(manifest.baseline)
+    if parsed is None:
+        return False
+    known, errored = parsed
+    direct = {
+        canonicalize_pkg_name(_split_pin_name(d["name"])[0]) for d in manifest.dependencies if d.get("name")
+    }
+    graph_check_failed = "" in errored
+    for f in findings:
+        key = finding_baseline_key(f)
+        if key is None:
+            continue
+        canon = canonicalize_pkg_name(f.package)
+        if tuple(key) in known:
+            f.baseline_status = "known"
+            if f.signal == "not_found_on_pypi":
+                # Already true at generation, so this is a custom source (private or custom-index
+                # package), an expected state rather than drift. Shown as a notice, never fails
+                # the check. The same finding appearing NEW means a package that was on PyPI has
+                # vanished, which stays a confirmed failure.
+                f.severity = "notice"
+        elif canon in errored or (graph_check_failed and canon not in direct):
+            f.baseline_status = "not_checked_at_generation"
+        else:
+            f.baseline_status = "new"
+    return True
+
+
 # --- Report shape ----------------------------------------------------------
 # Confirmed findings (yanked, removed, declared conflict, unsupported-python)
 # are visually separated from heuristic findings (stale, major-bump) per this
@@ -2620,10 +2726,25 @@ class DriftCheckReport:
     confirmed: List[DriftFinding] = field(default_factory=list)
     heuristic: List[DriftFinding] = field(default_factory=list)
     errors: List[DriftFinding] = field(default_factory=list)
+    notices: List[DriftFinding] = field(default_factory=list)  # known custom sources; never affect the outcome
+    baseline_recorded: bool = False  # True only when findings were classified against a usable baseline
 
     @property
     def has_confirmed(self) -> bool:
         return len(self.confirmed) > 0
+
+    @property
+    def has_actionable_heuristic(self) -> bool:
+        """A heuristic finding that should fail a check: anything not already known at generation.
+        Without a baseline nothing is known, so every heuristic finding counts."""
+        return any(f.baseline_status != "known" for f in self.heuristic)
+
+    def baseline_counts(self) -> Dict[str, int]:
+        counts = {"new": 0, "known": 0, "not_checked_at_generation": 0}
+        for f in self.confirmed + self.heuristic + self.notices:
+            if f.baseline_status in counts:
+                counts[f.baseline_status] += 1
+        return counts
 
     @property
     def has_heuristic(self) -> bool:
@@ -2638,7 +2759,7 @@ class DriftCheckReport:
         return not (self.has_confirmed or self.has_heuristic or self.has_errors)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        out = {
             "kind": self.kind,
             "target": self.target,
             "checked_at": self.checked_at,
@@ -2647,25 +2768,37 @@ class DriftCheckReport:
             "heuristic": [f.to_dict() for f in self.heuristic],
             "errors": [f.to_dict() for f in self.errors],
         }
+        if self.kind == "check":
+            out["notices"] = [f.to_dict() for f in self.notices]
+            out["baseline"] = {"recorded": True, **self.baseline_counts()} if self.baseline_recorded else {"recorded": False}
+        return out
 
 
 def build_drift_check_report(
     target: str, manifest: SteadyPyManifest, findings: List[DriftFinding], kind: str = "check"
 ) -> DriftCheckReport:
-    """Buckets a flat findings list into confirmed/heuristic/error by severity."""
+    """Buckets a flat findings list into confirmed/heuristic/error by severity. For a check
+    (not generation-time validation), findings are first classified against the manifest's
+    baseline, and each bucket lists new findings before known ones."""
+    baseline_recorded = classify_against_baseline(findings, manifest) if kind == "check" else False
     report = DriftCheckReport(
         target=target,
         checked_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         manifest=manifest,
         kind=kind,
+        baseline_recorded=baseline_recorded,
     )
     for f in findings:
         if f.severity == "confirmed":
             report.confirmed.append(f)
         elif f.severity == "heuristic":
             report.heuristic.append(f)
+        elif f.severity == "notice":
+            report.notices.append(f)
         else:
             report.errors.append(f)
+    report.confirmed.sort(key=lambda f: f.baseline_status == "known")  # stable: new first, known last
+    report.heuristic.sort(key=lambda f: f.baseline_status == "known")
     return report
 
 
@@ -2679,18 +2812,33 @@ def format_console_drift_report(report: DriftCheckReport) -> str:
         out.append("DEPENDENCY DRIFT CHECK")
         out.append(f"Target: {report.target}")
     out.append(f"Checked: {report.checked_at}")
+    if report.kind == "check":
+        if report.baseline_recorded:
+            counts = report.baseline_counts()
+            unclear = counts["new"] + counts["not_checked_at_generation"]
+            out.append(f"Since generation: {unclear} new, {counts['known']} already known.")
+        else:
+            out.append("Note: no generation-time baseline in this manifest, so findings are not classified as new or known.")
     out.append("=" * 80 + "\n")
+
+    def _line(f: DriftFinding) -> str:
+        tag = {"new": "[new] ", "known": "[known] ", "not_checked_at_generation": "[not checked at generation] "}.get(
+            f.baseline_status or "", "")
+        return f"  • {tag}[{f.signal}] {f.message}"
 
     if report.confirmed:
         out.append(f"🔴 CONFIRMED ISSUES ({len(report.confirmed)}):")
-        for f in report.confirmed:
-            out.append(f"  • [{f.signal}] {f.message}")
+        out.extend(_line(f) for f in report.confirmed)
         out.append("")
 
     if report.heuristic:
         out.append(f"🟡 WORTH REVIEWING -- heuristic, not confirmed ({len(report.heuristic)}):")
-        for f in report.heuristic:
-            out.append(f"  • [{f.signal}] {f.message}")
+        out.extend(_line(f) for f in report.heuristic)
+        out.append("")
+
+    if report.notices:
+        out.append(f"ℹ️ CUSTOM SOURCES -- already known at generation, not counted as drift ({len(report.notices)}):")
+        out.extend(_line(f) for f in report.notices)
         out.append("")
 
     if report.errors:
@@ -2704,7 +2852,10 @@ def format_console_drift_report(report: DriftCheckReport) -> str:
         if report.kind == "validation":
             out.append("STATUS: ✅ Clean. No issues found in these pins.")
         else:
-            out.append("STATUS: ✅ Clean. No drift detected against the pinned manifest.")
+            noted = f" ({len(report.notices)} custom-source package(s) noted above)." if report.notices else ""
+            out.append("STATUS: ✅ Clean. No drift detected against the pinned manifest." + noted)
+    elif not (report.has_confirmed or report.has_errors or report.has_actionable_heuristic):
+        out.append(f"STATUS: ✅ No new issues since generation ({len(report.heuristic)} known item(s) still present).")
     else:
         parts = []
         if report.has_confirmed:
@@ -2850,8 +3001,10 @@ def check_local_modules(
 def run_check_drift_pipeline(target: str, output_format: str = "text", root_dir: Optional[str] = None) -> int:
     """Orchestrates Check mode end to end: extract -> run all checks -> report.
 
-    Returns the process exit code: 0 clean, 1 drift found (confirmed or
-    heuristic), 2 a pin (or the manifest itself) could not be checked. A
+    Returns the process exit code: 0 clean, 1 drift found (any confirmed finding, new or
+    already known at generation, or a heuristic finding that is not already known), 2 a pin
+    (or the manifest itself) could not be checked. A heuristic finding that was already
+    present at generation does not fail the check. A
     missing manifest is not an error -- it exits 0 with a clear "nothing to
     check" message, since a pre-feature notebook is an expected, valid state.
     """
@@ -2893,7 +3046,7 @@ def run_check_drift_pipeline(target: str, output_format: str = "text", root_dir:
 
     if report.has_errors:
         return 2
-    if report.has_confirmed or report.has_heuristic:
+    if report.has_confirmed or report.has_actionable_heuristic:
         return 1
     return 0
 
@@ -3199,6 +3352,7 @@ def generate_production_blueprint(
         raw_installs=merged_raw_installs,
         custom_sourced=custom_sourced_names,
         local_modules=local_modules_captured,
+        baseline=build_baseline(generation_findings),
     )
     manifest.compute_and_set_hash()
 

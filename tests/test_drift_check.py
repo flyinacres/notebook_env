@@ -724,7 +724,9 @@ class TestPinChecksAreSharedBetweenGenerationAndCheckDrift:
         _, report = _check(path, capsys)
 
         assert [f["signal"] for f in at_generation] == ["unverifiable_custom_index"]
-        assert report["heuristic"] == at_generation
+        # Same finding; the check additionally tags it against the baseline generation recorded.
+        assert [f["baseline_status"] for f in report["heuristic"]] == ["known"]
+        assert [{k: v for k, v in f.items() if k != "baseline_status"} for f in report["heuristic"]] == at_generation
 
 
 class TestGenerationOrdering:
@@ -742,3 +744,289 @@ class TestGenerationOrdering:
         ne.generate_production_blueprint([dict(CLEAN_DEP)])
         assert "checks" in order and "hash" in order
         assert order.index("checks") < order.index("hash")
+
+
+# ---------------------------------------------------------------------------
+# Generation-time baseline: recorded findings, and new vs known at check time
+# ---------------------------------------------------------------------------
+
+import copy
+
+
+def _generate_file(tmp_path, deps, python_version=None):
+    result = ne.generate_production_blueprint(deps)
+    manifest = result["drift_report"].manifest
+    return _write_literal(tmp_path, manifest.to_dict()), manifest
+
+
+def _change_world(monkeypatch, mutate):
+    """Swaps in a copy of the fake PyPI that mutate() has altered -- 'time has passed'."""
+    world = copy.deepcopy(FAKE_PACKAGES)
+    mutate(world)
+    monkeypatch.setattr(ne, "_fetch_pypi_json", make_fake_fetch(world))
+    ne.fetch_pypi_version_metadata.cache_clear()
+    ne.fetch_pypi_package_metadata.cache_clear()
+
+
+def _by_signal(report, bucket, signal):
+    return [f for f in report[bucket] if f["signal"] == signal]
+
+
+REQUESTS_YANKED = {"name": "requests", "version": "2.32.0", "flags": []}  # yanked (confirmed) + stale (heuristic)
+STALE_ONLY = {"name": "stale-package", "version": "1.0.0", "flags": []}   # stale (heuristic) only
+OLD_NUMPY = {"name": "numpy", "version": "1.26.4", "flags": []}           # major_bump (heuristic) only at 3.11
+
+
+class TestBaselineKeys:
+    @pytest.mark.parametrize("finding,expected", [
+        (ne.DriftFinding("requests", "2.32.0", "yanked", "confirmed", "m"), ["yanked", "requests", "2.32.0"]),
+        (ne.DriftFinding("old-package", "0.9.0", "removed", "confirmed", "m"), ["removed", "old-package", "0.9.0"]),
+        (ne.DriftFinding("numpy", "1.26.4", "unsupported_python", "confirmed", "m"), ["unsupported_python", "numpy", "1.26.4"]),
+        (ne.DriftFinding("torch", "2.3.1+cu121", "unverifiable_custom_index", "heuristic", "m"),
+         ["unverifiable_custom_index", "torch", "2.3.1+cu121"]),
+        (ne.DriftFinding("stale-package", "1.0.0", "stale", "heuristic", "m", {"days_since_last_release": 900}),
+         ["stale", "stale-package"]),
+        (ne.DriftFinding("numpy", "1.26.4", "major_bump", "heuristic", "m", {"latest_version": "2.5.3"}),
+         ["major_bump", "numpy", "2"]),
+        (ne.DriftFinding("numpy", "<2", "conflict", "confirmed", "m", {"parent": "pandas"}),
+         ["conflict", "numpy", "<2", "pandas"]),
+    ])
+    def test_key_holds_the_facts_that_define_the_problem(self, finding, expected):
+        assert ne.finding_baseline_key(finding) == expected
+
+    def test_stale_key_ignores_the_changing_day_count(self):
+        a = ne.DriftFinding("p", "1", "stale", "heuristic", "m", {"days_since_last_release": 800})
+        b = ne.DriftFinding("p", "1", "stale", "heuristic", "m", {"days_since_last_release": 900})
+        assert ne.finding_baseline_key(a) == ne.finding_baseline_key(b)
+
+    def test_a_newer_latest_major_is_a_different_major_bump(self):
+        a = ne.DriftFinding("numpy", "1.26.4", "major_bump", "heuristic", "m", {"latest_version": "2.5.3"})
+        b = ne.DriftFinding("numpy", "1.26.4", "major_bump", "heuristic", "m", {"latest_version": "3.0.0"})
+        assert ne.finding_baseline_key(a) != ne.finding_baseline_key(b)
+
+    @pytest.mark.parametrize("signal,severity", [
+        ("tampered", "confirmed"), ("local_module_missing", "confirmed"),
+        ("local_module_unverifiable", "error"), ("check_error", "error"),
+    ])
+    def test_findings_with_no_generation_time_counterpart_have_no_key(self, signal, severity):
+        assert ne.finding_baseline_key(ne.DriftFinding("x", "1", signal, severity, "m")) is None
+
+    def test_conflict_findings_carry_their_parent(self):
+        deps = [{"name": "pandas", "version": "2.2.1", "flags": []}, {"name": "numpy", "version": "2.5.3", "flags": []}]
+        _, findings = ne.resolve_transitive_graph(deps, REQ_PY_311)
+        assert findings and all("parent" in f.details for f in findings)  # "" for a requirement from a direct pin
+        assert any(f.details["parent"] == "pandas" for f in findings)
+
+
+class TestGenerationRecordsBaseline:
+    def test_findings_at_generation_are_recorded(self):
+        baseline = ne.generate_production_blueprint([dict(REQUESTS_YANKED)])["drift_report"].manifest.baseline
+        assert baseline["version"] == 1
+        assert ["yanked", "requests", "2.32.0"] in baseline["findings"]
+        assert ["stale", "requests"] in baseline["findings"]
+        assert baseline["errors"] == []
+
+    def test_clean_generation_records_an_empty_baseline_not_none(self):
+        manifest = ne.generate_production_blueprint([dict(CLEAN_DEP)])["drift_report"].manifest
+        assert manifest.baseline == {"version": 1, "findings": [], "errors": []}
+
+    def test_packages_that_could_not_be_checked_are_recorded(self):
+        deps = [{"name": "flaky-package", "version": "1.0.0", "flags": []}]
+        baseline = ne.generate_production_blueprint(deps)["drift_report"].manifest.baseline
+        assert baseline["errors"] == ["flaky-package"]
+
+    def test_generation_report_findings_are_not_tagged(self):
+        report = ne.generate_production_blueprint([dict(REQUESTS_YANKED)])["drift_report"]
+        assert report.confirmed and all(f.baseline_status is None for f in report.confirmed + report.heuristic)
+
+    def test_baseline_is_covered_by_the_hash(self, tmp_path, capsys):
+        _, manifest = _generate_file(tmp_path, [dict(REQUESTS_YANKED)])
+        forged = manifest.to_dict()
+        forged["baseline"] = {"version": 1, "findings": [], "errors": []}  # silences the recorded yank
+        _, report = _check(_write_literal(tmp_path, forged, "forged.py"), capsys)
+        assert _by_signal(report, "confirmed", "tampered")
+
+
+class TestCheckDriftClassifiesAgainstBaseline:
+    def test_unchanged_world_reports_everything_as_known(self, tmp_path, capsys):
+        path, _ = _generate_file(tmp_path, [dict(REQUESTS_YANKED)])
+        exit_code, report = _check(path, capsys)
+        assert [f["baseline_status"] for f in report["confirmed"]] == ["known"]
+        assert [f["baseline_status"] for f in report["heuristic"]] == ["known"]
+        assert exit_code == 1  # a known confirmed finding still fails the check
+
+    def test_new_confirmed_finding_is_tagged_new(self, tmp_path, monkeypatch, capsys):
+        path, _ = _generate_file(tmp_path, [dict(CLEAN_DEP)])
+
+        def yank(world):
+            world["core-dep"]["versions"]["1.0.0"]["yanked"] = True
+        _change_world(monkeypatch, yank)
+
+        exit_code, report = _check(path, capsys)
+        assert [f["baseline_status"] for f in _by_signal(report, "confirmed", "yanked")] == ["new"]
+        assert exit_code == 1
+
+    def test_known_heuristic_alone_does_not_fail_the_check(self, tmp_path, capsys):
+        path, _ = _generate_file(tmp_path, [dict(STALE_ONLY)])
+        exit_code, report = _check(path, capsys)
+        assert [f["baseline_status"] for f in report["heuristic"]] == ["known"]
+        assert exit_code == 0
+
+    def test_new_heuristic_fails_the_check(self, tmp_path, monkeypatch, capsys):
+        path, _ = _generate_file(tmp_path, [dict(CLEAN_DEP)])
+
+        def go_stale(world):
+            world["core-dep"]["releases"]["1.0.0"]["upload_time"] = "2020-01-01T00:00:00.000000Z"
+        _change_world(monkeypatch, go_stale)
+
+        exit_code, report = _check(path, capsys)
+        assert [f["baseline_status"] for f in _by_signal(report, "heuristic", "stale")] == ["new"]
+        assert exit_code == 1
+
+    def test_same_signal_with_different_facts_is_new(self, tmp_path, monkeypatch, capsys):
+        path, _ = _generate_file(tmp_path, [dict(OLD_NUMPY)])  # major_bump: latest major was 2
+
+        def newer_major(world):
+            world["numpy"]["latest_version"] = "3.0.0"
+            world["numpy"]["releases"]["3.0.0"] = {"upload_time": "2026-09-01T00:00:00.000000Z", "yanked": False}
+        _change_world(monkeypatch, newer_major)
+
+        _, report = _check(path, capsys)
+        assert [f["baseline_status"] for f in _by_signal(report, "heuristic", "major_bump")] == ["new"]
+
+    def test_finding_on_a_package_that_errored_at_generation_is_not_claimed_new(self, tmp_path, monkeypatch, capsys):
+        path, _ = _generate_file(tmp_path, [{"name": "flaky-package", "version": "1.0.0", "flags": []}])
+
+        def recovers(world):
+            world["flaky-package"] = copy.deepcopy(world["stale-package"])
+        _change_world(monkeypatch, recovers)
+
+        exit_code, report = _check(path, capsys)
+        stale = _by_signal(report, "heuristic", "stale")
+        assert [f["baseline_status"] for f in stale] == ["not_checked_at_generation"]
+        assert exit_code == 1
+
+    def test_new_findings_are_listed_before_known_ones(self, tmp_path, monkeypatch, capsys):
+        path, _ = _generate_file(tmp_path, [dict(REQUESTS_YANKED), dict(CLEAN_DEP)])
+
+        def yank(world):
+            world["core-dep"]["versions"]["1.0.0"]["yanked"] = True
+        _change_world(monkeypatch, yank)
+
+        _, report = _check(path, capsys)
+        assert [(f["package"], f["baseline_status"]) for f in report["confirmed"]] == [
+            ("core-dep", "new"), ("requests", "known"),
+        ]
+
+    def test_console_report_tags_each_finding(self, tmp_path, monkeypatch, capsys):
+        path, _ = _generate_file(tmp_path, [dict(REQUESTS_YANKED), dict(CLEAN_DEP)])
+
+        def yank(world):
+            world["core-dep"]["versions"]["1.0.0"]["yanked"] = True
+        _change_world(monkeypatch, yank)
+
+        ne.run_check_drift_pipeline(str(path))
+        out = capsys.readouterr().out
+        assert "[new]" in out and "[known]" in out
+
+    def test_json_summarizes_the_split(self, tmp_path, monkeypatch, capsys):
+        path, _ = _generate_file(tmp_path, [dict(REQUESTS_YANKED), dict(CLEAN_DEP)])
+
+        def yank(world):
+            world["core-dep"]["versions"]["1.0.0"]["yanked"] = True
+        _change_world(monkeypatch, yank)
+
+        _, report = _check(path, capsys)
+        assert report["baseline"] == {"recorded": True, "new": 1, "known": 2, "not_checked_at_generation": 0}
+
+    def test_manifest_without_a_baseline_is_reported_flat_as_before(self, tmp_path, capsys):
+        manifest = _old_style_manifest()
+        manifest["dependencies"] = [dict(STALE_ONLY)]
+        manifest["dependency_hash"] = _sha256_of(manifest)
+        path = _write_literal(tmp_path, manifest)
+
+        exit_code, report = _check(path, capsys)
+        assert report["heuristic"] and all("baseline_status" not in f for f in report["heuristic"])
+        assert report["baseline"] == {"recorded": False}
+        assert exit_code == 1
+
+        ne.run_check_drift_pipeline(str(path))
+        assert "no generation-time baseline" in capsys.readouterr().out.lower()
+
+    def test_unrecognized_baseline_format_is_treated_as_no_baseline(self, tmp_path, capsys):
+        manifest = _old_style_manifest()
+        manifest["dependencies"] = [dict(STALE_ONLY)]
+        manifest["baseline"] = {"version": 99, "findings": [["stale", "stale-package"]], "errors": []}
+        manifest["dependency_hash"] = _sha256_of(manifest)
+
+        exit_code, report = _check(_write_literal(tmp_path, manifest), capsys)
+        assert report["baseline"] == {"recorded": False}
+        assert all("baseline_status" not in f for f in report["heuristic"])
+        assert exit_code == 1
+
+
+# ---------------------------------------------------------------------------
+# Known custom sources: a not_found_on_pypi finding already present at generation is
+# an expected state (private/custom-index package), not drift.
+# ---------------------------------------------------------------------------
+
+PRIVATE_PKG = {"name": "my-private-pkg", "version": "1.0.0", "flags": []}  # not on the fake PyPI
+
+
+class TestKnownCustomSources:
+    def test_generation_still_reports_it_as_a_confirmed_finding(self):
+        report = ne.generate_production_blueprint([dict(PRIVATE_PKG)])["drift_report"]
+        assert [f.signal for f in report.confirmed] == ["not_found_on_pypi"]
+        assert report.confirmed[0].baseline_status is None
+
+    def test_known_one_is_a_notice_and_does_not_fail_the_check(self, tmp_path, capsys):
+        path, _ = _generate_file(tmp_path, [dict(PRIVATE_PKG)])
+        exit_code, report = _check(path, capsys)
+        assert report["confirmed"] == []
+        assert [(f["signal"], f["severity"], f["baseline_status"]) for f in report["notices"]] == [
+            ("not_found_on_pypi", "notice", "known"),
+        ]
+        assert report["baseline"] == {"recorded": True, "new": 0, "known": 1, "not_checked_at_generation": 0}
+        assert exit_code == 0
+
+    def test_console_report_lists_it_as_a_notice_and_stays_clean(self, tmp_path, capsys):
+        path, _ = _generate_file(tmp_path, [dict(PRIVATE_PKG)])
+        exit_code = ne.run_check_drift_pipeline(str(path))
+        out = capsys.readouterr().out
+        assert "CUSTOM SOURCES" in out and "[known] [not_found_on_pypi]" in out
+        assert "CONFIRMED ISSUES" not in out
+        assert "STATUS: ✅ Clean" in out
+        assert exit_code == 0
+
+    def test_a_package_that_vanished_from_pypi_since_generation_still_fails(self, tmp_path, monkeypatch, capsys):
+        path, _ = _generate_file(tmp_path, [dict(CLEAN_DEP)])
+
+        def vanishes(world):
+            del world["core-dep"]
+        _change_world(monkeypatch, vanishes)
+
+        exit_code, report = _check(path, capsys)
+        assert [(f["signal"], f["baseline_status"]) for f in report["confirmed"]] == [("not_found_on_pypi", "new")]
+        assert report["notices"] == []
+        assert exit_code == 1
+
+    def test_a_real_new_finding_still_fails_alongside_a_known_custom_source(self, tmp_path, monkeypatch, capsys):
+        path, _ = _generate_file(tmp_path, [dict(PRIVATE_PKG), dict(CLEAN_DEP)])
+
+        def yank(world):
+            world["core-dep"]["versions"]["1.0.0"]["yanked"] = True
+        _change_world(monkeypatch, yank)
+
+        exit_code, report = _check(path, capsys)
+        assert [f["signal"] for f in report["confirmed"]] == ["yanked"]
+        assert [f["signal"] for f in report["notices"]] == ["not_found_on_pypi"]
+        assert exit_code == 1
+
+    def test_without_a_baseline_it_stays_a_confirmed_finding(self, tmp_path, capsys):
+        manifest = _old_style_manifest()
+        manifest["dependencies"] = [dict(PRIVATE_PKG)]
+        manifest["dependency_hash"] = _sha256_of(manifest)
+        exit_code, report = _check(_write_literal(tmp_path, manifest), capsys)
+        assert [f["signal"] for f in report["confirmed"]] == ["not_found_on_pypi"]
+        assert report["notices"] == []
+        assert exit_code == 1
