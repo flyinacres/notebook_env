@@ -52,7 +52,7 @@ import urllib.parse
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field
-from typing import Set, Dict, List, Tuple, Optional, Any, TypedDict, Callable, NamedTuple, Union
+from typing import Set, FrozenSet, Dict, List, Tuple, Optional, Any, TypedDict, Callable, NamedTuple, Union
 from packaging.version import Version, InvalidVersion
 from packaging.specifiers import SpecifierSet, InvalidSpecifier
 from packaging.requirements import Requirement, InvalidRequirement
@@ -2132,8 +2132,8 @@ class DriftFinding:
         }
 
 
-def _split_pin_name(name: str) -> Tuple[str, Optional[str]]:
-    """Splits a pin name into (bare PyPI project name, extra-or-None).
+def _split_pin_extras(name: str) -> Tuple[str, FrozenSet[str]]:
+    """Splits a pin name into (bare PyPI project name, every requested extra).
 
     Pin names can carry an extras tag (e.g. "pandas[test]") from extras
     promotion elsewhere in this tool. PyPI's JSON API only resolves bare
@@ -2142,10 +2142,16 @@ def _split_pin_name(name: str) -> Tuple[str, Optional[str]]:
     """
     try:
         req = Requirement(name)
-        extra = next(iter(req.extras)) if req.extras else None
-        return req.name, extra
+        return req.name, frozenset(req.extras)
     except InvalidRequirement:
-        return name, None
+        return name, frozenset()
+
+
+def _split_pin_name(name: str) -> Tuple[str, Optional[str]]:
+    """Like _split_pin_extras, for callers that only need the bare name.
+    The second value is the alphabetically first extra (deterministic), or None."""
+    bare, extras = _split_pin_extras(name)
+    return bare, (min(extras) if extras else None)
 
 
 def _pip_env_hint() -> str:
@@ -2370,16 +2376,27 @@ def check_python_support(name: str, version: str, required_python: Dict[str, int
 # the same PyPA resolution algorithm pip has used internally since pip 20.3,
 # rather than a hand-rolled approximation of what a real resolver does.
 #
-# Known limitation: extras on a direct pin (e.g. "pandas[test]") are not
-# expanded into the graph -- the base package resolves, but the extra's own
-# additional requirements are not walked. Not silently dropped: this is a
-# real gap, not yet built.
+# Extras (e.g. "pandas[test]", on a direct pin or named by any package's own
+# requires_dist) are modeled the way pip's resolver does: "pandas[test]" is its
+# own node in the graph. It depends on the base package at the same version plus
+# every requirement gated on that extra, so the extra's requirements are walked
+# and version conflicts through them are detected. The extras node is an
+# internal device and never appears in the resolved mapping.
 
 @dataclass(frozen=True)
 class _ResolutionCandidate:
-    """A concrete (name, version) resolvelib candidate backed by live PyPI data."""
+    """A concrete (name, version[, extras]) resolvelib candidate backed by live PyPI data."""
     name: str
     version: str
+    extras: FrozenSet[str] = frozenset()
+
+
+def _resolution_identifier(name: str, extras) -> str:
+    """Graph node id: the canonical name, plus a sorted extras suffix when extras are requested."""
+    base = canonicalize_pkg_name(name)
+    if not extras:
+        return base
+    return f"{base}[{','.join(sorted(canonicalize_pkg_name(e) for e in extras))}]"
 
 
 class _PyPIResolutionProvider(AbstractProvider):
@@ -2389,7 +2406,7 @@ class _PyPIResolutionProvider(AbstractProvider):
         self.required_python = required_python
 
     def identify(self, requirement_or_candidate) -> str:
-        return canonicalize_pkg_name(requirement_or_candidate.name)
+        return _resolution_identifier(requirement_or_candidate.name, requirement_or_candidate.extras)
 
     def get_preference(self, identifier, resolutions, candidates, information, backtrack_causes) -> int:
         return len(list(candidates[identifier]))
@@ -2399,6 +2416,7 @@ class _PyPIResolutionProvider(AbstractProvider):
         if not reqs:
             return []
         name = reqs[0].name
+        extras = frozenset(reqs[0].extras)  # identical across reqs: extras are part of the identifier
         pkg_meta = fetch_pypi_package_metadata(name)
         if pkg_meta.status != "found":
             return []
@@ -2414,7 +2432,7 @@ class _PyPIResolutionProvider(AbstractProvider):
             if all(r.specifier.contains(v, prereleases=True) for r in reqs):
                 matches.append((v, ver_str))
         matches.sort(key=lambda pair: pair[0], reverse=True)
-        return [_ResolutionCandidate(name, ver_str) for _, ver_str in matches]
+        return [_ResolutionCandidate(name, ver_str, extras) for _, ver_str in matches]
 
     def is_satisfied_by(self, requirement, candidate) -> bool:
         try:
@@ -2423,17 +2441,23 @@ class _PyPIResolutionProvider(AbstractProvider):
             return False
 
     def get_dependencies(self, candidate) -> List[Requirement]:
+        deps: List[Requirement] = []
+        if candidate.extras:
+            # The extras node rides on the base package at exactly the same version.
+            deps.append(Requirement(f"{candidate.name}=={candidate.version}"))
+            envs = [_marker_environment(self.required_python, extra=e) for e in sorted(candidate.extras)]
+        else:
+            envs = [_marker_environment(self.required_python, extra=None)]  # base install: no extras active
+
         meta = fetch_pypi_version_metadata(candidate.name, candidate.version)
         if meta.status != "found":
-            return []
-        env = _marker_environment(self.required_python, extra=None)  # base install; see extras limitation above
-        deps = []
+            return deps
         for raw in meta.requires_dist:
             try:
                 req = Requirement(raw)
             except InvalidRequirement:
                 continue
-            if req.marker is not None and not req.marker.evaluate(env):
+            if req.marker is not None and not any(req.marker.evaluate(env) for env in envs):
                 continue
             deps.append(req)
         return deps
@@ -2456,15 +2480,16 @@ def resolve_transitive_graph(
             continue
         if _has_local_version_identifier(version):
             continue  # not on PyPI by definition -- can't be a root requirement here
-        name, _extra = _split_pin_name(raw_name)
+        name, extras = _split_pin_extras(raw_name)
         if fetch_pypi_package_metadata(name).status != "found":
             # Custom-index/local-only package: not resolvable via this PyPI-only
             # provider, and not a real conflict -- check_yanked_or_removed already
             # reports on it directly (not_found_on_pypi), so silently excluding it
             # from the graph here avoids a false ResolutionImpossible.
             continue
+        extras_part = f"[{','.join(sorted(extras))}]" if extras else ""
         try:
-            root_reqs.append(Requirement(f"{name}=={version}"))
+            root_reqs.append(Requirement(f"{name}{extras_part}=={version}"))
         except InvalidRequirement:
             continue
 
@@ -2493,7 +2518,8 @@ def resolve_transitive_graph(
             message=f"Transitive resolution failed unexpectedly: {type(e).__name__}: {e}",
         )]
 
-    return {name: cand.version for name, cand in result.mapping.items()}, []
+    # Extras nodes are internal: each one's base package (same version) is also in the mapping.
+    return {name: cand.version for name, cand in result.mapping.items() if "[" not in name}, []
 
 
 def check_transitive_signals(

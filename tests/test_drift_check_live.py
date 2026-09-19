@@ -120,3 +120,12 @@ class TestLiveTransitiveResolution:
         assert resolved["pandas"] == "2.2.1"
         assert "numpy" in resolved
         assert "hypothesis" not in resolved  # test-extra must not leak into a base resolve
+
+    def test_real_extra_is_expanded(self):
+        """pandas 2.2.1 declares hypothesis under extra == "test" (historical, immutable)."""
+        deps = [{"name": "pandas[test]", "version": "2.2.1", "flags": []}]
+        resolved, findings = ne.resolve_transitive_graph(deps, {"major": 3, "minor": 11})
+        assert findings == []
+        assert resolved["pandas"] == "2.2.1"
+        assert "hypothesis" in resolved
+        assert not [name for name in resolved if "[" in name]

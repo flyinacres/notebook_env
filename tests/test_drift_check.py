@@ -93,6 +93,48 @@ FAKE_PACKAGES = {
 }
 
 
+def _pkg(version="1.0.0", requires_dist=(), yanked=False):
+    """One-release fake package, uploaded recently so it never trips the staleness heuristic."""
+    return {
+        "latest_version": version,
+        "releases": {version: {"upload_time": "2026-08-01T00:00:00.000000Z", "yanked": yanked}},
+        "versions": {version: {
+            "requires_dist": list(requires_dist), "requires_python": None, "yanked": yanked,
+            "yanked_reason": "fixture: yanked" if yanked else None, "project_urls": {},
+        }},
+    }
+
+
+# pandas[test] -> hypothesis (>=6.46.1) -> sortedcontainers, which is only reachable through the extra.
+FAKE_PACKAGES["hypothesis"] = {
+    "latest_version": "6.100.0",
+    "releases": {
+        "5.0.0": {"upload_time": "2026-08-01T00:00:00.000000Z", "yanked": False},
+        "6.100.0": {"upload_time": "2026-08-01T00:00:00.000000Z", "yanked": False},
+    },
+    "versions": {
+        "5.0.0": {"requires_dist": [], "requires_python": None, "yanked": False,
+                  "yanked_reason": None, "project_urls": {}},
+        "6.100.0": {"requires_dist": ["sortedcontainers>=2.1.0"], "requires_python": None, "yanked": False,
+                    "yanked_reason": None, "project_urls": {}},
+    },
+}
+FAKE_PACKAGES["sortedcontainers"] = _pkg("2.4.0", yanked=True)
+
+# Two independent extras plus an unconditional requirement.
+FAKE_PACKAGES["multi-extra-pkg"] = _pkg("1.0.0", requires_dist=[
+    'alpha-dep; extra == "a"',
+    'beta-dep; extra == "b"',
+    "core-dep",
+])
+FAKE_PACKAGES["alpha-dep"] = _pkg()
+FAKE_PACKAGES["beta-dep"] = _pkg()
+FAKE_PACKAGES["core-dep"] = _pkg()
+
+# A package whose own requirement asks for an extra of another package.
+FAKE_PACKAGES["meta-pkg"] = _pkg("1.0.0", requires_dist=["pandas[test]>=2.2"])
+
+
 def make_fake_fetch(packages):
     def _fake_fetch(url):
         path = url[len("https://pypi.org/pypi/"):].rstrip("/")
@@ -374,6 +416,77 @@ class TestResolveTransitiveGraph:
         deps = [{"name": "pandas", "version": "2.2.1", "flags": []}]
         resolved, findings = ne.resolve_transitive_graph(deps, REQ_PY_311)
         assert "hypothesis" not in resolved
+
+
+class TestExtrasInTransitiveGraph:
+    """A pin like pandas[test] must pull the extra's own requirements into the graph."""
+
+    def test_extra_requirements_are_walked(self):
+        deps = [{"name": "pandas[test]", "version": "2.2.1", "flags": []}]
+        resolved, findings = ne.resolve_transitive_graph(deps, REQ_PY_311)
+        assert findings == []
+        assert resolved["hypothesis"] == "6.100.0"
+        assert "sortedcontainers" in resolved  # reachable only through the extra
+
+    def test_base_pin_still_excludes_extra_requirements(self):
+        deps = [{"name": "pandas", "version": "2.2.1", "flags": []}]
+        resolved, _ = ne.resolve_transitive_graph(deps, REQ_PY_311)
+        assert "hypothesis" not in resolved
+
+    def test_extras_variant_is_not_reported_as_a_separate_package(self):
+        deps = [{"name": "pandas[test]", "version": "2.2.1", "flags": []}]
+        resolved, _ = ne.resolve_transitive_graph(deps, REQ_PY_311)
+        assert not [name for name in resolved if "[" in name]
+        assert resolved["pandas"] == "2.2.1"
+
+    def test_every_requested_extra_is_walked(self):
+        deps = [{"name": "multi-extra-pkg[a,b]", "version": "1.0.0", "flags": []}]
+        resolved, findings = ne.resolve_transitive_graph(deps, REQ_PY_311)
+        assert findings == []
+        assert {"alpha-dep", "beta-dep", "core-dep"} <= set(resolved)
+
+    def test_only_the_requested_extra_is_walked(self):
+        deps = [{"name": "multi-extra-pkg[a]", "version": "1.0.0", "flags": []}]
+        resolved, _ = ne.resolve_transitive_graph(deps, REQ_PY_311)
+        assert "alpha-dep" in resolved
+        assert "beta-dep" not in resolved
+        assert "core-dep" in resolved
+
+    def test_extra_named_by_a_transitive_requirement_is_walked(self):
+        deps = [{"name": "meta-pkg", "version": "1.0.0", "flags": []}]
+        resolved, findings = ne.resolve_transitive_graph(deps, REQ_PY_311)
+        assert findings == []
+        assert "hypothesis" in resolved  # meta-pkg -> pandas[test] -> hypothesis
+
+    def test_conflict_created_by_an_extra_is_reported(self):
+        deps = [
+            {"name": "pandas[test]", "version": "2.2.1", "flags": []},
+            {"name": "hypothesis", "version": "5.0.0", "flags": []},  # pandas[test] needs >=6.46.1
+        ]
+        resolved, findings = ne.resolve_transitive_graph(deps, REQ_PY_311)
+        assert resolved is None
+        assert findings and all(f.signal == "conflict" and f.severity == "confirmed" for f in findings)
+
+    def test_unknown_extra_adds_nothing_and_does_not_fail(self):
+        deps = [{"name": "pandas[nonexistent]", "version": "2.2.1", "flags": []}]
+        resolved, findings = ne.resolve_transitive_graph(deps, REQ_PY_311)
+        assert findings == []
+        assert "hypothesis" not in resolved
+        assert resolved["pandas"] == "2.2.1"
+
+    def test_signals_reach_packages_only_reachable_through_the_extra(self):
+        with_extra = ne.check_transitive_signals(
+            [{"name": "pandas[test]", "version": "2.2.1", "flags": []}], REQ_PY_311)
+        assert [f for f in with_extra if f.signal == "yanked" and f.package == "sortedcontainers"]
+
+        without = ne.check_transitive_signals(
+            [{"name": "pandas", "version": "2.2.1", "flags": []}], REQ_PY_311)
+        assert not [f for f in without if f.package == "sortedcontainers"]
+
+    def test_all_requested_extras_are_parsed(self):
+        name, extras = ne._split_pin_extras("multi-extra-pkg[b,a]")
+        assert name == "multi-extra-pkg"
+        assert extras == frozenset({"a", "b"})
 
 
 class TestCheckTransitiveSignals:
