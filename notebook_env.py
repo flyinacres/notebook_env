@@ -48,6 +48,7 @@ import hashlib
 import importlib.metadata
 import urllib.request
 import urllib.error
+import urllib.parse
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field
@@ -88,6 +89,10 @@ DEFAULT_UNIVERSAL_MANIFEST_NAME: str = "requirements-all.txt"
 
 HELP_URL: str = "https://github.com/flyinacres/notebook_env/blob/main/HELP.md"
 README_URL: str = "https://github.com/flyinacres/notebook_env/blob/main/README.md"
+
+# Fixed first line of the generated Cell 1. Shared by the generator and by is_prior_setup_cell,
+# so what the tool writes and what it later recognizes as its own cannot drift apart.
+SETUP_MARKDOWN_HEADING: str = "### 🛠️ Environment Setup & Dependency Verification"
 
 DEFAULT_IGNORED_DIRS: Set[str] = {
     ".git", ".venv", "venv", "env", "__pycache__", ".ipynb_checkpoints", "build", "dist"
@@ -210,13 +215,17 @@ class DependencyEntry:
         version: Pinned version string (e.g., '2.3.1+cu121', '2.2.1') or empty if unversioned.
         flags: Scoped CLI flags to pass to pip install (e.g., ['--extra-index-url', 'https://...']).
         source: Discovery origin ('import', 'pip_command', 'writefile_script').
-        status: Semantic category ('pinned', 'guarded', 'platform_pseudo_module', 'build_tool', 'local_module', 'auxiliary_tool', 'writefile_script').
+        status: Semantic category ('pinned', 'guarded', 'platform_pseudo_module', 'build_tool', 'local_module', 'auxiliary_tool', 'writefile_script',
+            'direct_reference', 'system_path').
         is_comment: True if this entry represents a comment, platform pseudo-module, or uninstalled fallback.
         comment_text: Full string representation when is_comment is True.
         anchor: Which directory a 'local_module' status entry resolved against
             ('notebook_dir' or 'root_dir'); empty for every other status. Never
             carries a path -- only the anchor name -- so a shared notebook never
             bakes in the creator's directory structure (see SteadyPyManifest.local_modules).
+        direct_url: For a 'direct_reference' entry (installed from a remote git/archive URL,
+            not PyPI): the source spec to carry into the manifest's raw_installs. Always empty
+            for a 'system_path' entry -- a local path is never stored anywhere.
     """
     name: str = ""
     version: str = ""
@@ -226,6 +235,7 @@ class DependencyEntry:
     is_comment: bool = False
     comment_text: str = ""
     anchor: str = ""
+    direct_url: str = ""
 
     @property
     def specifier(self) -> str:
@@ -1489,8 +1499,17 @@ def build_auxiliary_tool_entries(
     for tool in unimported_tools:
         canon_tool = canonicalize_pkg_name(tool)
         matched_pin = frozen_env.get(canon_tool)
-        ver = matched_pin.split("==", 1)[1] if matched_pin and "==" in matched_pin else ""
-        if matched_pin:
+        _, ver, direct_url = split_frozen_pin(matched_pin) if matched_pin else ("", "", None)
+        ver = ver or ""
+        if direct_url:
+            aux_entries.append(DependencyEntry(
+                name=tool,
+                source="pip_command",
+                status="auxiliary_tool",
+                is_comment=True,
+                comment_text=f"# {tool}  (installed via cell command; {direct_reference_note(direct_url)})"
+            ))
+        elif matched_pin:
             aux_entries.append(DependencyEntry(
                 name=tool,
                 version=ver,
@@ -1538,8 +1557,17 @@ def build_writefile_tool_entries(
         pypi_name = IMPORT_TO_PYPI_MAP.get(pkg, pkg)
         canon_pypi = canonicalize_pkg_name(pypi_name)
         matched_pin = frozen_env.get(canon_pypi)
-        ver = matched_pin.split("==", 1)[1] if matched_pin and "==" in matched_pin else ""
-        if matched_pin:
+        _, ver, direct_url = split_frozen_pin(matched_pin) if matched_pin else ("", "", None)
+        ver = ver or ""
+        if direct_url:
+            entries.append(DependencyEntry(
+                name=pypi_name,
+                source="writefile_script",
+                status="writefile_script",
+                is_comment=True,
+                comment_text=f"# {pypi_name}  (imported inside script generated via %%writefile; {direct_reference_note(direct_url)})"
+            ))
+        elif matched_pin:
             entries.append(DependencyEntry(
                 name=pypi_name,
                 version=ver,
@@ -1615,12 +1643,24 @@ def resolve_pypi_package_and_extras(
     canon_pypi = canonicalize_pkg_name(pypi_name)
     matched_pin = frozen_env.get(canon_pypi)
 
+    pin_version: Optional[str] = None
+    direct_url: Optional[str] = None
+    if matched_pin:
+        _, pin_version, direct_url = split_frozen_pin(matched_pin)
+
     if is_guarded:
-        if matched_pin:
-            ver = matched_pin.split("==", 1)[1]
+        if direct_url:
             return DependencyEntry(
                 name=pypi_name,
-                version=ver,
+                version="",
+                status="guarded",
+                is_comment=True,
+                comment_text=f"# {pypi_name} (optional or conditional dependency inside try/except block; {direct_reference_note(direct_url)})"
+            ), None
+        if matched_pin:
+            return DependencyEntry(
+                name=pypi_name,
+                version=pin_version or "",
                 status="guarded",
                 is_comment=True,
                 comment_text=f"# {matched_pin} (optional or conditional dependency inside try/except block)"
@@ -1640,6 +1680,23 @@ def resolve_pypi_package_and_extras(
             status="pinned",
             is_comment=True,
             comment_text=f"# {pypi_name} (imported as '{imp}'; not found via pip-freeze or local file scan -- verify before assuming this is truly missing)"
+        ), None
+
+    if direct_url:
+        note = direct_reference_note(direct_url)
+        if is_local_direct_url(direct_url):
+            return DependencyEntry(
+                name=pypi_name,
+                status="system_path",
+                is_comment=True,
+                comment_text=f"# {pypi_name} (imported as '{imp}'; {note})"
+            ), None
+        return DependencyEntry(
+            name=pypi_name,
+            status="direct_reference",
+            is_comment=True,
+            comment_text=f"# {pypi_name} (imported as '{imp}'; {note})",
+            direct_url=direct_url
         ), None
 
     pkg_part, ver_part = matched_pin.split("==", 1)
@@ -1739,8 +1796,107 @@ def resolve_opencv_variant(submodules: Optional[Set[str]] = None) -> str:
     return "opencv-contrib-python" if has_contrib else "opencv-python"
 
 
+_VCS_URL_PREFIXES = ("git+", "hg+", "svn+", "bzr+")
+
+
+def split_frozen_pin(pin: str) -> Tuple[str, Optional[str], Optional[str]]:
+    """Splits one frozen-environment entry into (name, version, direct_url).
+
+    'name==1.2' -> (name, '1.2', None). 'name @ url' (a package installed from a
+    direct reference, not PyPI) -> (name, None, url). Every consumer of a frozen
+    entry goes through this, so none of them can assume the '==' shape.
+    """
+    if " @ " in pin:
+        name, url = pin.split(" @ ", 1)
+        return name.strip(), None, url.strip()
+    if "==" in pin:
+        name, version = pin.split("==", 1)
+        return name.strip(), version.strip(), None
+    return pin.strip(), None, None
+
+
+def _strip_vcs_prefix(spec: str) -> str:
+    lowered = spec.lower()
+    for prefix in _VCS_URL_PREFIXES:
+        if lowered.startswith(prefix):
+            return spec[len(prefix):]
+    return spec
+
+
+def is_local_direct_url(url: str) -> bool:
+    """True for a direct reference that lives on this machine (file:// or git+file://)."""
+    return _strip_vcs_prefix(url).lower().startswith("file:")
+
+
+def _direct_source_key(spec: str) -> Tuple[str, str]:
+    """Host and path of a direct-reference spec, ignoring VCS prefix, @ref, #fragment and .git."""
+    parts = urllib.parse.urlsplit(_strip_vcs_prefix(spec.strip().strip("'\"")))
+    path = parts.path
+    head, sep, tail = path.rpartition("@")
+    if sep and "/" not in tail:  # a trailing @ref; user@host lives in netloc, not here
+        path = head
+    path = path.rstrip("/")
+    if path.lower().endswith(".git"):
+        path = path[:-4]
+    return parts.netloc.lower(), path.lower()
+
+
+def same_direct_source(a: str, b: str) -> bool:
+    """True if two direct-reference specs point at the same repository/archive, whatever ref each pins."""
+    return _direct_source_key(a) == _direct_source_key(b)
+
+
+def direct_reference_note(direct_url: str) -> str:
+    """Plain-language description of where a non-PyPI package came from, for generated comments.
+    Never includes the URL or path itself."""
+    if is_local_direct_url(direct_url):
+        return ("found on a system-dependent path, which can't and shouldn't be shared directly. "
+                "Publish it or host it at a shared URL so others can install it")
+    return ("installed from a direct URL, not PyPI; it is installed from the non-standard sources "
+            "list, so make sure anyone running this notebook can reach that source")
+
+
+def _read_direct_reference_pins() -> Dict[str, str]:
+    """Finds installed packages that came from a direct reference (PEP 610 direct_url.json).
+
+    Covers git, archive URL, local directory and editable installs uniformly, which
+    parsing `pip freeze` text does not (an editable install prints a comment line and a
+    bare `-e path`). Returns canonical name -> 'name @ url', with VCS installs written
+    as 'vcs+url@commit' the way pip freeze does.
+    """
+    pins: Dict[str, str] = {}
+    for dist in importlib.metadata.distributions():
+        try:
+            raw = dist.read_text("direct_url.json")
+            name = dist.metadata["Name"]
+        except (OSError, ValueError) as e:
+            logger.debug(f"Could not read direct_url.json for a distribution: {e}")
+            continue
+        if not raw or not name:
+            continue
+        try:
+            info = json.loads(raw)
+        except json.JSONDecodeError as e:
+            logger.debug(f"Malformed direct_url.json for {name}: {e}")
+            continue
+        url = info.get("url") if isinstance(info, dict) else None
+        if not url:
+            continue
+        vcs_info = info.get("vcs_info")
+        if isinstance(vcs_info, dict) and vcs_info.get("vcs"):
+            url = f"{vcs_info['vcs']}+{url}"
+            if vcs_info.get("commit_id"):
+                url = f"{url}@{vcs_info['commit_id']}"
+        pins.setdefault(canonicalize_pkg_name(name), f"{name} @ {url}")
+    return pins
+
+
 def get_installed_environment() -> Tuple[Dict[str, str], List[str]]:
-    """Runs pip freeze to get precise version snapshots of the active runtime."""
+    """Runs pip freeze to get precise version snapshots of the active runtime.
+
+    Ordinary installs map to 'name==version'. Packages installed from a direct
+    reference (git/URL/local path/editable) map to 'name @ url'; see split_frozen_pin.
+    """
     res = subprocess.run([sys.executable, "-m", "pip", "freeze"], capture_output=True, text=True)
     if res.returncode != 0:
         logger.warning(f"⚠️ 'pip freeze' execution failed (exit code {res.returncode}). Active environment versions could not be captured.")
@@ -1748,12 +1904,19 @@ def get_installed_environment() -> Tuple[Dict[str, str], List[str]]:
 
     frozen: Dict[str, str] = {}
     for line in res.stdout.splitlines():
-        if "==" in line:
-            pkg, ver = line.split("==", 1)
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", "-")):
+            continue  # comments and `-e path` lines; editable installs are read from metadata instead
+        if " @ " in stripped:
+            name, _, _ = split_frozen_pin(stripped)
+            frozen[canonicalize_pkg_name(name)] = stripped
+        elif "==" in stripped:
+            pkg, ver = stripped.split("==", 1)
             canon = canonicalize_pkg_name(pkg)
-            frozen[canon] = line.strip()
-            frozen[pkg.lower()] = line.strip()
-            
+            frozen[canon] = stripped
+            frozen[pkg.lower()] = stripped
+
+    frozen.update(_read_direct_reference_pins())
     return frozen, res.stdout.splitlines()
 
 
@@ -2876,11 +3039,14 @@ def generate_production_blueprint(
     normalized_items: List[Dict[str, Any]] = []
     comment_lines: List[str] = []
     local_modules_captured: List[Dict[str, str]] = []
+    direct_reference_specs: List[str] = []
 
     for item in manifest_items:
         if isinstance(item, DependencyEntry):
             if item.is_comment:
                 comment_lines.append(item.comment_text)
+                if item.status == "direct_reference" and item.direct_url:
+                    direct_reference_specs.append(item.direct_url)
                 if item.status == "local_module" and item.anchor:
                     local_modules_captured.append({"name": item.name, "anchor": item.anchor})
             else:
@@ -2919,7 +3085,7 @@ def generate_production_blueprint(
         local_builds_section = f"- **Specific Package Builds Detected:** The following package(s) use custom or hardware-specific builds:\n" + "\n".join(bullet_lines)
 
     markdown_lines = [
-        "### 🛠️ Environment Setup & Dependency Verification",
+        SETUP_MARKDOWN_HEADING,
         f"This notebook includes verified dependencies to ensure reproducible execution.\n",
         "- **Automatic Setup:** Cell 2 verifies Python version compatibility and installs verified package versions sequentially."
     ]
@@ -2950,12 +3116,19 @@ def generate_production_blueprint(
         if _has_local_version_identifier(version) or fetch_pypi_package_metadata(bare_name).status != "found":
             custom_sourced_names.append(name)
 
+    # Installed from a remote direct reference with no matching install line in the
+    # notebook itself: carry the recorded source, unless the notebook already names it.
+    merged_raw_installs: List[str] = list(raw_installs) if raw_installs else []
+    for spec in direct_reference_specs:
+        if not any(same_direct_source(spec, existing) for existing in merged_raw_installs):
+            merged_raw_installs.append(spec)
+
     manifest = SteadyPyManifest(
         python_version={"major": py_major, "minor": py_minor},
         dependencies=normalized_items,
         gpu=gpu_info.to_dict() if gpu_info else None,
         generated_at=timestamp,
-        raw_installs=list(raw_installs) if raw_installs else [],
+        raw_installs=merged_raw_installs,
         custom_sourced=custom_sourced_names,
         local_modules=local_modules_captured,
     )
@@ -3170,6 +3343,44 @@ print("=" * 60)"""
         "step2_code": step2_code,
         "drift_report": drift_report,
     }
+
+
+def is_prior_setup_cell(cell: Dict[str, Any]) -> bool:
+    """True if `cell` is a previously generated setup cell that a fresh run must replace.
+
+    The managed tag is the primary signal, but it is not sufficient: cells pasted
+    from the live-kernel flow never carry it, and metadata can be lost on save.
+    Left in place, an untagged old manifest would coexist with the new one and
+    run after it. So content is checked as well: a code cell that assigns
+    STEADY_PY_MANIFEST (the same definition extract_manifest_from_file uses for
+    "this is the manifest"), or a markdown cell that begins with the generated
+    setup heading. Cells that merely mention either are not matched.
+    """
+    meta = cell.get("metadata")
+    tool_meta = meta.get("notebook_env") if isinstance(meta, dict) else None
+    if isinstance(tool_meta, dict) and tool_meta.get("managed") is True:
+        return True
+
+    source = cell.get("source", "")
+    if isinstance(source, list):
+        source = "".join(source)
+    if not isinstance(source, str):
+        return False
+
+    cell_type = cell.get("cell_type")
+    if cell_type == "markdown":
+        return source.lstrip().startswith(SETUP_MARKDOWN_HEADING)
+    if cell_type == "code":
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return False
+        return any(
+            isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "STEADY_PY_MANIFEST" for t in node.targets)
+            for node in ast.walk(tree)
+        )
+    return False
 
 
 def create_managed_cells(blueprint: BlueprintResult) -> List[Dict[str, Any]]:
@@ -3727,11 +3938,8 @@ def apply_output_to_notebook(
 
     cells = nb_data.get("cells", [])
 
-    # Idempotent filter: strip prior managed setup blocks
-    non_managed_cells = [
-        c for c in cells 
-        if not (isinstance(c.get("metadata"), dict) and c.get("metadata", {}).get("notebook_env", {}).get("managed") is True)
-    ]
+    # Idempotent filter: strip prior setup blocks, tagged or not (see is_prior_setup_cell)
+    non_managed_cells = [c for c in cells if not is_prior_setup_cell(c)]
     nb_data["cells"] = managed_cells + non_managed_cells
 
     if in_place:

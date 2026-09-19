@@ -217,6 +217,105 @@ def test_inplace_idempotency_rerun(sample_notebook_file, mock_frozen_env):
     assert data_run2["cells"][1]["metadata"]["notebook_env"]["managed"] is True
 
 
+# --- Untagged prior setup cells (pasted from the live-kernel flow, or metadata lost on save) ---
+
+def _scan(path):
+    """Real AST re-scan of a notebook on disk, as the CLI does."""
+    success, imports, submodules, sources, _, _, guarded, dyn = ne.extract_from_file(str(path))
+    return ne.NotebookScanResult(
+        path=path,
+        is_python=success,
+        lang_label="python",
+        imports=imports,
+        submodules=submodules,
+        guarded_imports=guarded,
+        dynamic_warnings=dyn,
+        code_sources=sources,
+    )
+
+
+def _strip_notebook_env_metadata(path):
+    """Simulates setup cells that lost their managed tag."""
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    for cell in data["cells"]:
+        cell["metadata"] = {}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=1)
+
+
+def _setup_cells(data):
+    """(cells defining STEADY_PY_MANIFEST, markdown cells that are the setup heading)."""
+    manifest_cells = [
+        c for c in data["cells"]
+        if c["cell_type"] == "code" and "STEADY_PY_MANIFEST = " in "".join(c["source"])
+    ]
+    heading_cells = [
+        c for c in data["cells"]
+        if c["cell_type"] == "markdown"
+        and "Environment Setup & Dependency Verification" in "".join(c["source"]).splitlines()[0]
+    ]
+    return manifest_cells, heading_cells
+
+
+@pytest.mark.parametrize("in_place", [True, False], ids=["in_place", "companion_file"])
+def test_untagged_prior_setup_cells_are_fully_replaced(sample_notebook_file, mock_frozen_env, in_place):
+    """A prior manifest must be replaced entirely even when its cells carry no managed tag."""
+    ne.apply_output_to_notebook(_scan(sample_notebook_file), mock_frozen_env, {}, None, in_place=True)
+    _strip_notebook_env_metadata(sample_notebook_file)
+
+    # The environment changes between generations, so a surviving old manifest is distinguishable.
+    mock_frozen_env["pandas"] = "pandas==2.2.0"
+
+    out_path, _ = ne.apply_output_to_notebook(
+        _scan(sample_notebook_file), mock_frozen_env, {}, None, suffix="_merged", in_place=in_place
+    )
+
+    with open(out_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    manifest_cells, heading_cells = _setup_cells(data)
+    assert len(manifest_cells) == 1, "exactly one STEADY_PY_MANIFEST definition must remain"
+    assert len(heading_cells) == 1, "exactly one setup heading must remain"
+    assert len(data["cells"]) == 3, "one user cell plus the two regenerated setup cells"
+
+    user_cells = [c for c in data["cells"] if "".join(c["source"]) == "import pandas as pd\nimport numpy as np\n"]
+    assert len(user_cells) == 1, "the user's own cell must be preserved"
+
+    manifest, error = ne.extract_manifest_from_file(str(out_path))
+    assert error is None
+    assert {d["name"]: d["version"] for d in manifest.dependencies}.get("pandas") == "2.2.0"
+
+
+def test_inplace_keeps_user_cells_that_only_mention_the_manifest(sample_notebook_file, mock_frozen_env):
+    """Over-deletion guard: cells that reference the manifest or heading without defining them are the user's."""
+    with open(sample_notebook_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    lookalike_sources = [
+        "print(STEADY_PY_MANIFEST['dependencies'])\n",
+        "# STEADY_PY_MANIFEST = {}\nx = 1\n",
+        "STEADY_PY_MANIFEST_BACKUP = {'dependencies': []}\n",
+    ]
+    for src in lookalike_sources:
+        data["cells"].append({"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": [src]})
+    mention_md = "Notes: see the Environment Setup & Dependency Verification section.\n"
+    data["cells"].append({"cell_type": "markdown", "metadata": {}, "source": [mention_md]})
+
+    with open(sample_notebook_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=1)
+
+    ne.apply_output_to_notebook(_scan(sample_notebook_file), mock_frozen_env, {}, None, in_place=True)
+
+    with open(sample_notebook_file, "r", encoding="utf-8") as f:
+        result = json.load(f)
+
+    kept = ["".join(c["source"]) for c in result["cells"]]
+    for src in lookalike_sources + [mention_md]:
+        assert src in kept, f"user cell was wrongly removed: {src!r}"
+    assert len(result["cells"]) == 1 + 4 + 2
+
+
 # =====================================================================
 # TIER 2: SUBPROCESS CLI PLUMBING TESTS (Explicit UTF-8 Handles & Structural Checks)
 # =====================================================================
