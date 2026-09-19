@@ -306,6 +306,13 @@ class GpuInfo:
         }
 
 
+def _manifest_payload_hash(payload: Dict[str, Any]) -> str:
+    """SHA-256 of canonical (sorted-key) JSON of every field except dependency_hash itself."""
+    body = {k: v for k, v in payload.items() if k != "dependency_hash"}
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 @dataclass
 class SteadyPyManifest:
     """Reproducibility manifest embedded in generated Cell 2 as STEADY_PY_MANIFEST.
@@ -328,6 +335,21 @@ class SteadyPyManifest:
     raw_installs: List[str] = field(default_factory=list)
     custom_sourced: List[str] = field(default_factory=list)
     local_modules: List[Dict[str, str]] = field(default_factory=list)
+    # Set only by from_literal: the hash recomputed over the fields exactly as they were
+    # persisted. Never serialized, hashed or compared; it is not part of the manifest.
+    verified_hash: Optional[str] = field(default=None, init=False, repr=False, compare=False)
+
+    @classmethod
+    def from_literal(cls, data: Dict[str, Any]) -> "SteadyPyManifest":
+        """Builds a manifest from a persisted STEADY_PY_MANIFEST literal.
+
+        The integrity hash is recomputed over `data` as found, not over this class's
+        current field set. Adding a field to the manifest therefore never makes an older
+        manifest look hand-edited, and deleting a field from a newer one is still caught.
+        """
+        manifest = cls(**data)
+        manifest.verified_hash = _manifest_payload_hash(data)
+        return manifest
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -348,10 +370,7 @@ class SteadyPyManifest:
         Covers content and provenance fields alike, so hand-editing anything in
         the manifest -- including generated_at, to hide age -- invalidates the hash.
         """
-        payload = self.to_dict()
-        payload.pop("dependency_hash")
-        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        self.dependency_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        self.dependency_hash = _manifest_payload_hash(self.to_dict())
         return self.dependency_hash
 
 
@@ -2550,6 +2569,35 @@ def check_transitive_signals(
     return findings
 
 
+def run_pin_checks(dependencies: List[Dict[str, Any]], python_version: Dict[str, int]) -> List[DriftFinding]:
+    """Every PyPI-based check against a list of pins, direct and transitive.
+
+    The single implementation behind both generation-time validation and --check-drift.
+    Keeping them one function is deliberate: they used to be two hand-maintained copies of
+    the same sequence, and any recorded-versus-current comparison is only meaningful if both
+    sides produce findings the same way.
+    """
+    findings: List[DriftFinding] = []
+    for dep in dependencies:
+        name, version = dep.get("name"), dep.get("version")
+        if not name or not version:
+            continue
+        if _has_local_version_identifier(version):
+            findings.append(DriftFinding(
+                package=name, version=version, signal="unverifiable_custom_index", severity="heuristic",
+                message=f"{name}=={version} has a local version identifier -- installed from a custom index, "
+                        f"not PyPI, so PyPI-based checks (yanked/removed/staleness/major-bump/python-support) "
+                        f"cannot be run against it.",
+            ))
+            continue
+        findings.extend(check_yanked_or_removed(name, version))
+        findings.extend(check_staleness(name, version))
+        findings.extend(check_major_bump(name, version))
+        findings.extend(check_python_support(name, version, python_version))
+    findings.extend(check_transitive_signals(dependencies, python_version))
+    return findings
+
+
 # --- Report shape ----------------------------------------------------------
 # Confirmed findings (yanked, removed, declared conflict, unsupported-python)
 # are visually separated from heuristic findings (stale, major-bump) per this
@@ -2736,7 +2784,7 @@ def extract_manifest_from_file(path: str) -> Tuple[Optional[SteadyPyManifest], O
         return None, None  # no manifest present -- not an error
 
     try:
-        return SteadyPyManifest(**manifest_dict), None
+        return SteadyPyManifest.from_literal(manifest_dict), None
     except TypeError as e:
         return None, f"STEADY_PY_MANIFEST found in {path} but has an unexpected shape: {e}"
 
@@ -2821,9 +2869,10 @@ def run_check_drift_pipeline(target: str, output_format: str = "text", root_dir:
 
     # Verify the manifest hasn't been hand-edited since it was generated. Only
     # meaningful here -- generation is writing dependency_hash for the first
-    # time, not verifying a prior one.
+    # time, not verifying a prior one. The stored hash stays on the manifest so
+    # the report shows what the file actually contains.
     stored_hash = manifest.dependency_hash
-    recomputed_hash = manifest.compute_and_set_hash()
+    recomputed_hash = manifest.verified_hash
     if recomputed_hash != stored_hash:
         findings.append(DriftFinding(
             package="", version="", signal="tampered", severity="confirmed",
@@ -2833,23 +2882,7 @@ def run_check_drift_pipeline(target: str, output_format: str = "text", root_dir:
 
     findings.extend(check_local_modules(manifest, notebook_dir=str(Path(target).parent), root_dir=root_dir))
 
-    for dep in manifest.dependencies:
-        name, version = dep.get("name"), dep.get("version")
-        if not name or not version:
-            continue
-        if _has_local_version_identifier(version):
-            findings.append(DriftFinding(
-                package=name, version=version, signal="unverifiable_custom_index", severity="heuristic",
-                message=f"{name}=={version} has a local version identifier -- installed from a custom index, "
-                        f"not PyPI, so PyPI-based checks (yanked/removed/staleness/major-bump/python-support) "
-                        f"cannot be run against it.",
-            ))
-            continue
-        findings.extend(check_yanked_or_removed(name, version))
-        findings.extend(check_staleness(name, version))
-        findings.extend(check_major_bump(name, version))
-        findings.extend(check_python_support(name, version, manifest.python_version))
-    findings.extend(check_transitive_signals(manifest.dependencies, manifest.python_version))
+    findings.extend(run_pin_checks(manifest.dependencies, manifest.python_version))
 
     report = build_drift_check_report(target, manifest, findings)
 
@@ -3132,7 +3165,7 @@ def generate_production_blueprint(
     # Classify custom-sourced pins (local-version-identifier or not found on PyPI)
     # up front so the runtime failure path can point to the right guidance if
     # install ever fails. fetch_pypi_package_metadata is memoized, so this costs
-    # nothing extra -- the generation_findings loop below reaches the same pins.
+    # nothing extra -- run_pin_checks below reaches the same pins.
     custom_sourced_names: List[str] = []
     for dep in normalized_items:
         name, version = dep.get("name"), dep.get("version")
@@ -3149,8 +3182,17 @@ def generate_production_blueprint(
         if not any(same_direct_source(spec, existing) for existing in merged_raw_installs):
             merged_raw_installs.append(spec)
 
+    # Check pins against live PyPI at generation time, not only via a later,
+    # separate --check-drift run -- catching a bad pin now is strictly better
+    # than freezing it into a "reproducible" cell that never worked. The
+    # manifest is still produced either way (this tool never withholds
+    # output); findings are surfaced to the caller for a loud warning. Computed
+    # before the manifest exists so they can be recorded inside it.
+    python_version = {"major": py_major, "minor": py_minor}
+    generation_findings = run_pin_checks(normalized_items, python_version)
+
     manifest = SteadyPyManifest(
-        python_version={"major": py_major, "minor": py_minor},
+        python_version=python_version,
         dependencies=normalized_items,
         gpu=gpu_info.to_dict() if gpu_info else None,
         generated_at=timestamp,
@@ -3184,29 +3226,6 @@ for raw_idx, raw_spec in enumerate(STEADY_PY_MANIFEST.get("raw_installs", []), s
 total_deps += len(STEADY_PY_MANIFEST.get("raw_installs", []))
 '''
 
-    # Check pins against live PyPI at generation time, not only via a later,
-    # separate --check-drift run -- catching a bad pin now is strictly better
-    # than freezing it into a "reproducible" cell that never worked. The
-    # manifest is still produced either way (this tool never withholds
-    # output); findings are surfaced to the caller for a loud warning.
-    generation_findings: List[DriftFinding] = []
-    for dep in normalized_items:
-        name, version = dep.get("name"), dep.get("version")
-        if not name or not version:
-            continue
-        if _has_local_version_identifier(version):
-            generation_findings.append(DriftFinding(
-                package=name, version=version, signal="unverifiable_custom_index", severity="heuristic",
-                message=f"{name}=={version} has a local version identifier -- installed from a custom index, "
-                        f"not PyPI, so PyPI-based checks (yanked/removed/staleness/major-bump/python-support) "
-                        f"cannot be run against it.",
-            ))
-            continue
-        generation_findings.extend(check_yanked_or_removed(name, version))
-        generation_findings.extend(check_staleness(name, version))
-        generation_findings.extend(check_major_bump(name, version))
-        generation_findings.extend(check_python_support(name, version, manifest.python_version))
-    generation_findings.extend(check_transitive_signals(normalized_items, manifest.python_version))
     drift_report = build_drift_check_report("", manifest, generation_findings, kind="validation")
 
     freeze_block_code = ""

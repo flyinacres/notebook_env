@@ -7,6 +7,9 @@ no real network calls in this suite, but the actual JSON-parsing logic in
 both fetch functions still runs and is exercised, not bypassed.
 """
 
+import hashlib
+import json
+
 import pytest
 
 import notebook_env as ne
@@ -601,3 +604,141 @@ class TestLocalModuleDriftCheck:
         manifest = self._manifest_with([{"anchor": "notebook_dir"}])
         findings = ne.check_local_modules(manifest, notebook_dir=str(tmp_path))
         assert findings == []
+
+# ---------------------------------------------------------------------------
+# Manifest hash verification, shared pin checks, generation-time ordering
+# ---------------------------------------------------------------------------
+
+CLEAN_DEP = {"name": "core-dep", "version": "1.0.0", "flags": []}  # fake package with no findings of any kind
+
+
+def _sha256_of(payload):
+    """Independent of the implementation: canonical JSON of everything except dependency_hash."""
+    body = {k: v for k, v in payload.items() if k != "dependency_hash"}
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _old_style_manifest():
+    """Shaped and hashed the way a tool version that predates the local_modules field wrote it."""
+    manifest = {
+        "python_version": {"major": 3, "minor": 11},
+        "dependencies": [dict(CLEAN_DEP)],
+        "gpu": None,
+        "generated_at": "2025-01-01 00:00:00",
+        "tool_version": "40",
+        "raw_installs": [],
+        "custom_sourced": [],
+    }
+    manifest["dependency_hash"] = _sha256_of(manifest)
+    return manifest
+
+
+def _write_literal(tmp_path, manifest, name="nb.py"):
+    path = tmp_path / name
+    path.write_text(f"STEADY_PY_MANIFEST = {manifest!r}\n", encoding="utf-8")
+    return path
+
+
+def _check(path, capsys):
+    exit_code = ne.run_check_drift_pipeline(str(path), output_format="json")
+    return exit_code, json.loads(capsys.readouterr().out)
+
+
+class TestManifestHashVerification:
+    """The hash is verified over the data exactly as persisted, not over the current dataclass shape."""
+
+    def test_manifest_from_before_a_field_existed_still_verifies(self, tmp_path, capsys):
+        exit_code, report = _check(_write_literal(tmp_path, _old_style_manifest()), capsys)
+        assert [f for f in report["confirmed"] if f["signal"] == "tampered"] == []
+        assert exit_code == 0
+
+    def test_freshly_generated_manifest_verifies(self, tmp_path, capsys):
+        result = ne.generate_production_blueprint([dict(CLEAN_DEP)])
+        exit_code, report = _check(_write_literal(tmp_path, result["drift_report"].manifest.to_dict()), capsys)
+        assert [f for f in report["confirmed"] if f["signal"] == "tampered"] == []
+        assert exit_code == 0
+
+    def test_hand_edited_value_is_detected(self, tmp_path, capsys):
+        manifest = _old_style_manifest()
+        manifest["generated_at"] = "2026-09-01 00:00:00"  # hiding age, hash left alone
+        exit_code, report = _check(_write_literal(tmp_path, manifest), capsys)
+        assert [f for f in report["confirmed"] if f["signal"] == "tampered"]
+        assert exit_code == 1
+
+    def test_deleting_a_field_is_detected(self, tmp_path, capsys):
+        result = ne.generate_production_blueprint([dict(CLEAN_DEP)])
+        manifest = result["drift_report"].manifest.to_dict()
+        del manifest["local_modules"]
+        _, report = _check(_write_literal(tmp_path, manifest), capsys)
+        assert [f for f in report["confirmed"] if f["signal"] == "tampered"]
+
+    def test_report_carries_the_stored_hash_not_the_recomputed_one(self, tmp_path, capsys):
+        manifest = _old_style_manifest()
+        stored = manifest["dependency_hash"]
+        manifest["generated_at"] = "2026-09-01 00:00:00"
+        _, report = _check(_write_literal(tmp_path, manifest), capsys)
+        assert report["manifest"]["dependency_hash"] == stored
+        tampered = [f for f in report["confirmed"] if f["signal"] == "tampered"][0]
+        assert tampered["details"]["stored_hash"] == stored
+        assert tampered["details"]["recomputed_hash"] != stored
+
+
+_PIN_CHECKS = [
+    "check_yanked_or_removed", "check_staleness", "check_major_bump",
+    "check_python_support", "check_transitive_signals",
+]
+
+
+class TestPinChecksAreSharedBetweenGenerationAndCheckDrift:
+    """Both moments must run the very same checks on the very same inputs. They were once two
+    hand-maintained copies of one sequence; this guards against that drifting apart again."""
+
+    def _record_calls(self, monkeypatch, log):
+        for fname in _PIN_CHECKS:
+            monkeypatch.setattr(ne, fname, lambda *args, _f=fname: log.append((_f, args)) or [])
+
+    def test_identical_checks_in_both_paths(self, tmp_path, monkeypatch, capsys):
+        deps = [
+            dict(CLEAN_DEP),
+            {"name": "torch", "version": "2.3.1+cu121", "flags": []},  # local version: skipped by direct checks
+            {"name": "pandas[test]", "version": "2.2.1", "flags": []},
+        ]
+        generated, checked = [], []
+
+        self._record_calls(monkeypatch, generated)
+        result = ne.generate_production_blueprint(deps)
+        path = _write_literal(tmp_path, result["drift_report"].manifest.to_dict())
+
+        self._record_calls(monkeypatch, checked)
+        ne.run_check_drift_pipeline(str(path), output_format="json")
+        capsys.readouterr()
+
+        assert generated, "the generation path ran no pin checks at all"
+        assert generated == checked
+
+    def test_local_version_pin_yields_the_same_finding_in_both_paths(self, tmp_path, capsys):
+        deps = [{"name": "torch", "version": "2.3.1+cu121", "flags": []}]
+        result = ne.generate_production_blueprint(deps)
+        at_generation = [f.to_dict() for f in result["drift_report"].heuristic]
+        path = _write_literal(tmp_path, result["drift_report"].manifest.to_dict())
+        _, report = _check(path, capsys)
+
+        assert [f["signal"] for f in at_generation] == ["unverifiable_custom_index"]
+        assert report["heuristic"] == at_generation
+
+
+class TestGenerationOrdering:
+    def test_pin_checks_run_before_the_manifest_is_hashed(self, monkeypatch):
+        """Recorded findings will live inside the hashed manifest, so they must exist first."""
+        order = []
+        monkeypatch.setattr(ne, "check_yanked_or_removed", lambda *a: order.append("checks") or [])
+        real_hash = ne.SteadyPyManifest.compute_and_set_hash
+
+        def spy(self):
+            order.append("hash")
+            return real_hash(self)
+
+        monkeypatch.setattr(ne.SteadyPyManifest, "compute_and_set_hash", spy)
+        ne.generate_production_blueprint([dict(CLEAN_DEP)])
+        assert "checks" in order and "hash" in order
+        assert order.index("checks") < order.index("hash")
