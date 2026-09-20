@@ -36,4 +36,4 @@ def test_constant_values_are_the_wire_strings():
 
 def test_constants_embed_in_the_manifest_literal_as_plain_strings():
     baseline = ne.build_baseline([ne.DriftFinding("requests", "2.32.0", ne.Signal.YANKED, ne.Severity.CONFIRMED, "m")])
-    assert repr(baseline) == "{'version': 1, 'findings': [['yanked', 'requests', '2.32.0']], 'errors': []}"
+    assert repr(baseline.to_dict()) == "{'version': 1, 'findings': [['yanked', 'requests', '2.32.0']], 'errors': []}"

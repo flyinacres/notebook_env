@@ -121,7 +121,7 @@ class TestBaselineE2E:
         deps = [ne.PinnedDependency("requests", "2.32.0")]
         path, result = _write_notebook_with_manifest(tmp_path, deps)
 
-        assert ["yanked", "requests", "2.32.0"] in result["drift_report"].manifest.baseline["findings"]
+        assert ("yanked", "requests", "2.32.0") in result["drift_report"].manifest.baseline.findings
 
         exit_code = ne.run_check_drift_pipeline(str(path), output_format="json")
         report = json.loads(capsys.readouterr().out)

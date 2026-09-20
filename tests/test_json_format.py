@@ -644,8 +644,11 @@ class TestSequentialExecutionEngine:
         assert "[2/2]" in captured
 
     def test_best_effort_execution_continues_on_failure(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # The executed code below assigns subprocess.run on the real module. Registering it with
+        # monkeypatch first makes teardown restore it; otherwise the fake leaks into every later test.
+        monkeypatch.setattr(subprocess, "run", subprocess.run)
         manifest_items = [
             ne.PinnedDependency("fail_pkg", "1.0.0"),
             ne.PinnedDependency("pass_pkg", "2.0.0")
@@ -1103,6 +1106,11 @@ class TestInteractiveKernelRuntime:
         and only attaches a single stderr console handler.
         """
         logger = logging.getLogger("notebook_env")
+
+        # The stderr handler is attached by the CLI entry point, not at import; calling it twice
+        # must not add a second one.
+        ne._configure_console()
+        ne._configure_console()
 
         # In live sessions, propagate must be False so root loggers (e.g. IPython) don't duplicate logs
         assert logger.propagate is False

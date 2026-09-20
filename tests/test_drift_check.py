@@ -339,7 +339,7 @@ class TestMajorBump:
         assert len(findings) == 1
         assert findings[0].signal == "major_bump"
         assert findings[0].severity == "heuristic"
-        assert findings[0].details["latest_version"] == "2.5.3"
+        assert findings[0].latest_version == "2.5.3"
 
     def test_network_error_reported_not_silenced(self):
         findings = ne.check_major_bump("flaky-package", "1.0.0")
@@ -780,17 +780,17 @@ OLD_NUMPY = ne.PinnedDependency("numpy", "1.26.4")           # major_bump (heuri
 
 class TestBaselineKeys:
     @pytest.mark.parametrize("finding,expected", [
-        (ne.DriftFinding("requests", "2.32.0", "yanked", "confirmed", "m"), ["yanked", "requests", "2.32.0"]),
-        (ne.DriftFinding("old-package", "0.9.0", "removed", "confirmed", "m"), ["removed", "old-package", "0.9.0"]),
-        (ne.DriftFinding("numpy", "1.26.4", "unsupported_python", "confirmed", "m"), ["unsupported_python", "numpy", "1.26.4"]),
+        (ne.DriftFinding("requests", "2.32.0", "yanked", "confirmed", "m"), ("yanked", "requests", "2.32.0")),
+        (ne.DriftFinding("old-package", "0.9.0", "removed", "confirmed", "m"), ("removed", "old-package", "0.9.0")),
+        (ne.DriftFinding("numpy", "1.26.4", "unsupported_python", "confirmed", "m"), ("unsupported_python", "numpy", "1.26.4")),
         (ne.DriftFinding("torch", "2.3.1+cu121", "unverifiable_custom_index", "heuristic", "m"),
-         ["unverifiable_custom_index", "torch", "2.3.1+cu121"]),
+         ("unverifiable_custom_index", "torch", "2.3.1+cu121")),
         (ne.DriftFinding("stale-package", "1.0.0", "stale", "heuristic", "m", {"days_since_last_release": 900}),
-         ["stale", "stale-package"]),
-        (ne.DriftFinding("numpy", "1.26.4", "major_bump", "heuristic", "m", {"latest_version": "2.5.3"}),
-         ["major_bump", "numpy", "2"]),
-        (ne.DriftFinding("numpy", "<2", "conflict", "confirmed", "m", {"parent": "pandas"}),
-         ["conflict", "numpy", "<2", "pandas"]),
+         ("stale", "stale-package")),
+        (ne.DriftFinding("numpy", "1.26.4", "major_bump", "heuristic", "m", latest_version="2.5.3"),
+         ("major_bump", "numpy", "2")),
+        (ne.DriftFinding("numpy", "<2", "conflict", "confirmed", "m", parent="pandas"),
+         ("conflict", "numpy", "<2", "pandas")),
     ])
     def test_key_holds_the_facts_that_define_the_problem(self, finding, expected):
         assert ne.finding_baseline_key(finding) == expected
@@ -801,8 +801,8 @@ class TestBaselineKeys:
         assert ne.finding_baseline_key(a) == ne.finding_baseline_key(b)
 
     def test_a_newer_latest_major_is_a_different_major_bump(self):
-        a = ne.DriftFinding("numpy", "1.26.4", "major_bump", "heuristic", "m", {"latest_version": "2.5.3"})
-        b = ne.DriftFinding("numpy", "1.26.4", "major_bump", "heuristic", "m", {"latest_version": "3.0.0"})
+        a = ne.DriftFinding("numpy", "1.26.4", "major_bump", "heuristic", "m", latest_version="2.5.3")
+        b = ne.DriftFinding("numpy", "1.26.4", "major_bump", "heuristic", "m", latest_version="3.0.0")
         assert ne.finding_baseline_key(a) != ne.finding_baseline_key(b)
 
     @pytest.mark.parametrize("signal,severity", [
@@ -815,26 +815,25 @@ class TestBaselineKeys:
     def test_conflict_findings_carry_their_parent(self):
         deps = [ne.PinnedDependency("pandas", "2.2.1"), ne.PinnedDependency("numpy", "2.5.3")]
         _, findings = ne.resolve_transitive_graph(deps, REQ_PY_311)
-        assert findings and all("parent" in f.details for f in findings)  # "" for a requirement from a direct pin
-        assert any(f.details["parent"] == "pandas" for f in findings)
+        assert findings and all(f.parent is not None for f in findings)  # "" for a requirement from a direct pin
+        assert any(f.parent == "pandas" for f in findings)
 
 
 class TestGenerationRecordsBaseline:
     def test_findings_at_generation_are_recorded(self):
         baseline = ne.generate_production_blueprint([REQUESTS_YANKED])["drift_report"].manifest.baseline
-        assert baseline["version"] == 1
-        assert ["yanked", "requests", "2.32.0"] in baseline["findings"]
-        assert ["stale", "requests"] in baseline["findings"]
-        assert baseline["errors"] == []
+        assert ("yanked", "requests", "2.32.0") in baseline.findings
+        assert ("stale", "requests") in baseline.findings
+        assert baseline.errors == ()
 
     def test_clean_generation_records_an_empty_baseline_not_none(self):
         manifest = ne.generate_production_blueprint([CLEAN_DEP])["drift_report"].manifest
-        assert manifest.baseline == {"version": 1, "findings": [], "errors": []}
+        assert manifest.baseline == ne.Baseline()
 
     def test_packages_that_could_not_be_checked_are_recorded(self):
         deps = [ne.PinnedDependency("flaky-package", "1.0.0")]
         baseline = ne.generate_production_blueprint(deps)["drift_report"].manifest.baseline
-        assert baseline["errors"] == ["flaky-package"]
+        assert baseline.errors == ("flaky-package",)
 
     def test_generation_report_findings_are_not_tagged(self):
         report = ne.generate_production_blueprint([REQUESTS_YANKED])["drift_report"]
@@ -1146,3 +1145,84 @@ class TestBatchAggregateValidation:
         root = _make_batch(tmp_path)
         assert json.loads(_run_batch(root, capsys, fmt="json", write=False))["validation"] is None
         assert "BATCH DEPENDENCY VALIDATION" not in _run_batch(root, capsys, write=False)
+
+
+# ---------------------------------------------------------------------------
+# Typed Baseline, explicit DriftFinding fields, typed per-notebook counts
+# ---------------------------------------------------------------------------
+
+class TestBaselineType:
+    def test_to_dict_is_the_persisted_shape(self):
+        baseline = ne.Baseline(findings=(("yanked", "requests", "2.32.0"),), errors=("flaky-package",))
+        assert baseline.to_dict() == {
+            "version": 1, "findings": [["yanked", "requests", "2.32.0"]], "errors": ["flaky-package"],
+        }
+
+    def test_round_trips(self):
+        baseline = ne.Baseline(findings=(("stale", "p"), ("yanked", "q", "1")), errors=("x", ""))
+        assert ne.Baseline.from_dict(baseline.to_dict()) == baseline
+
+    @pytest.mark.parametrize("raw", [
+        None, [], "baseline", {"version": 99, "findings": [], "errors": []},
+        {"version": 1, "findings": "abc", "errors": []}, {"version": 1, "findings": [["ok", 3]], "errors": []},
+        {"version": 1, "findings": [], "errors": [3]}, {"version": 1, "errors": []},
+    ])
+    def test_unusable_baselines_read_as_none(self, raw):
+        assert ne.Baseline.from_dict(raw) is None
+
+    def test_build_baseline_returns_a_sorted_typed_record(self):
+        findings = [
+            ne.DriftFinding("requests", "2.32.0", ne.Signal.YANKED, ne.Severity.CONFIRMED, "m"),
+            ne.DriftFinding("a-pkg", "1", ne.Signal.STALE, ne.Severity.HEURISTIC, "m"),
+            ne.DriftFinding("flaky", "1", ne.Signal.CHECK_ERROR, ne.Severity.ERROR, "m"),
+        ]
+        assert ne.build_baseline(findings) == ne.Baseline(
+            findings=(("stale", "a-pkg"), ("yanked", "requests", "2.32.0")), errors=("flaky",),
+        )
+
+    def test_manifest_holds_a_typed_baseline_and_persists_it_as_a_dict(self):
+        manifest = ne.generate_production_blueprint([REQUESTS_YANKED])["drift_report"].manifest
+        assert isinstance(manifest.baseline, ne.Baseline)
+        assert manifest.to_dict()["baseline"] == manifest.baseline.to_dict()
+        assert ne.SteadyPyManifest.from_literal(manifest.to_dict()).baseline == manifest.baseline
+
+    def test_finding_keys_are_tuples_but_serialize_as_lists(self):
+        finding = ne.DriftFinding("requests", "2.32.0", ne.Signal.YANKED, ne.Severity.CONFIRMED, "m")
+        assert ne.finding_baseline_key(finding) == ("yanked", "requests", "2.32.0")
+        assert ne.finding_identity_key(finding) == ("yanked", "requests", "2.32.0")
+        assert finding.to_dict()["key"] == ["yanked", "requests", "2.32.0"]
+
+
+class TestDriftFindingExplicitFields:
+    def test_major_bump_carries_latest_version_as_a_field_and_in_json_details(self):
+        (finding,) = ne.check_major_bump("numpy", "1.26.4")
+        assert finding.latest_version == "2.5.3"
+        assert finding.to_dict()["details"]["latest_version"] == "2.5.3"
+
+    def test_conflict_carries_its_parent_as_a_field_and_in_json_details(self):
+        deps = [ne.PinnedDependency("pandas", "2.2.1"), ne.PinnedDependency("numpy", "2.5.3")]
+        _, findings = ne.resolve_transitive_graph(deps, REQ_PY_311)
+        via_pandas = [f for f in findings if f.parent == "pandas"]
+        assert via_pandas and via_pandas[0].to_dict()["details"]["parent"] == "pandas"
+        assert [f.parent for f in findings if f.parent is not None]  # "" means a requirement from a direct pin
+
+    def test_keys_read_the_explicit_fields(self):
+        bump = ne.DriftFinding("numpy", "1.26.4", ne.Signal.MAJOR_BUMP, ne.Severity.HEURISTIC, "m", latest_version="3.0.0")
+        conflict = ne.DriftFinding("numpy", "<2", ne.Signal.CONFLICT, ne.Severity.CONFIRMED, "m", parent="pandas")
+        assert ne.finding_baseline_key(bump) == ("major_bump", "numpy", "3")
+        assert ne.finding_baseline_key(conflict) == ("conflict", "numpy", "<2", "pandas")
+
+    def test_display_only_details_stay_in_details(self):
+        (finding,) = ne.check_staleness("stale-package", "1.0.0")
+        assert "days_since_last_release" in finding.details and finding.latest_version is None and finding.parent is None
+
+
+class TestNotebookValidationCounts:
+    def test_batch_validation_holds_typed_per_notebook_counts(self):
+        report = ne.generate_production_blueprint([REQUESTS_YANKED])["drift_report"]
+        validation = ne.build_batch_validation([("a.ipynb", report)])
+        (counts,) = validation.notebooks
+        assert isinstance(counts, ne.NotebookValidationCounts)
+        assert (counts.path, counts.confirmed, counts.heuristic, counts.errors) == ("a.ipynb", 1, 1, 0)
+        assert counts.to_dict() == {"path": "a.ipynb", "confirmed": 1, "heuristic": 1, "errors": 0}
+        assert validation.to_dict()["notebooks"] == [counts.to_dict()]

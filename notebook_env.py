@@ -52,7 +52,7 @@ import urllib.parse
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field
-from typing import Set, FrozenSet, Dict, List, Tuple, Optional, Any, TypedDict, Callable, NamedTuple, Union
+from typing import Set, FrozenSet, Dict, List, Tuple, Optional, Any, TypedDict, Callable, NamedTuple, Union, Mapping, Sequence
 from packaging.version import Version, InvalidVersion
 from packaging.specifiers import SpecifierSet, InvalidSpecifier
 from packaging.requirements import Requirement, InvalidRequirement
@@ -63,21 +63,31 @@ from resolvelib.resolvers import ResolutionImpossible
 TOOL_VERSION: str = "44"
 SCHEMA_VERSION: str = "1.0"
 
-# Force UTF-8 encoding for stdout and stderr on Windows/redirected environments
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-
-# Setup logging stream for diagnostic messages (directed to stderr)
+# Diagnostics go through this logger. Importing the module must not touch process-global state
+# (the standard streams, other loggers' handlers), so the logger itself is only given a NullHandler;
+# the CLI entry point (main) calls _configure_console() to attach the stderr handler and force UTF-8
+# output. It never propagates to the root logger, so a host that configures logging (an IPython
+# session, a test runner) does not print every message twice. The name is explicit, not __name__,
+# because running the file as a script would otherwise name it "__main__".
 logger = logging.getLogger("notebook_env")
 logger.setLevel(logging.INFO)
 logger.propagate = False
+if not logger.handlers:  # guarded: the file is re-executed when pasted into a live kernel more than once
+    logger.addHandler(logging.NullHandler())
 
-if not logger.handlers:
-    console_handler = logging.StreamHandler(sys.stderr)
-    console_handler.setFormatter(logging.Formatter("%(message)s"))
-    logger.addHandler(console_handler)
+
+def _configure_console() -> None:
+    """CLI-only process setup: UTF-8 stdout/stderr (Windows and redirected output) and a plain
+    stderr log handler at INFO. Called once from main(), never at import."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+    for placeholder in [h for h in logger.handlers if isinstance(h, logging.NullHandler)]:
+        logger.removeHandler(placeholder)  # the real handler replaces it, leaving exactly one
+    if not any(type(h) is logging.StreamHandler for h in logger.handlers):
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(handler)
 
 
 # =====================================================================
@@ -371,6 +381,41 @@ class GpuInfo:
         }
 
 
+BASELINE_FORMAT_VERSION = 1
+FindingKey = Tuple[str, ...]  # see finding_baseline_key
+
+
+@dataclass(frozen=True)
+class Baseline:
+    """What generation-time validation found: compact finding keys, plus the packages that could not
+    be checked ("" means the transitive resolution itself failed). Persisted in the manifest as a
+    dict (to_dict / from_dict)."""
+    findings: Tuple[FindingKey, ...] = ()
+    errors: Tuple[str, ...] = ()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "version": BASELINE_FORMAT_VERSION,
+            "findings": [list(key) for key in self.findings],
+            "errors": list(self.errors),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> Optional["Baseline"]:
+        """None when `data` is absent or not a baseline format this tool understands, so an
+        unrecognized baseline reads as 'no baseline recorded' rather than as an error."""
+        if not isinstance(data, dict) or data.get("version") != BASELINE_FORMAT_VERSION:
+            return None
+        findings, errors = data.get("findings"), data.get("errors")
+        if not isinstance(findings, list) or not isinstance(errors, list):
+            return None
+        if not all(isinstance(k, (list, tuple)) and all(isinstance(part, str) for part in k) for k in findings):
+            return None
+        if not all(isinstance(e, str) for e in errors):
+            return None
+        return cls(findings=tuple(tuple(k) for k in findings), errors=tuple(errors))
+
+
 @dataclass(frozen=True)
 class PinnedDependency:
     """One pinned direct dependency as recorded in the manifest and consumed by the drift checks.
@@ -428,7 +473,7 @@ class SteadyPyManifest:
     raw_installs: List[str] = field(default_factory=list)
     custom_sourced: List[str] = field(default_factory=list)
     local_modules: List[Dict[str, str]] = field(default_factory=list)
-    baseline: Optional[Dict[str, Any]] = None
+    baseline: Optional[Baseline] = None
     # Set only by from_literal: the hash recomputed over the fields exactly as they were
     # persisted. Never serialized, hashed or compared; it is not part of the manifest.
     verified_hash: Optional[str] = field(default=None, init=False, repr=False, compare=False)
@@ -446,7 +491,11 @@ class SteadyPyManifest:
         deps = data.get("dependencies")
         if not isinstance(deps, list):
             raise TypeError("the manifest's 'dependencies' must be a list")
-        manifest = cls(**{**data, "dependencies": [PinnedDependency.from_dict(d) for d in deps]})
+        manifest = cls(**{
+            **data,
+            "dependencies": [PinnedDependency.from_dict(d) for d in deps],
+            "baseline": Baseline.from_dict(data.get("baseline")),
+        })
         manifest.verified_hash = _manifest_payload_hash(data)
         return manifest
 
@@ -461,7 +510,7 @@ class SteadyPyManifest:
             "raw_installs": self.raw_installs,
             "custom_sourced": self.custom_sourced,
             "local_modules": self.local_modules,
-            "baseline": self.baseline,
+            "baseline": self.baseline.to_dict() if self.baseline is not None else None,
         }
 
     def compute_and_set_hash(self) -> str:
@@ -803,7 +852,7 @@ def _memoize_for_run(func: Callable) -> Callable:
             cache[key] = func(*args, **kwargs)
         return _defensive_copy(cache[key])
 
-    wrapper.cache_clear = cache.clear
+    wrapper.cache_clear = cache.clear  # type: ignore[attr-defined]
     return wrapper
 
 
@@ -1488,7 +1537,7 @@ def harvest_cell_magics_and_commands(
 def build_unified_timeline(
     code_sources: List[str],
     frozen_env: Dict[str, str],
-    pkg_dist_map: Optional[Dict[str, List[str]]] = None,
+    pkg_dist_map: Optional[Mapping[str, List[str]]] = None,
     is_execution_ordered: bool = True,
     local_ctx: Optional[LocalModuleContext] = None
 ) -> TimelineResult:
@@ -1708,7 +1757,7 @@ def resolve_pypi_package_and_extras(
     imp: str, 
     submodules_set: Set[str], 
     frozen_env: Dict[str, str], 
-    pkg_dist_map: Optional[Dict[str, List[str]]] = None,
+    pkg_dist_map: Optional[Mapping[str, List[str]]] = None,
     is_guarded: bool = False,
     local_ctx: Optional[LocalModuleContext] = None
 ) -> Tuple[DependencyEntry, Optional[PromotionDetail]]:
@@ -1828,8 +1877,10 @@ def resolve_pypi_package_and_extras(
                 if sub_tail in provided_extras_lower:
                     extra_tag = provided_extras_lower[sub_tail]
                     break
-        except Exception:
-            pass
+        except importlib.metadata.PackageNotFoundError:
+            pass  # not installed here, so there are no extras to match
+        except Exception as e:  # extras tagging is best-effort; never let odd metadata stop the run
+            logger.debug(f"Could not read Provides-Extra for '{pkg_part}': {e}", exc_info=True)
 
     if extra_tag:
         promoted_name = f"{pkg_part}[{extra_tag}]"
@@ -1851,7 +1902,7 @@ def build_manifest_entries(
     imports: Any, 
     submodules: Dict[str, Set[str]], 
     frozen_env: Dict[str, str], 
-    pkg_dist_map: Optional[Dict[str, List[str]]] = None,
+    pkg_dist_map: Optional[Mapping[str, List[str]]] = None,
     guarded_imports: Optional[Set[str]] = None,
     local_ctx: Optional[LocalModuleContext] = None
 ) -> Tuple[List[str], List[str]]:
@@ -1868,7 +1919,7 @@ def build_dependency_objects(
     imports: Any, 
     submodules: Dict[str, Set[str]], 
     frozen_env: Dict[str, str], 
-    pkg_dist_map: Optional[Dict[str, List[str]]] = None,
+    pkg_dist_map: Optional[Mapping[str, List[str]]] = None,
     guarded_imports: Optional[Set[str]] = None,
     local_ctx: Optional[LocalModuleContext] = None
 ) -> Tuple[List[DependencyEntry], List[PromotionDetail]]:
@@ -1906,8 +1957,8 @@ def resolve_opencv_variant(submodules: Optional[Set[str]] = None) -> str:
             return "opencv-contrib-python"
         elif "opencv-python" in installed:
             return "opencv-python"
-    except Exception:
-        pass
+    except Exception as e:  # falls back to the default variant below
+        logger.debug(f"Could not inspect installed OpenCV variants: {e}", exc_info=True)
     return "opencv-contrib-python" if has_contrib else "opencv-python"
 
 
@@ -2177,6 +2228,7 @@ def fetch_pypi_version_metadata(name: str, version: str) -> PypiVersionMetadata:
     status, payload, error_detail = _fetch_pypi_json(f"https://pypi.org/pypi/{name}/{version}/json")
     if status != FetchStatus.FOUND:
         return PypiVersionMetadata(status=status, error_detail=error_detail)
+    assert payload is not None  # _fetch_pypi_json returns a payload whenever the status is FOUND
 
     info = payload.get("info", {})
     return PypiVersionMetadata(
@@ -2195,6 +2247,7 @@ def fetch_pypi_package_metadata(name: str) -> PypiPackageMetadata:
     status, payload, error_detail = _fetch_pypi_json(f"https://pypi.org/pypi/{name}/json")
     if status != FetchStatus.FOUND:
         return PypiPackageMetadata(status=status, error_detail=error_detail)
+    assert payload is not None  # _fetch_pypi_json returns a payload whenever the status is FOUND
 
     info = payload.get("info", {})
     releases: Dict[str, Dict[str, Any]] = {}
@@ -2238,16 +2291,25 @@ class DriftFinding:
     # Set only on a check-drift finding, and only when the manifest carries a usable baseline:
     # "known" (present at generation), "new", or "not_checked_at_generation".
     baseline_status: Optional[str] = None
+    # Facts that identify a finding (they feed finding_baseline_key), so explicit fields rather
+    # than entries in the display-only `details` bag. Both still appear under "details" in JSON.
+    latest_version: Optional[str] = None  # major_bump: the newest version on PyPI
+    parent: Optional[str] = None  # conflict: the package whose requirement conflicted ("" = a direct pin)
 
     def to_dict(self) -> Dict[str, Any]:
+        details = dict(self.details)
+        if self.latest_version is not None:
+            details["latest_version"] = self.latest_version
+        if self.parent is not None:
+            details["parent"] = self.parent
         out = {
             "package": self.package,
             "version": self.version,
             "signal": self.signal,
             "severity": self.severity,
             "message": self.message,
-            "details": self.details,
-            "key": finding_identity_key(self),
+            "details": details,
+            "key": list(finding_identity_key(self)),
         }
         if self.baseline_status is not None:
             out["baseline_status"] = self.baseline_status
@@ -2315,7 +2377,7 @@ def _marker_environment(required_python: Dict[str, int], extra: Optional[str]) -
     Kaggle/Colab are Linux, matching this environment, a reasonable approximation).
     """
     py_version = f"{required_python.get('major')}.{required_python.get('minor')}"
-    env = dict(default_environment())
+    env: Dict[str, str] = {str(k): str(v) for k, v in default_environment().items()}
     env["python_version"] = py_version
     env["python_full_version"] = py_version
     env["extra"] = extra or ""
@@ -2458,7 +2520,7 @@ def check_major_bump(name: str, version: str) -> List[DriftFinding]:
     return [DriftFinding(
         package=name, version=version, signal=Signal.MAJOR_BUMP, severity=Severity.HEURISTIC,
         message=f"{name}=={version} is on major version {pinned_v.major}; {package_meta.latest_version} (major {latest_v.major}) is available -- worth reviewing",
-        details={"latest_version": package_meta.latest_version},
+        latest_version=package_meta.latest_version,
     )]
 
 
@@ -2630,7 +2692,7 @@ def resolve_transitive_graph(
                     f"Unresolvable dependency graph: {cause.requirement} required by "
                     f"{cause.parent.name if cause.parent else 'a direct pin'}"
                 ),
-                details={"parent": cause.parent.name if cause.parent else ""},
+                parent=cause.parent.name if cause.parent else "",
             )
             for cause in e.causes
         ]
@@ -2709,8 +2771,6 @@ def run_pin_checks(dependencies: List[PinnedDependency], python_version: Dict[st
 # could not be checked back then, so "new" would be a claim we can't make). Each signal
 # keys on exactly the facts that define the problem: a changed fact is a new finding.
 
-BASELINE_FORMAT_VERSION = 1
-
 # Per-release facts: fixed for a given package version.
 _PER_VERSION_SIGNALS = frozenset({
     Signal.YANKED, Signal.REMOVED, Signal.NOT_FOUND_ON_PYPI, Signal.UNSUPPORTED_PYTHON,
@@ -2718,67 +2778,55 @@ _PER_VERSION_SIGNALS = frozenset({
 })
 
 
-def finding_baseline_key(finding: DriftFinding) -> Optional[List[str]]:
+def finding_baseline_key(finding: DriftFinding) -> Optional[FindingKey]:
     """The facts that make this finding 'the same problem' across runs; None if it has no
     generation-time counterpart (tamper, local-module and check-error findings)."""
     signal = finding.signal
     if signal in _PER_VERSION_SIGNALS:
-        return [signal, finding.package, finding.version]
+        return (signal, finding.package, finding.version)
     if signal == Signal.STALE:
-        return [signal, finding.package]  # the day count changes every run; the problem doesn't
+        return (signal, finding.package)  # the day count changes every run; the problem doesn't
     if signal == Signal.MAJOR_BUMP:
-        latest = str(finding.details.get("latest_version", ""))
+        latest = finding.latest_version or ""
         try:
             major = str(Version(latest).major)
         except InvalidVersion:
             major = latest
-        return [signal, finding.package, major]  # a still-newer major is a different finding
+        return (signal, finding.package, major)  # a still-newer major is a different finding
     if signal == Signal.CONFLICT:
-        return [signal, finding.package, finding.version, str(finding.details.get("parent", ""))]
+        return (signal, finding.package, finding.version, finding.parent or "")
     return None
 
 
-def finding_identity_key(finding: DriftFinding) -> List[str]:
+def finding_identity_key(finding: DriftFinding) -> FindingKey:
     """A stable identity for any finding, for comparing two reports without touching messages or
     dates. Equal to the baseline key wherever one exists; findings with no baseline counterpart
     (tamper, local-module, check-error) fall back to signal, package and version."""
-    return finding_baseline_key(finding) or [finding.signal, finding.package, finding.version]
+    return finding_baseline_key(finding) or (finding.signal, finding.package, finding.version)
 
 
-def build_baseline(findings: List[DriftFinding]) -> Dict[str, Any]:
+def build_baseline(findings: List[DriftFinding]) -> Baseline:
     """Compact, sorted record of generation-time findings, plus the packages that could not
     be checked ("" means the transitive resolution itself failed)."""
-    keys: List[List[str]] = []
+    keys: Set[FindingKey] = set()
     errored: Set[str] = set()
     for f in findings:
         if f.severity == Severity.ERROR:
             errored.add(f.package)
             continue
         key = finding_baseline_key(f)
-        if key is not None and key not in keys:
-            keys.append(key)
-    return {"version": BASELINE_FORMAT_VERSION, "findings": sorted(keys), "errors": sorted(errored)}
-
-
-def _parse_baseline(raw: Any) -> Optional[Tuple[Set[Tuple[str, ...]], Set[str]]]:
-    """(recorded keys, canonical names that errored), or None if absent or not a format we know."""
-    if not isinstance(raw, dict) or raw.get("version") != BASELINE_FORMAT_VERSION:
-        return None
-    try:
-        keys = {tuple(k) for k in raw.get("findings", [])}
-        errored = {canonicalize_pkg_name(e) if e else "" for e in raw.get("errors", [])}
-    except TypeError:
-        return None
-    return keys, errored
+        if key is not None:
+            keys.add(key)
+    return Baseline(findings=tuple(sorted(keys)), errors=tuple(sorted(errored)))
 
 
 def classify_against_baseline(findings: List[DriftFinding], manifest: SteadyPyManifest) -> bool:
     """Sets baseline_status on every comparable finding. Returns False (and touches nothing)
     when the manifest has no usable baseline."""
-    parsed = _parse_baseline(manifest.baseline)
-    if parsed is None:
+    if manifest.baseline is None:
         return False
-    known, errored = parsed
+    known = set(manifest.baseline.findings)
+    errored = {canonicalize_pkg_name(e) if e else "" for e in manifest.baseline.errors}
     direct = {
         canonicalize_pkg_name(_split_pin_name(d.name)[0]) for d in manifest.dependencies if d.name
     }
@@ -2788,7 +2836,7 @@ def classify_against_baseline(findings: List[DriftFinding], manifest: SteadyPyMa
         if key is None:
             continue
         canon = canonicalize_pkg_name(f.package)
-        if tuple(key) in known:
+        if key in known:
             f.baseline_status = BaselineStatus.KNOWN
             if f.signal == Signal.NOT_FOUND_ON_PYPI:
                 # Already true at generation, so this is a custom source (private or custom-index
@@ -2858,7 +2906,7 @@ class DriftCheckReport:
         return not (self.has_confirmed or self.has_heuristic or self.has_errors)
 
     def to_dict(self) -> Dict[str, Any]:
-        out = {
+        out: Dict[str, Any] = {
             "kind": self.kind,
             "target": self.target,
             "checked_at": self.checked_at,
@@ -2995,7 +3043,7 @@ _VALIDATION_SEVERITY_ORDER = [Severity.CONFIRMED, Severity.HEURISTIC, Severity.E
 @dataclass
 class BatchFindingGroup:
     """One distinct finding, and every notebook in the batch it appears in."""
-    key: List[str]
+    key: FindingKey
     signal: str
     severity: str
     package: str
@@ -3005,16 +3053,32 @@ class BatchFindingGroup:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "key": self.key, "signal": self.signal, "severity": self.severity,
+            "key": list(self.key), "signal": self.signal, "severity": self.severity,
             "package": self.package, "version": self.version, "message": self.message,
             "notebooks": self.notebooks,
         }
 
 
 @dataclass
+class NotebookValidationCounts:
+    """One checked notebook's finding counts, by severity."""
+    path: str  # relative to the batch directory
+    confirmed: int = 0
+    heuristic: int = 0
+    errors: int = 0
+
+    @property
+    def has_findings(self) -> bool:
+        return bool(self.confirmed or self.heuristic or self.errors)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"path": self.path, "confirmed": self.confirmed, "heuristic": self.heuristic, "errors": self.errors}
+
+
+@dataclass
 class BatchValidation:
     findings: List[BatchFindingGroup]
-    notebooks: List[Dict[str, Any]]  # every notebook checked: {"path", "confirmed", "heuristic", "errors"}
+    notebooks: List[NotebookValidationCounts]  # every notebook checked
 
     @property
     def notebooks_checked(self) -> int:
@@ -3032,7 +3096,7 @@ class BatchValidation:
             "notebooks_checked": self.notebooks_checked,
             "totals": self.totals(),
             "findings": [g.to_dict() for g in self.findings],
-            "notebooks": self.notebooks,
+            "notebooks": [n.to_dict() for n in self.notebooks],
         }
 
 
@@ -3048,14 +3112,14 @@ def build_batch_validation(reports: List[Tuple[str, "DriftCheckReport"]]) -> Bat
     Findings group on their identity key plus message: within one run the same package, version
     and signal always produce the same message, and distinct errors on one package stay separate."""
     groups: Dict[Tuple[str, Tuple[str, ...], str], BatchFindingGroup] = {}
-    notebooks: List[Dict[str, Any]] = []
+    notebooks: List[NotebookValidationCounts] = []
     for path, report in sorted(reports, key=lambda item: item[0]):
-        notebooks.append({
-            "path": path,
-            "confirmed": len(report.confirmed),
-            "heuristic": len(report.heuristic),
-            "errors": len(report.errors),
-        })
+        notebooks.append(NotebookValidationCounts(
+            path=path,
+            confirmed=len(report.confirmed),
+            heuristic=len(report.heuristic),
+            errors=len(report.errors),
+        ))
         for f in report.confirmed + report.heuristic + report.errors:
             key = finding_identity_key(f)
             gkey = (f.severity, tuple(key), f.message)
@@ -3100,12 +3164,12 @@ def format_console_batch_validation(validation: BatchValidation, max_names: int 
             out.append(f"      affects {len(g.notebooks)} notebook(s): {names}")
         out.append("")
 
-    affected = [nb for nb in validation.notebooks if nb["confirmed"] or nb["heuristic"] or nb["errors"]]
+    affected = [nb for nb in validation.notebooks if nb.has_findings]
     out.append("NOTEBOOKS WITH FINDINGS:")
     for nb in affected:
         out.append(
-            f"  {nb['path']}: {nb['confirmed']} confirmed, {nb['heuristic']} worth reviewing, "
-            f"{nb['errors']} could not be checked"
+            f"  {nb.path}: {nb.confirmed} confirmed, {nb.heuristic} worth reviewing, "
+            f"{nb.errors} could not be checked"
         )
     totals = validation.totals()
     parts = []
@@ -3211,7 +3275,7 @@ def check_local_modules(
                             f"for this check, so it can't be verified.",
                 ))
                 continue
-            anchor_dir = root_dir
+            anchor_dir: Optional[str] = root_dir
         else:
             anchor_dir = notebook_dir
 
@@ -3308,8 +3372,10 @@ def expand_transitive_frameworks(imports: Any) -> Set[str]:
                     for fw in SUPPORTED_GPU_FRAMEWORKS:
                         if fw in req_lower:
                             expanded.add(fw)
-            except Exception:
-                pass
+            except importlib.metadata.PackageNotFoundError:
+                pass  # not installed here, so its requirements can't be read
+            except Exception as e:
+                logger.debug(f"Could not read the requirements of '{pkg}': {e}", exc_info=True)
     return expanded
 
 
@@ -3350,7 +3416,7 @@ def probe_tensorflow_gpu() -> Optional[GpuProbeResult]:
                 details = tf.config.experimental.get_device_details(gpus[0])
                 dev_name = f"{details.get('device_name', 'NVIDIA GPU')} (via TensorFlow)"
             except Exception:
-                pass
+                pass  # keep the generic name; cannot log here, stderr (fd 2) is silenced inside this block
             return GpuProbeResult("GPU", dev_name)
     except ImportError:
         return None
@@ -3449,7 +3515,7 @@ def resolve_notebook_gpu_info(nb_imports: Any, batch_hw_cache: Optional[GpuInfo]
             matched_device = fw_devices[fw_stem]
             break
 
-    if matched_device:
+    if matched_device and matched_fw:
         active_label = CANONICAL_TO_FRAMEWORK_DISPLAY.get(matched_fw, matched_fw.capitalize())
         return GpuInfo(
             has_gpu=True,
@@ -3475,7 +3541,7 @@ def resolve_notebook_gpu_info(nb_imports: Any, batch_hw_cache: Optional[GpuInfo]
 # =====================================================================
 
 def generate_production_blueprint(
-    manifest_items: List[Union[DependencyEntry, PinnedDependency, str]], 
+    manifest_items: Sequence[Union[DependencyEntry, PinnedDependency, str]], 
     full_freeze_lines: Optional[List[str]] = None, 
     local_tagged_info: Optional[List[Tuple[str, List[str]]]] = None, 
     gpu_info: Optional[GpuInfo] = None,
@@ -3887,7 +3953,7 @@ class RepoEnvironmentMap:
                     self.global_imports.append(pkg)
                 self.harvested_packages_to_notebooks.setdefault(pkg, []).append(result.path)
 
-        for url in result.harvested_urls:
+        for url in result.harvested_urls or ():
             self.url_to_notebooks.setdefault(url, []).append(result.path)
 
 
@@ -3965,7 +4031,7 @@ def walk_and_scan_directory(target_dir: str, skip_suffix: Optional[str] = None) 
 def build_single_notebook_report(
     scan_res: NotebookScanResult,
     frozen_env: Dict[str, str],
-    pkg_dist_map: Dict[str, List[str]],
+    pkg_dist_map: Mapping[str, List[str]],
     gpu_info: Optional[GpuInfo],
     root_dir: Optional[str] = None
 ) -> NotebookAnalysisReport:
@@ -4022,7 +4088,7 @@ def build_single_notebook_report(
 def analyze_batch_repository(
     repo_map: RepoEnvironmentMap, 
     frozen_env: Dict[str, str], 
-    pkg_dist_map: Dict[str, List[str]], 
+    pkg_dist_map: Mapping[str, List[str]], 
     batch_hw_cache: Optional[GpuInfo]
 ) -> BatchAnalysisSummary:
     """Aggregates dependency metrics, warnings, and index settings across repository notebooks."""
@@ -4277,7 +4343,7 @@ def format_json_single_report(
 def generate_batch_analysis_report(
     repo_map: RepoEnvironmentMap, 
     frozen_env: Dict[str, str], 
-    pkg_dist_map: Dict[str, List[str]], 
+    pkg_dist_map: Mapping[str, List[str]], 
     batch_hw_cache: Optional[GpuInfo]
 ) -> Tuple[str, bool]:
     """Orchestrates batch repository analysis and returns (report_text, is_clean)."""
@@ -4287,7 +4353,7 @@ def generate_batch_analysis_report(
 
 
 def generate_universal_manifest(
-    repo_map: RepoEnvironmentMap, frozen_env: Dict[str, str], pkg_dist_map: Dict[str, List[str]]
+    repo_map: RepoEnvironmentMap, frozen_env: Dict[str, str], pkg_dist_map: Mapping[str, List[str]]
 ) -> str:
     """Generates content string for universal manifest."""
     lines = []
@@ -4335,7 +4401,7 @@ def generate_universal_manifest(
 def apply_output_to_notebook(
     scan_res: NotebookScanResult, 
     frozen_env: Dict[str, str], 
-    pkg_dist_map: Dict[str, List[str]], 
+    pkg_dist_map: Mapping[str, List[str]], 
     batch_hw_cache: Optional[GpuInfo], 
     suffix: Optional[str] = None, 
     in_place: bool = False,
@@ -4413,7 +4479,7 @@ def run_batch_pipeline(
     target_batch_dir: str, 
     args: argparse.Namespace, 
     frozen_env: Dict[str, str], 
-    pkg_dist_map: Dict[str, List[str]], 
+    pkg_dist_map: Mapping[str, List[str]], 
     batch_hw_cache: Optional[GpuInfo],
     precomputed_repo_map: Optional[RepoEnvironmentMap] = None
 ) -> None:
@@ -4492,7 +4558,7 @@ def run_single_file_pipeline(
     args: argparse.Namespace, 
     frozen_env: Dict[str, str], 
     raw_full_freeze: List[str],
-    pkg_dist_map: Dict[str, List[str]],
+    pkg_dist_map: Mapping[str, List[str]],
     precomputed_gpu_info: Optional[GpuInfo] = None
 ) -> None:
     """Executes single-notebook analysis or live IPython kernel history extraction."""
@@ -4651,8 +4717,9 @@ def run_single_file_pipeline(
 
 def main() -> None:
     """CLI entrypoint and dispatch router for single notebook or batch analysis modes."""
-    resolve_local_module.cache_clear()
-    build_manifest_entries.cache_clear()
+    _configure_console()
+    resolve_local_module.cache_clear()  # type: ignore[attr-defined]  # attached by _memoize_for_run
+    build_manifest_entries.cache_clear()  # type: ignore[attr-defined]
 
     parser = argparse.ArgumentParser(description="Generate environment lockfiles for Jupyter Notebooks.")
     parser.add_argument("notebook", nargs="?", help="Path to target .ipynb file or directory (when using --batch).")

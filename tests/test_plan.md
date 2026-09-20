@@ -274,6 +274,7 @@ Each item was written test-first: the test was confirmed failing against the pri
 - [x] Batch aggregate validation: grouping across notebooks, deterministic machine-independent JSON, clean and analysis-only cases (`test_drift_check.py`).
 - [x] `tests/runners/test_raw_installs.py` (Docker, common tier). Hermetic: a wheel built by hand, served from a local HTTP server, `PIP_NO_INDEX=1`, a real Jupyter kernel. Four scenarios (explicit path, inferred URL, unreachable source, inferred local path), each generating a locked notebook, removing the package, verifying it is absent, then executing the notebook in a fresh kernel. It prints the observed evidence for every check and ends with a per-scenario summary. Confirmed to fail against the pre-fix code.
 - [x] `e2e_harness.py`: `interactive_kernel(quiet=True)` discards the kernel process's own stderr (the TCP-encryption warning). `run_suite` sets `PIP_DISABLE_PIP_VERSION_CHECK=1` for every container to silence pip's upgrade notice.
+- [x] Module hygiene (`test_module_hygiene.py`): importing leaves streams and handlers untouched, `_configure_console` is idempotent, and a failed OpenCV probe falls back and logs at debug. The constants guard is `test_constants.py`.
 - [ ] Not covered: the fix-and-regenerate loop against a real environment in the Docker tier (checked by hand: after a yanked pin is replaced and `--in-place` is re-run, the baseline resets and check-drift exits 0); git URLs (need a network or a local git server); raw installs under check-drift (nothing is checked for them yet).
 
 ---
