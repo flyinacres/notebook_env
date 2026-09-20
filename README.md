@@ -157,7 +157,7 @@ python notebook_env.py --batch ./course_materials --output-dir ./locked_notebook
 
 This mirrors your folder structure under the target directory, so two notebooks with the same filename in different subfolders (`week1/pipeline.ipynb` and `week2/pipeline.ipynb`) won't overwrite each other. One limitation worth knowing: only the notebook itself gets copied there, not any data files or local `.py` modules sitting alongside it. If your notebook reads a file with a relative path (like `pd.read_csv("data/sales.csv")`), that read will fail from the new location unless you copy those files over yourself. If you want the output to stay directly runnable without extra steps, leave `--output-dir` off and let it sit alongside the source instead.
 
-There are a few more options for this mode. See `DEVELOPMENT.md` if you need those — they're less commonly needed and more worth understanding in detail before using.
+There are a few more options for this mode. See `development.md` if you need those — they're less commonly needed and more worth understanding in detail before using.
 
 When you write files (`--output`, `--in-place` or `--output-dir`), the tool also checks every pinned package against PyPI as it goes, and finishes with a **batch dependency validation** section. Each problem is listed once, with the notebooks it affects, so forty notebooks pinning the same withdrawn release show up as one finding rather than forty. With `--format json` the same information is available as a `validation` block. It never changes the tool's exit code.
 
@@ -185,16 +185,18 @@ To update a notebook after fixing a problem, fix the package in your own environ
 
 Being upfront about this rather than letting you discover it the hard way:
 
-- If a package is loaded by name from a variable (rather than written directly, e.g. `import pandas`), and that variable's value isn't obvious from reading the code, the tool can't figure out what it is.
-- If your notebook adds a folder to its search path at runtime (`sys.path.append(...)`) and then imports individual files from it directly, those imports may get flagged as missing packages even though they're really local files. Importing the folder itself as a package (`from my_folder import my_module`) is recognized correctly; it's specifically the "add to search path, then import the file directly" style that isn't.
+- If a package is loaded by name from a variable (rather than written directly, e.g. `import pandas`), and that variable's value isn't obvious from reading the code, the tool can't figure out what it is, and it flags a warning rather than guessing.
+- If your notebook adds a folder to its search path at runtime (`sys.path.append(...)`) and then imports individual files from it directly, those imports may get flagged as missing packages even though they're really local files. This applies when you run the tool against a saved file or a batch of notebooks; pasting it into a live notebook ("Paste mode" below) handles it automatically, because the running session already knows about the folder. Importing the folder itself as a package (`from my_folder import my_module`) is recognized correctly; it's specifically the "add to search path, then import the file directly" style that isn't.
 - A specific, less common style of import (`from . import something`) isn't detected at all.
-- It only checks packages you import directly — not the packages _those_ packages depend on internally. Those can still change version on their own between installs.
-- Packages that come from somewhere other than PyPI (a git address, a web link, a local folder) are installed as written. The tool can't check whether they're still reachable or whether they changed later, and it doesn't look at what they depend on.
+- It pins only the packages you import directly, not the packages those depend on internally, so those can still change version on their own between installs. The checks do look through those dependencies for conflicts and withdrawn releases, but the tool can't pin them.
+- A package from a git address or web link is recorded and reinstalled as written, but the tool can't check that it's still reachable or unchanged, and it doesn't look at what that package depends on. A package you installed by hand from a local folder or file isn't recorded, because a path only exists on your computer: the setup cell notes it, but can't install it for anyone else.
 - It confirms a GPU was _available_, not that every part of the notebook actually used it.
 - It can't automatically fix a hardware-specific build mismatch (like a GPU version tag) — only flag it.
+- Some libraries choose an optional add-on internally based on a setting (for example `holoviews.extension("bokeh")` quietly pulls in `bokeh`). That dependency never appears as an `import` in your notebook, so the tool can't see it.
+- The later re-check (`--check-drift`) only reads package information. It can't tell whether your code still works with a newer version, and it doesn't look for security vulnerabilities.
 - Running it against a saved file vs. pasting it into a live notebook can genuinely give different answers (see "Two ways to run it" above) — they're not interchangeable, and picking the wrong one for your situation can produce a misleading result.
 
-For the full technical list, ongoing work, and known internal bugs being tracked, see `DEVELOPMENT.md` — that document is written for whoever's actively developing this tool, not for day-to-day users, so it's denser than this guide on purpose.
+For the full technical list, ongoing work, and known internal bugs being tracked, see `development.md` — that document is written for whoever's actively developing this tool, not for day-to-day users, so it's denser than this guide on purpose.
 
 ---
 
@@ -211,4 +213,4 @@ For the full technical list, ongoing work, and known internal bugs being tracked
 
 ---
 
-_For the technical roadmap, in-progress work, and known internal bugs, see `DEVELOPMENT.md`._
+_For the technical roadmap, in-progress work, and known internal bugs, see `development.md`._

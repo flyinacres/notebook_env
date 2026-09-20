@@ -84,11 +84,9 @@ if not logger.handlers:
 # SYSTEM CONSTANTS & CONFIGURATION DEFAULTS
 # =====================================================================
 
-DEFAULT_PINNED_MANIFEST_NAME: str = "pinned_requirements.txt"
 DEFAULT_UNIVERSAL_MANIFEST_NAME: str = "requirements-all.txt"
 
 HELP_URL: str = "https://github.com/flyinacres/notebook_env/blob/main/HELP.md"
-README_URL: str = "https://github.com/flyinacres/notebook_env/blob/main/README.md"
 
 # Fixed first line of the generated Cell 1. Shared by the generator and by is_prior_setup_cell,
 # so what the tool writes and what it later recognizes as its own cannot drift apart.
@@ -113,7 +111,70 @@ class StatusLabel:
     CORRUPTED = "corrupted"
     ERROR = "error"
     UNKNOWN = "unknown"
-    MISSING_METADATA = "missing metadata"
+
+
+# Names shared by the drift/validation code and the JSON it emits. Plain string constants (like
+# StatusLabel above), not Enum members, so values embed in the manifest literal, serialize to JSON and
+# format into messages as ordinary strings on every supported Python version. Using the constant
+# instead of a bare literal turns a typo into an immediate AttributeError instead of a finding that
+# silently never matches.
+
+class Signal:
+    """DriftFinding.signal values."""
+    CONFLICT = "conflict"
+    YANKED = "yanked"
+    REMOVED = "removed"
+    NOT_FOUND_ON_PYPI = "not_found_on_pypi"
+    STALE = "stale"
+    MAJOR_BUMP = "major_bump"
+    UNSUPPORTED_PYTHON = "unsupported_python"
+    UNVERIFIABLE_CUSTOM_INDEX = "unverifiable_custom_index"
+    CHECK_ERROR = "check_error"
+    TAMPERED = "tampered"
+    LOCAL_MODULE_MISSING = "local_module_missing"
+    LOCAL_MODULE_UNVERIFIABLE = "local_module_unverifiable"
+
+
+class Severity:
+    """DriftFinding.severity values. NOTICE is a known custom source demoted at check time."""
+    CONFIRMED = "confirmed"
+    HEURISTIC = "heuristic"
+    ERROR = "error"
+    NOTICE = "notice"
+
+
+class BaselineStatus:
+    """DriftFinding.baseline_status values (check-drift against a generation-time baseline)."""
+    NEW = "new"
+    KNOWN = "known"
+    NOT_CHECKED_AT_GENERATION = "not_checked_at_generation"
+
+
+class DependencyStatus:
+    """DependencyEntry.status values."""
+    PINNED = "pinned"
+    GUARDED = "guarded"
+    PLATFORM_PSEUDO_MODULE = "platform_pseudo_module"
+    BUILD_TOOL = "build_tool"
+    LOCAL_MODULE = "local_module"
+    AUXILIARY_TOOL = "auxiliary_tool"
+    WRITEFILE_SCRIPT = "writefile_script"
+    DIRECT_REFERENCE = "direct_reference"
+    SYSTEM_PATH = "system_path"
+
+
+class FetchStatus:
+    """Outcome of a PyPI metadata fetch."""
+    FOUND = "found"
+    NOT_FOUND = "not_found"
+    NETWORK_ERROR = "network_error"
+
+
+class ReportKind:
+    """DriftCheckReport.kind values."""
+    CHECK = "check"
+    VALIDATION = "validation"
+
 
 @dataclass
 class DiagnosticEvent:
@@ -231,7 +292,7 @@ class DependencyEntry:
     version: str = ""
     flags: List[str] = field(default_factory=list)
     source: str = "import"
-    status: str = "pinned"
+    status: str = DependencyStatus.PINNED
     is_comment: bool = False
     comment_text: str = ""
     anchor: str = ""
@@ -570,10 +631,6 @@ TRANSITIVE_FRAMEWORK_MAP: Dict[str, str] = {
     "timm": "torch",
     "keras": "tensorflow",
     "flax": "jax",
-}
-
-FRAMEWORK_NAME_TO_CANONICAL: Dict[str, str] = {
-    v: k for k, v in CANONICAL_TO_FRAMEWORK_DISPLAY.items()
 }
 
 STD_LIB: Set[str] = set(sys.stdlib_module_names) if hasattr(sys, 'stdlib_module_names') else {
@@ -1320,7 +1377,7 @@ def harvest_cell_magics_and_commands(
     for occ in occurrences:
         harvested_packages.add(occ.name)
 
-    for pkg_key, occ in resolved_occs.items():
+    for occ in resolved_occs.values():
         scoped_flags[occ.name] = occ.flags
         i = 0
         while i < len(occ.flags):
@@ -1518,7 +1575,7 @@ def build_auxiliary_tool_entries(
     aux_entries.append(DependencyEntry(
         is_comment=True,
         source="pip_command",
-        status="auxiliary_tool",
+        status=DependencyStatus.AUXILIARY_TOOL,
         comment_text="\n# --- AUXILIARY TOOL INSTALLS (harvested from cell magics) ---"
     ))
     for tool in unimported_tools:
@@ -1530,7 +1587,7 @@ def build_auxiliary_tool_entries(
             aux_entries.append(DependencyEntry(
                 name=tool,
                 source="pip_command",
-                status="auxiliary_tool",
+                status=DependencyStatus.AUXILIARY_TOOL,
                 is_comment=True,
                 comment_text=f"# {tool}  (installed via cell command; {direct_reference_note(direct_url)})"
             ))
@@ -1539,7 +1596,7 @@ def build_auxiliary_tool_entries(
                 name=tool,
                 version=ver,
                 source="pip_command",
-                status="auxiliary_tool",
+                status=DependencyStatus.AUXILIARY_TOOL,
                 is_comment=True,
                 comment_text=f"# {matched_pin}  (installed via cell command; not directly imported in Python code)"
             ))
@@ -1548,7 +1605,7 @@ def build_auxiliary_tool_entries(
                 name=tool,
                 version="",
                 source="pip_command",
-                status="auxiliary_tool",
+                status=DependencyStatus.AUXILIARY_TOOL,
                 is_comment=True,
                 comment_text=f"# {tool}  (installed via cell command; not found in active env)"
             ))
@@ -1575,7 +1632,7 @@ def build_writefile_tool_entries(
     entries.append(DependencyEntry(
         is_comment=True,
         source="writefile_script",
-        status="writefile_script",
+        status=DependencyStatus.WRITEFILE_SCRIPT,
         comment_text="\n# --- WRITEFILE SCRIPT DEPENDENCIES ---"
     ))
     for pkg in script_only:
@@ -1588,7 +1645,7 @@ def build_writefile_tool_entries(
             entries.append(DependencyEntry(
                 name=pypi_name,
                 source="writefile_script",
-                status="writefile_script",
+                status=DependencyStatus.WRITEFILE_SCRIPT,
                 is_comment=True,
                 comment_text=f"# {pypi_name}  (imported inside script generated via %%writefile; {direct_reference_note(direct_url)})"
             ))
@@ -1597,7 +1654,7 @@ def build_writefile_tool_entries(
                 name=pypi_name,
                 version=ver,
                 source="writefile_script",
-                status="writefile_script",
+                status=DependencyStatus.WRITEFILE_SCRIPT,
                 is_comment=True,
                 comment_text=f"# {matched_pin}  (imported inside script generated via %%writefile)"
             ))
@@ -1606,7 +1663,7 @@ def build_writefile_tool_entries(
                 name=pypi_name,
                 version="",
                 source="writefile_script",
-                status="writefile_script",
+                status=DependencyStatus.WRITEFILE_SCRIPT,
                 is_comment=True,
                 comment_text=f"# {pypi_name}  (imported inside script generated via %%writefile; not found in active env)"
             ))
@@ -1626,7 +1683,7 @@ def resolve_pypi_package_and_extras(
     if imp in PLATFORM_PSEUDO_MODULES:
         return DependencyEntry(
             name=imp,
-            status="platform_pseudo_module",
+            status=DependencyStatus.PLATFORM_PSEUDO_MODULE,
             is_comment=True,
             comment_text=f"# {imp} (provided automatically by platform like Colab/Databricks; no install needed)"
         ), None
@@ -1634,7 +1691,7 @@ def resolve_pypi_package_and_extras(
     if imp in BUILD_AND_PACKAGING_TOOLS:
         return DependencyEntry(
             name=imp,
-            status="build_tool",
+            status=DependencyStatus.BUILD_TOOL,
             is_comment=True,
             comment_text=f"# {imp} (core Python build/packaging tool; excluded from requirement lockfiles)"
         ), None
@@ -1643,7 +1700,7 @@ def resolve_pypi_package_and_extras(
     if resolved_anchor:
         return DependencyEntry(
             name=imp,
-            status="local_module",
+            status=DependencyStatus.LOCAL_MODULE,
             is_comment=True,
             comment_text=f"# {imp} (local folder/file next to notebook; ensure sibling files were shared)",
             anchor=resolved_anchor
@@ -1678,7 +1735,7 @@ def resolve_pypi_package_and_extras(
             return DependencyEntry(
                 name=pypi_name,
                 version="",
-                status="guarded",
+                status=DependencyStatus.GUARDED,
                 is_comment=True,
                 comment_text=f"# {pypi_name} (optional or conditional dependency inside try/except block; {direct_reference_note(direct_url)})"
             ), None
@@ -1686,14 +1743,14 @@ def resolve_pypi_package_and_extras(
             return DependencyEntry(
                 name=pypi_name,
                 version=pin_version or "",
-                status="guarded",
+                status=DependencyStatus.GUARDED,
                 is_comment=True,
                 comment_text=f"# {matched_pin} (optional or conditional dependency inside try/except block)"
             ), None
         return DependencyEntry(
             name=pypi_name,
             version="",
-            status="guarded",
+            status=DependencyStatus.GUARDED,
             is_comment=True,
             comment_text=f"# {pypi_name} (optional or conditional dependency inside try/except block)"
         ), None
@@ -1702,7 +1759,7 @@ def resolve_pypi_package_and_extras(
         return DependencyEntry(
             name=pypi_name,
             version="",
-            status="pinned",
+            status=DependencyStatus.PINNED,
             is_comment=True,
             comment_text=f"# {pypi_name} (imported as '{imp}'; not found via pip-freeze or local file scan -- verify before assuming this is truly missing)"
         ), None
@@ -1712,13 +1769,13 @@ def resolve_pypi_package_and_extras(
         if is_local_direct_url(direct_url):
             return DependencyEntry(
                 name=pypi_name,
-                status="system_path",
+                status=DependencyStatus.SYSTEM_PATH,
                 is_comment=True,
                 comment_text=f"# {pypi_name} (imported as '{imp}'; {note})"
             ), None
         return DependencyEntry(
             name=pypi_name,
-            status="direct_reference",
+            status=DependencyStatus.DIRECT_REFERENCE,
             is_comment=True,
             comment_text=f"# {pypi_name} (imported as '{imp}'; {note})",
             direct_url=direct_url
@@ -1751,9 +1808,9 @@ def resolve_pypi_package_and_extras(
             version=ver_part,
             detail=notice_detail
         )
-        return DependencyEntry(name=promoted_name, version=ver_part, status="pinned"), promo
+        return DependencyEntry(name=promoted_name, version=ver_part, status=DependencyStatus.PINNED), promo
 
-    return DependencyEntry(name=pkg_part, version=ver_part, status="pinned"), None
+    return DependencyEntry(name=pkg_part, version=ver_part, status=DependencyStatus.PINNED), None
 
 
 @_memoize_for_run
@@ -2072,25 +2129,25 @@ def _fetch_pypi_json(url: str) -> Tuple[str, Optional[Dict[str, Any]], Optional[
     req = urllib.request.Request(url, headers={"User-Agent": PYPI_USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=PYPI_REQUEST_TIMEOUT) as resp:
-            return "found", json.loads(resp.read()), None
+            return FetchStatus.FOUND, json.loads(resp.read()), None
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            return "not_found", None, None
-        return "network_error", None, f"HTTP {e.code}"
+            return FetchStatus.NOT_FOUND, None, None
+        return FetchStatus.NETWORK_ERROR, None, f"HTTP {e.code}"
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
-        return "network_error", None, str(e)
+        return FetchStatus.NETWORK_ERROR, None, str(e)
 
 
 @_memoize_for_run
 def fetch_pypi_version_metadata(name: str, version: str) -> PypiVersionMetadata:
     """Looks up one exact pinned release. Cache key: (name, version) -- invariant across notebooks."""
     status, payload, error_detail = _fetch_pypi_json(f"https://pypi.org/pypi/{name}/{version}/json")
-    if status != "found":
+    if status != FetchStatus.FOUND:
         return PypiVersionMetadata(status=status, error_detail=error_detail)
 
     info = payload.get("info", {})
     return PypiVersionMetadata(
-        status="found",
+        status=FetchStatus.FOUND,
         requires_dist=info.get("requires_dist") or [],
         requires_python=info.get("requires_python"),
         yanked=info.get("yanked", False),
@@ -2103,7 +2160,7 @@ def fetch_pypi_version_metadata(name: str, version: str) -> PypiVersionMetadata:
 def fetch_pypi_package_metadata(name: str) -> PypiPackageMetadata:
     """Looks up a package's project-level data (latest version, full release history). Cache key: name alone."""
     status, payload, error_detail = _fetch_pypi_json(f"https://pypi.org/pypi/{name}/json")
-    if status != "found":
+    if status != FetchStatus.FOUND:
         return PypiPackageMetadata(status=status, error_detail=error_detail)
 
     info = payload.get("info", {})
@@ -2117,7 +2174,7 @@ def fetch_pypi_package_metadata(name: str) -> PypiPackageMetadata:
         }
 
     return PypiPackageMetadata(
-        status="found",
+        status=FetchStatus.FOUND,
         latest_version=info.get("version"),
         releases=releases,
     )
@@ -2269,39 +2326,39 @@ def check_yanked_or_removed(name: str, version: str) -> List[DriftFinding]:
     name, _ = _split_pin_name(name)
     version_meta = fetch_pypi_version_metadata(name, version)
 
-    if version_meta.status == "network_error":
+    if version_meta.status == FetchStatus.NETWORK_ERROR:
         return [DriftFinding(
-            package=name, version=version, signal="check_error", severity="error",
+            package=name, version=version, signal=Signal.CHECK_ERROR, severity=Severity.ERROR,
             message=f"Could not check {name}=={version} against PyPI: {version_meta.error_detail}",
         )]
 
-    if version_meta.status == "found":
+    if version_meta.status == FetchStatus.FOUND:
         if version_meta.yanked:
             reason = f" ({version_meta.yanked_reason})" if version_meta.yanked_reason else ""
             return [DriftFinding(
-                package=name, version=version, signal="yanked", severity="confirmed",
+                package=name, version=version, signal=Signal.YANKED, severity=Severity.CONFIRMED,
                 message=f"{name}=={version} has been yanked from PyPI{reason}",
                 details={"yanked_reason": version_meta.yanked_reason},
             )]
         return []
 
-    # version_meta.status == "not_found": disambiguate version-removed vs. project-removed
+    # version_meta.status == FetchStatus.NOT_FOUND: disambiguate version-removed vs. project-removed
     package_meta = fetch_pypi_package_metadata(name)
-    if package_meta.status == "network_error":
+    if package_meta.status == FetchStatus.NETWORK_ERROR:
         return [DriftFinding(
-            package=name, version=version, signal="check_error", severity="error",
+            package=name, version=version, signal=Signal.CHECK_ERROR, severity=Severity.ERROR,
             message=f"Could not check {name}=={version} against PyPI: {package_meta.error_detail}",
         )]
-    if package_meta.status == "found":
+    if package_meta.status == FetchStatus.FOUND:
         return [DriftFinding(
-            package=name, version=version, signal="removed", severity="confirmed",
+            package=name, version=version, signal=Signal.REMOVED, severity=Severity.CONFIRMED,
             message=f"{name}=={version} no longer exists on PyPI, though {name} itself is still published",
         )]
 
     env_hint = _pip_env_hint()
     local_hint = _local_find_links_artifact_hint(name, version)
     return [DriftFinding(
-        package=name, version=version, signal="not_found_on_pypi", severity="confirmed",
+        package=name, version=version, signal=Signal.NOT_FOUND_ON_PYPI, severity=Severity.CONFIRMED,
         message=(
             f"{name} could not be found on PyPI. It may be a private, local-only, or custom-index "
             f"package that ships alongside this notebook (if so, no action needed), or the name may "
@@ -2315,12 +2372,12 @@ def check_staleness(name: str, version: str) -> List[DriftFinding]:
     """Heuristic: no release anywhere in the project within STALE_THRESHOLD_DAYS."""
     name, _ = _split_pin_name(name)
     package_meta = fetch_pypi_package_metadata(name)
-    if package_meta.status == "network_error":
+    if package_meta.status == FetchStatus.NETWORK_ERROR:
         return [DriftFinding(
-            package=name, version=version, signal="check_error", severity="error",
+            package=name, version=version, signal=Signal.CHECK_ERROR, severity=Severity.ERROR,
             message=f"Could not check {name} for staleness: {package_meta.error_detail}",
         )]
-    if package_meta.status != "found" or not package_meta.releases:
+    if package_meta.status != FetchStatus.FOUND or not package_meta.releases:
         return []
 
     upload_times = []
@@ -2341,7 +2398,7 @@ def check_staleness(name: str, version: str) -> List[DriftFinding]:
         return []
 
     return [DriftFinding(
-        package=name, version=version, signal="stale", severity="heuristic",
+        package=name, version=version, signal=Signal.STALE, severity=Severity.HEURISTIC,
         message=f"{name} has had no release in {age_days} days (last: {most_recent.date().isoformat()}) -- worth reviewing whether it's still maintained",
         details={"days_since_last_release": age_days, "last_release_date": most_recent.date().isoformat()},
     )]
@@ -2351,12 +2408,12 @@ def check_major_bump(name: str, version: str) -> List[DriftFinding]:
     """Heuristic: a newer major version exists than the one pinned -- worth reviewing, not a failure."""
     name, _ = _split_pin_name(name)
     package_meta = fetch_pypi_package_metadata(name)
-    if package_meta.status == "network_error":
+    if package_meta.status == FetchStatus.NETWORK_ERROR:
         return [DriftFinding(
-            package=name, version=version, signal="check_error", severity="error",
+            package=name, version=version, signal=Signal.CHECK_ERROR, severity=Severity.ERROR,
             message=f"Could not check {name} for a newer major version: {package_meta.error_detail}",
         )]
-    if package_meta.status != "found" or not package_meta.latest_version:
+    if package_meta.status != FetchStatus.FOUND or not package_meta.latest_version:
         return []
     try:
         pinned_v, latest_v = Version(version), Version(package_meta.latest_version)
@@ -2366,7 +2423,7 @@ def check_major_bump(name: str, version: str) -> List[DriftFinding]:
         return []
 
     return [DriftFinding(
-        package=name, version=version, signal="major_bump", severity="heuristic",
+        package=name, version=version, signal=Signal.MAJOR_BUMP, severity=Severity.HEURISTIC,
         message=f"{name}=={version} is on major version {pinned_v.major}; {package_meta.latest_version} (major {latest_v.major}) is available -- worth reviewing",
         details={"latest_version": package_meta.latest_version},
     )]
@@ -2376,12 +2433,12 @@ def check_python_support(name: str, version: str, required_python: Dict[str, int
     """Confirms the pinned release declares support for the notebook's REQUIRED_PYTHON."""
     name, _ = _split_pin_name(name)
     version_meta = fetch_pypi_version_metadata(name, version)
-    if version_meta.status == "network_error":
+    if version_meta.status == FetchStatus.NETWORK_ERROR:
         return [DriftFinding(
-            package=name, version=version, signal="check_error", severity="error",
+            package=name, version=version, signal=Signal.CHECK_ERROR, severity=Severity.ERROR,
             message=f"Could not check {name}=={version} for Python support: {version_meta.error_detail}",
         )]
-    if version_meta.status != "found" or not version_meta.requires_python:
+    if version_meta.status != FetchStatus.FOUND or not version_meta.requires_python:
         return []  # nothing declared -> nothing to confirm against; not a finding
 
     target = f"{required_python.get('major')}.{required_python.get('minor')}"
@@ -2393,7 +2450,7 @@ def check_python_support(name: str, version: str, required_python: Dict[str, int
     if supported:
         return []
     return [DriftFinding(
-        package=name, version=version, signal="unsupported_python", severity="confirmed",
+        package=name, version=version, signal=Signal.UNSUPPORTED_PYTHON, severity=Severity.CONFIRMED,
         message=f"{name}=={version} declares requires-python {version_meta.requires_python}, which does not cover Python {target}",
         details={"declared_requires_python": version_meta.requires_python, "notebook_python": target},
     )]
@@ -2450,7 +2507,7 @@ class _PyPIResolutionProvider(AbstractProvider):
         name = reqs[0].name
         extras = frozenset(reqs[0].extras)  # identical across reqs: extras are part of the identifier
         pkg_meta = fetch_pypi_package_metadata(name)
-        if pkg_meta.status != "found":
+        if pkg_meta.status != FetchStatus.FOUND:
             return []
         excluded = {c.version for c in incompatibilities[identifier]}
         matches = []
@@ -2482,7 +2539,7 @@ class _PyPIResolutionProvider(AbstractProvider):
             envs = [_marker_environment(self.required_python, extra=None)]  # base install: no extras active
 
         meta = fetch_pypi_version_metadata(candidate.name, candidate.version)
-        if meta.status != "found":
+        if meta.status != FetchStatus.FOUND:
             return deps
         for raw in meta.requires_dist:
             try:
@@ -2513,7 +2570,7 @@ def resolve_transitive_graph(
         if _has_local_version_identifier(version):
             continue  # not on PyPI by definition -- can't be a root requirement here
         name, extras = _split_pin_extras(raw_name)
-        if fetch_pypi_package_metadata(name).status != "found":
+        if fetch_pypi_package_metadata(name).status != FetchStatus.FOUND:
             # Custom-index/local-only package: not resolvable via this PyPI-only
             # provider, and not a real conflict -- check_yanked_or_removed already
             # reports on it directly (not_found_on_pypi), so silently excluding it
@@ -2535,7 +2592,7 @@ def resolve_transitive_graph(
             DriftFinding(
                 package=getattr(cause.requirement, "name", "?"),
                 version=str(getattr(cause.requirement, "specifier", "")),
-                signal="conflict", severity="confirmed",
+                signal=Signal.CONFLICT, severity=Severity.CONFIRMED,
                 message=(
                     f"Unresolvable dependency graph: {cause.requirement} required by "
                     f"{cause.parent.name if cause.parent else 'a direct pin'}"
@@ -2547,7 +2604,7 @@ def resolve_transitive_graph(
         return None, findings
     except Exception as e:
         return None, [DriftFinding(
-            package="", version="", signal="check_error", severity="error",
+            package="", version="", signal=Signal.CHECK_ERROR, severity=Severity.ERROR,
             message=f"Transitive resolution failed unexpectedly: {type(e).__name__}: {e}",
         )]
 
@@ -2598,7 +2655,7 @@ def run_pin_checks(dependencies: List[Dict[str, Any]], python_version: Dict[str,
             continue
         if _has_local_version_identifier(version):
             findings.append(DriftFinding(
-                package=name, version=version, signal="unverifiable_custom_index", severity="heuristic",
+                package=name, version=version, signal=Signal.UNVERIFIABLE_CUSTOM_INDEX, severity=Severity.HEURISTIC,
                 message=f"{name}=={version} has a local version identifier -- installed from a custom index, "
                         f"not PyPI, so PyPI-based checks (yanked/removed/staleness/major-bump/python-support) "
                         f"cannot be run against it.",
@@ -2623,7 +2680,8 @@ BASELINE_FORMAT_VERSION = 1
 
 # Per-release facts: fixed for a given package version.
 _PER_VERSION_SIGNALS = frozenset({
-    "yanked", "removed", "not_found_on_pypi", "unsupported_python", "unverifiable_custom_index",
+    Signal.YANKED, Signal.REMOVED, Signal.NOT_FOUND_ON_PYPI, Signal.UNSUPPORTED_PYTHON,
+    Signal.UNVERIFIABLE_CUSTOM_INDEX,
 })
 
 
@@ -2633,16 +2691,16 @@ def finding_baseline_key(finding: DriftFinding) -> Optional[List[str]]:
     signal = finding.signal
     if signal in _PER_VERSION_SIGNALS:
         return [signal, finding.package, finding.version]
-    if signal == "stale":
+    if signal == Signal.STALE:
         return [signal, finding.package]  # the day count changes every run; the problem doesn't
-    if signal == "major_bump":
+    if signal == Signal.MAJOR_BUMP:
         latest = str(finding.details.get("latest_version", ""))
         try:
             major = str(Version(latest).major)
         except InvalidVersion:
             major = latest
         return [signal, finding.package, major]  # a still-newer major is a different finding
-    if signal == "conflict":
+    if signal == Signal.CONFLICT:
         return [signal, finding.package, finding.version, str(finding.details.get("parent", ""))]
     return None
 
@@ -2660,7 +2718,7 @@ def build_baseline(findings: List[DriftFinding]) -> Dict[str, Any]:
     keys: List[List[str]] = []
     errored: Set[str] = set()
     for f in findings:
-        if f.severity == "error":
+        if f.severity == Severity.ERROR:
             errored.add(f.package)
             continue
         key = finding_baseline_key(f)
@@ -2698,17 +2756,17 @@ def classify_against_baseline(findings: List[DriftFinding], manifest: SteadyPyMa
             continue
         canon = canonicalize_pkg_name(f.package)
         if tuple(key) in known:
-            f.baseline_status = "known"
-            if f.signal == "not_found_on_pypi":
+            f.baseline_status = BaselineStatus.KNOWN
+            if f.signal == Signal.NOT_FOUND_ON_PYPI:
                 # Already true at generation, so this is a custom source (private or custom-index
                 # package), an expected state rather than drift. Shown as a notice, never fails
                 # the check. The same finding appearing NEW means a package that was on PyPI has
                 # vanished, which stays a confirmed failure.
-                f.severity = "notice"
+                f.severity = Severity.NOTICE
         elif canon in errored or (graph_check_failed and canon not in direct):
-            f.baseline_status = "not_checked_at_generation"
+            f.baseline_status = BaselineStatus.NOT_CHECKED_AT_GENERATION
         else:
-            f.baseline_status = "new"
+            f.baseline_status = BaselineStatus.NEW
     return True
 
 
@@ -2730,7 +2788,7 @@ class DriftCheckReport:
     target: str
     checked_at: str
     manifest: SteadyPyManifest
-    kind: str = "check"  # "validation" | "check"
+    kind: str = ReportKind.CHECK  # ReportKind.VALIDATION | ReportKind.CHECK
     confirmed: List[DriftFinding] = field(default_factory=list)
     heuristic: List[DriftFinding] = field(default_factory=list)
     errors: List[DriftFinding] = field(default_factory=list)
@@ -2745,10 +2803,10 @@ class DriftCheckReport:
     def has_actionable_heuristic(self) -> bool:
         """A heuristic finding that should fail a check: anything not already known at generation.
         Without a baseline nothing is known, so every heuristic finding counts."""
-        return any(f.baseline_status != "known" for f in self.heuristic)
+        return any(f.baseline_status != BaselineStatus.KNOWN for f in self.heuristic)
 
     def baseline_counts(self) -> Dict[str, int]:
-        counts = {"new": 0, "known": 0, "not_checked_at_generation": 0}
+        counts = {BaselineStatus.NEW: 0, BaselineStatus.KNOWN: 0, BaselineStatus.NOT_CHECKED_AT_GENERATION: 0}
         for f in self.confirmed + self.heuristic + self.notices:
             if f.baseline_status in counts:
                 counts[f.baseline_status] += 1
@@ -2776,7 +2834,7 @@ class DriftCheckReport:
             "heuristic": [f.to_dict() for f in self.heuristic],
             "errors": [f.to_dict() for f in self.errors],
         }
-        if self.kind == "check":
+        if self.kind == ReportKind.CHECK:
             out["notices"] = [f.to_dict() for f in self.notices]
             out["baseline"] = {"recorded": True, **self.baseline_counts()} if self.baseline_recorded else {"recorded": False}
         return out
@@ -2788,7 +2846,7 @@ def build_drift_check_report(
     """Buckets a flat findings list into confirmed/heuristic/error by severity. For a check
     (not generation-time validation), findings are first classified against the manifest's
     baseline, and each bucket lists new findings before known ones."""
-    baseline_recorded = classify_against_baseline(findings, manifest) if kind == "check" else False
+    baseline_recorded = classify_against_baseline(findings, manifest) if kind == ReportKind.CHECK else False
     report = DriftCheckReport(
         target=target,
         checked_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -2797,16 +2855,16 @@ def build_drift_check_report(
         baseline_recorded=baseline_recorded,
     )
     for f in findings:
-        if f.severity == "confirmed":
+        if f.severity == Severity.CONFIRMED:
             report.confirmed.append(f)
-        elif f.severity == "heuristic":
+        elif f.severity == Severity.HEURISTIC:
             report.heuristic.append(f)
-        elif f.severity == "notice":
+        elif f.severity == Severity.NOTICE:
             report.notices.append(f)
         else:
             report.errors.append(f)
-    report.confirmed.sort(key=lambda f: f.baseline_status == "known")  # stable: new first, known last
-    report.heuristic.sort(key=lambda f: f.baseline_status == "known")
+    report.confirmed.sort(key=lambda f: f.baseline_status == BaselineStatus.KNOWN)  # stable: new first, known last
+    report.heuristic.sort(key=lambda f: f.baseline_status == BaselineStatus.KNOWN)
     return report
 
 
@@ -2814,13 +2872,13 @@ def format_console_drift_report(report: DriftCheckReport) -> str:
     """Formats a DriftCheckReport into a human-readable stdout report string."""
     out = []
     out.append("=" * 80)
-    if report.kind == "validation":
+    if report.kind == ReportKind.VALIDATION:
         out.append("INITIAL DEPENDENCY VALIDATION")
     else:
         out.append("DEPENDENCY DRIFT CHECK")
         out.append(f"Target: {report.target}")
     out.append(f"Checked: {report.checked_at}")
-    if report.kind == "check":
+    if report.kind == ReportKind.CHECK:
         if report.baseline_recorded:
             counts = report.baseline_counts()
             unclear = counts["new"] + counts["not_checked_at_generation"]
@@ -2830,8 +2888,11 @@ def format_console_drift_report(report: DriftCheckReport) -> str:
     out.append("=" * 80 + "\n")
 
     def _line(f: DriftFinding) -> str:
-        tag = {"new": "[new] ", "known": "[known] ", "not_checked_at_generation": "[not checked at generation] "}.get(
-            f.baseline_status or "", "")
+        tag = {
+            BaselineStatus.NEW: "[new] ",
+            BaselineStatus.KNOWN: "[known] ",
+            BaselineStatus.NOT_CHECKED_AT_GENERATION: "[not checked at generation] ",
+        }.get(f.baseline_status or "", "")
         return f"  • {tag}[{f.signal}] {f.message}"
 
     if report.confirmed:
@@ -2857,7 +2918,7 @@ def format_console_drift_report(report: DriftCheckReport) -> str:
 
     out.append("-" * 80)
     if report.is_clean:
-        if report.kind == "validation":
+        if report.kind == ReportKind.VALIDATION:
             out.append("STATUS: ✅ Clean. No issues found in these pins.")
         else:
             noted = f" ({len(report.notices)} custom-source package(s) noted above)." if report.notices else ""
@@ -2883,7 +2944,7 @@ def format_json_drift_report(report: DriftCheckReport) -> str:
     payload = {
         "schema_version": SCHEMA_VERSION,
         "tool_version": TOOL_VERSION,
-        "mode": "initial_validation" if report.kind == "validation" else "check_drift",
+        "mode": "initial_validation" if report.kind == ReportKind.VALIDATION else "check_drift",
         **report.to_dict(),
     }
     return json.dumps(payload, indent=2)
@@ -2895,7 +2956,7 @@ def format_json_drift_report(report: DriftCheckReport) -> str:
 # once, with the notebooks it affects. Everything in it is deterministic (sorted, relative
 # paths, no timestamps), so two runs can be compared directly.
 
-_VALIDATION_SEVERITY_ORDER = ["confirmed", "heuristic", "error"]
+_VALIDATION_SEVERITY_ORDER = [Severity.CONFIRMED, Severity.HEURISTIC, Severity.ERROR]
 
 
 @dataclass
@@ -2928,9 +2989,9 @@ class BatchValidation:
 
     def totals(self) -> Dict[str, int]:
         return {
-            "confirmed": sum(1 for g in self.findings if g.severity == "confirmed"),
-            "heuristic": sum(1 for g in self.findings if g.severity == "heuristic"),
-            "errors": sum(1 for g in self.findings if g.severity == "error"),
+            "confirmed": sum(1 for g in self.findings if g.severity == Severity.CONFIRMED),
+            "heuristic": sum(1 for g in self.findings if g.severity == Severity.HEURISTIC),
+            "errors": sum(1 for g in self.findings if g.severity == Severity.ERROR),
         }
 
     def to_dict(self) -> Dict[str, Any]:
@@ -3112,7 +3173,7 @@ def check_local_modules(
         if anchor == "root_dir":
             if root_dir is None:
                 findings.append(DriftFinding(
-                    package=name, version="", signal="local_module_unverifiable", severity="error",
+                    package=name, version="", signal=Signal.LOCAL_MODULE_UNVERIFIABLE, severity=Severity.ERROR,
                     message=f"'{name}' was recorded via a root_dir at generation time; none was supplied "
                             f"for this check, so it can't be verified.",
                 ))
@@ -3123,7 +3184,7 @@ def check_local_modules(
 
         if not anchor_dir or not Path(anchor_dir).exists():
             findings.append(DriftFinding(
-                package=name, version="", signal="local_module_unverifiable", severity="error",
+                package=name, version="", signal=Signal.LOCAL_MODULE_UNVERIFIABLE, severity=Severity.ERROR,
                 message=f"Cannot verify '{name}': the recorded location's directory no longer exists. "
                         f"If the project was moved, re-run generation to update.",
             ))
@@ -3133,7 +3194,7 @@ def check_local_modules(
             continue
 
         findings.append(DriftFinding(
-            package=name, version="", signal="local_module_missing", severity="confirmed",
+            package=name, version="", signal=Signal.LOCAL_MODULE_MISSING, severity=Severity.CONFIRMED,
             message=f"'{name}' was originally found at {anchor_dir}; it can no longer be found there. "
                     f"Check that it will still be available to users, or re-run generation if the "
                     f"project structure changed.",
@@ -3172,7 +3233,7 @@ def run_check_drift_pipeline(target: str, output_format: str = "text", root_dir:
     recomputed_hash = manifest.verified_hash
     if recomputed_hash != stored_hash:
         findings.append(DriftFinding(
-            package="", version="", signal="tampered", severity="confirmed",
+            package="", version="", signal=Signal.TAMPERED, severity=Severity.CONFIRMED,
             message=f"Manifest hash mismatch in {target} -- it may have been hand-edited since generation.",
             details={"stored_hash": stored_hash, "recomputed_hash": recomputed_hash},
         ))
@@ -3401,9 +3462,9 @@ def generate_production_blueprint(
         if isinstance(item, DependencyEntry):
             if item.is_comment:
                 comment_lines.append(item.comment_text)
-                if item.status == "direct_reference" and item.direct_url:
+                if item.status == DependencyStatus.DIRECT_REFERENCE and item.direct_url:
                     direct_reference_specs.append(item.direct_url)
-                if item.status == "local_module" and item.anchor:
+                if item.status == DependencyStatus.LOCAL_MODULE and item.anchor:
                     local_modules_captured.append({"name": item.name, "anchor": item.anchor})
             else:
                 normalized_items.append(item.to_dict())
@@ -3469,7 +3530,7 @@ def generate_production_blueprint(
         if not name or not version:
             continue
         bare_name, _extra = _split_pin_name(name)
-        if _has_local_version_identifier(version) or fetch_pypi_package_metadata(bare_name).status != "found":
+        if _has_local_version_identifier(version) or fetch_pypi_package_metadata(bare_name).status != FetchStatus.FOUND:
             custom_sourced_names.append(name)
 
     # Installed from a remote direct reference with no matching install line in the
@@ -3524,7 +3585,7 @@ for raw_idx, raw_spec in enumerate(STEADY_PY_MANIFEST.get("raw_installs", []), s
 total_deps += len(STEADY_PY_MANIFEST.get("raw_installs", []))
 '''
 
-    drift_report = build_drift_check_report("", manifest, generation_findings, kind="validation")
+    drift_report = build_drift_check_report("", manifest, generation_findings, kind=ReportKind.VALIDATION)
 
     freeze_block_code = ""
     if full_freeze_lines:
@@ -3974,7 +4035,7 @@ def analyze_batch_repository(
                 pypi_name = dep.name or (dep.comment_text.split()[1] if len(dep.comment_text.split()) > 1 else "")
                 if pypi_name:
                     canon = canonicalize_pkg_name(pypi_name)
-                    target_map = canonical_guarded_map if dep.status == "guarded" else canonical_missing_map
+                    target_map = canonical_guarded_map if dep.status == DependencyStatus.GUARDED else canonical_missing_map
                     target_map.setdefault(canon, []).append(Path(nb_report.notebook_path).name)
                     display_name = pypi_name.replace("_", "-")
                     canonical_to_display.setdefault(canon, display_name)
@@ -4120,11 +4181,6 @@ def format_console_report(summary: BatchAnalysisSummary) -> str:
     out.append("=" * 80)
 
     return "\n".join(out)
-
-
-def format_batch_report(summary: BatchAnalysisSummary) -> str:
-    """Legacy alias redirecting to format_console_report."""
-    return format_console_report(summary)
 
 
 def format_json_batch_report(
