@@ -95,6 +95,8 @@ These show up as comments (lines starting with `#`) inside the list of packages 
 | `# package (imported as 'x' in try/except or conditional block - optional fallback)` | The notebook only imports this package inside a fallback block — code written to try one approach and fall back to another if the first isn't available. Since the notebook doesn't strictly require it, it's listed but not force-installed. |
 | `# package (platform pseudo-module provided by runtime environment)`                 | This isn't a real installable package — it's something Kaggle, Databricks, or a similar platform automatically provides while your notebook is running there. Installing it yourself isn't possible and isn't needed.                         |
 | `# package (local repo module; not a PyPI package)`                                  | This "package" is actually a folder of code that lives right next to the notebook, not something from the internet. Nothing to install — it just needs to be copied along with the notebook.                                                  |
+| `# package (imported as 'x'; found on a system-dependent path, which can't and shouldn't be shared directly. ...)` | This package was installed on the author's computer from a location that only exists there, such as a local folder or file. The path isn't written into the notebook. To share it, publish the package or host it at a web address others can install from. |
+| `# package (imported as 'x'; installed from a direct URL, not PyPI; ...)` | This package came from a web address (for example a git repository), not the public package index. The tool records that address and installs from it after the regular packages. Anyone running the notebook must be able to reach it. |
 | `# tool (installed via cell magic; not found in active env)`                         | Something in the notebook ran an install command (like `%pip install`) for a tool that isn't a regular Python import — the tool couldn't confirm it's currently installed. Worth double-checking manually if the notebook depends on it.      |
 
 ### GPU / accelerator messages specifically
@@ -157,7 +159,25 @@ This mirrors your folder structure under the target directory, so two notebooks 
 
 There are a few more options for this mode. See `DEVELOPMENT.md` if you need those — they're less commonly needed and more worth understanding in detail before using.
 
+When you write files (`--output`, `--in-place` or `--output-dir`), the tool also checks every pinned package against PyPI as it goes, and finishes with a **batch dependency validation** section. Each problem is listed once, with the notebooks it affects, so forty notebooks pinning the same withdrawn release show up as one finding rather than forty. With `--format json` the same information is available as a `validation` block. It never changes the tool's exit code.
+
 **Worth knowing about how folder scanning works:** finding notebooks to analyze searches every subfolder, no matter how deep. But recognizing your own local helper files (so they're not mistakenly flagged as "missing packages") only looks in two places: the exact folder you point `--batch` at, and each notebook's own immediate folder. If you have a shared helper file several folders above where your notebooks live, point `--batch` at that shared folder directly (or a common parent of it and your notebooks) rather than a subfolder underneath it, or the tool won't find it.
+
+---
+
+## Checking a locked notebook later
+
+A notebook the tool has locked can be re-checked at any time, without changing anything:
+
+```
+python notebook_env.py my_notebook_merged.ipynb --check-drift
+```
+
+This reads the pinned package list stored in the notebook and compares it with what PyPI says today. Problems come in two groups: **confirmed** (a pinned release was withdrawn or removed, two pins conflict, a release doesn't support the notebook's Python version, or the stored list was edited by hand) and **worth reviewing** (no recent releases, or a newer major version exists). Each finding is tagged `[new]` (not present when the notebook was locked) or `[known]` (already there), so you can tell what changed. Add `--format json` for a version other programs can read; every finding carries a `key` that stays the same between runs, so two reports can be compared without depending on dates or wording. Add `--root-dir DIR` if the notebook relies on local helper files stored relative to a project folder.
+
+The exit code is `0` (nothing to act on), `1` (a confirmed problem, or a new item worth reviewing) or `2` (something couldn't be checked). "Worth reviewing" items that were already known when the notebook was locked don't cause a `1`, and neither do packages that were never on PyPI in the first place (private or custom-index packages), which are listed as notes.
+
+To update a notebook after fixing a problem, fix the package in your own environment first, then run the tool on the notebook again with `--in-place`. It replaces the old setup cells completely, so the stored list and its baseline are refreshed.
 
 ---
 
@@ -169,6 +189,7 @@ Being upfront about this rather than letting you discover it the hard way:
 - If your notebook adds a folder to its search path at runtime (`sys.path.append(...)`) and then imports individual files from it directly, those imports may get flagged as missing packages even though they're really local files. Importing the folder itself as a package (`from my_folder import my_module`) is recognized correctly; it's specifically the "add to search path, then import the file directly" style that isn't.
 - A specific, less common style of import (`from . import something`) isn't detected at all.
 - It only checks packages you import directly — not the packages _those_ packages depend on internally. Those can still change version on their own between installs.
+- Packages that come from somewhere other than PyPI (a git address, a web link, a local folder) are installed as written. The tool can't check whether they're still reachable or whether they changed later, and it doesn't look at what they depend on.
 - It confirms a GPU was _available_, not that every part of the notebook actually used it.
 - It can't automatically fix a hardware-specific build mismatch (like a GPU version tag) — only flag it.
 - Running it against a saved file vs. pasting it into a live notebook can genuinely give different answers (see "Two ways to run it" above) — they're not interchangeable, and picking the wrong one for your situation can produce a misleading result.

@@ -40,6 +40,12 @@ Something didn't install correctly. If the message right after this one mentions
 
 _What to do:_ scroll up, above this failure message, to the actual error text from the install step. That's where the real reason is, usually one of: no internet connection, a package name that's changed or no longer exists, a package name that looks like a local file or folder rather than something published (worth asking whoever gave you this notebook, in that case), or a permissions/disk-space problem on your machine. If you genuinely can't tell what went wrong from the text above, the person who gave you this notebook is your best next step, they'll know what it's supposed to need.
 
+**"Installing non-standard sources (git/URL/local file)..."**
+
+Some things this notebook needs come from somewhere other than the standard package index, such as a git repository, a web link, or a file the author had on their computer. They are installed exactly as the author wrote them, and the tool can't verify them.
+
+_What to do:_ if one of them prints "failed to install", its address is probably unreachable or private. Ask whoever shared the notebook where the package is available now. Nothing is hidden: the notebook will fail later, at the first line that needs it.
+
 ---
 
 ## If the first cell (the description) mentions any of these
@@ -71,6 +77,8 @@ Those are notes, not instructions, anything starting with `#` is skipped, not in
 | `# package (... optional fallback)`                 | This package is only used as a backup option in the notebook, so it wasn't required.                                                                                                                                      |
 | `# package (platform pseudo-module ...)`            | Not a real installable package, it's something automatically provided by the platform you're running on (like Kaggle or Databricks). Nothing to install.                                                                  |
 | `# package (local repo module; not a PyPI package)` | This is a file that's meant to be included right alongside the notebook, not something from the internet. If something's missing, check that all the notebook's files were shared with you, not just the notebook itself. |
+| `# package (... found on a system-dependent path ...)` | This was installed on the author's computer from a location that only exists there. It won't be installed for you. Ask whoever shared the notebook where the package is available. |
+| `# package (... installed from a direct URL, not PyPI ...)` | This came from a web address, such as a git repository, rather than the public package index. The setup cell installs it from that address, so you need to be able to reach it. |
 | `# tool (... not found in active env)`              | Something the notebook tries to use couldn't be confirmed as installed. Worth mentioning to whoever shared the notebook with you if it seems related to what's failing.                                                   |
 
 ---
