@@ -533,13 +533,13 @@ class TestPackageRequirements:
 
 class TestBlueprintGeneration:
     def test_returns_both_sections(self) -> None:
-        manifest_items = [{"name": "numpy", "version": "1.26.0", "flags": []}]
+        manifest_items = [ne.PinnedDependency("numpy", "1.26.0")]
         blueprint: BlueprintResult = ne.generate_production_blueprint(manifest_items)
         assert "step1_markdown" in blueprint
         assert "step2_code" in blueprint
 
     def test_python_version_guard_matches_runtime(self) -> None:
-        manifest_items = [{"name": "numpy", "version": "1.26.0", "flags": []}]
+        manifest_items = [ne.PinnedDependency("numpy", "1.26.0")]
         blueprint: BlueprintResult = ne.generate_production_blueprint(manifest_items)
         expected_guard: str = f"REQUIRED_PYTHON = ({sys.version_info.major}, {sys.version_info.minor})"
         assert expected_guard in blueprint["step2_code"]
@@ -551,17 +551,17 @@ class TestBlueprintGeneration:
             device_name="NVIDIA GeForce RTX 3090 (via PyTorch)",
             frameworks=["torch"],
         )
-        manifest_items = [{"name": "torch", "version": "2.3.1", "flags": []}]
+        manifest_items = [ne.PinnedDependency("torch", "2.3.1")]
         blueprint: BlueprintResult = ne.generate_production_blueprint(manifest_items, gpu_info=gpu_info)
         assert "RTX 3090" in blueprint["step1_markdown"]
 
     def test_gpu_section_omitted_when_no_gpu(self) -> None:
-        manifest_items = [{"name": "numpy", "version": "1.26.0", "flags": []}]
+        manifest_items = [ne.PinnedDependency("numpy", "1.26.0")]
         blueprint: BlueprintResult = ne.generate_production_blueprint(manifest_items, gpu_info=None)
         assert "Hardware Acceleration" not in blueprint["step1_markdown"]
 
     def test_full_freeze_appended_after_manifest(self) -> None:
-        manifest_items = [{"name": "numpy", "version": "1.26.0", "flags": []}]
+        manifest_items = [ne.PinnedDependency("numpy", "1.26.0")]
         blueprint: BlueprintResult = ne.generate_production_blueprint(
             manifest_items, full_freeze_lines=["# certifi==2024.2.2"]
         )
@@ -581,8 +581,8 @@ class TestSequentialExecutionEngine:
     def test_cell2_contains_inline_dependency_structure(self) -> None:
         """Cell 2 embeds dependencies and scoped flags as an inline Python list/dict."""
         manifest_items = [
-            {"name": "torch", "version": "2.3.1+cu121", "flags": ["--extra-index-url", "https://download.pytorch.org/whl/cu121"]},
-            {"name": "pandas", "version": "2.2.1", "flags": []}
+            ne.PinnedDependency("torch", "2.3.1+cu121", ("--extra-index-url", "https://download.pytorch.org/whl/cu121")),
+            ne.PinnedDependency("pandas", "2.2.1")
         ]
         blueprint = ne.generate_production_blueprint(manifest_items)
         code = blueprint["step2_code"]
@@ -597,7 +597,7 @@ class TestSequentialExecutionEngine:
     ) -> None:
         """When a package install fails, Cell 2 prints author-verified version and captures stderr."""
         manifest_items = [
-            {"name": "broken_pkg", "version": "1.0.0", "flags": []}
+            ne.PinnedDependency("broken_pkg", "1.0.0")
         ]
         blueprint = ne.generate_production_blueprint(manifest_items)
         
@@ -621,8 +621,8 @@ class TestSequentialExecutionEngine:
     ) -> None:
         """A failure on package 1 does not abort execution for package 2."""
         manifest_items = [
-            {"name": "fail_pkg", "version": "1.0.0", "flags": []},
-            {"name": "pass_pkg", "version": "2.0.0", "flags": []}
+            ne.PinnedDependency("fail_pkg", "1.0.0"),
+            ne.PinnedDependency("pass_pkg", "2.0.0")
         ]
         blueprint = ne.generate_production_blueprint(manifest_items)
         
@@ -647,8 +647,8 @@ class TestSequentialExecutionEngine:
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         manifest_items = [
-            {"name": "fail_pkg", "version": "1.0.0", "flags": []},
-            {"name": "pass_pkg", "version": "2.0.0", "flags": []}
+            ne.PinnedDependency("fail_pkg", "1.0.0"),
+            ne.PinnedDependency("pass_pkg", "2.0.0")
         ]
         blueprint = ne.generate_production_blueprint(manifest_items)
         

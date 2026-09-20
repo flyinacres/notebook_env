@@ -398,7 +398,7 @@ class TestMarkerEnvironment:
 
 class TestResolveTransitiveGraph:
     def test_resolvable_graph(self):
-        deps = [{"name": "pandas", "version": "2.2.1", "flags": []}]
+        deps = [ne.PinnedDependency("pandas", "2.2.1")]
         resolved, findings = ne.resolve_transitive_graph(deps, REQ_PY_311)
         assert findings == []
         assert resolved["pandas"] == "2.2.1"
@@ -406,8 +406,8 @@ class TestResolveTransitiveGraph:
 
     def test_unresolvable_graph_reports_conflict(self):
         deps = [
-            {"name": "pandas", "version": "2.2.1", "flags": []},
-            {"name": "numpy", "version": "2.5.3", "flags": []},
+            ne.PinnedDependency("pandas", "2.2.1"),
+            ne.PinnedDependency("numpy", "2.5.3"),
         ]
         resolved, findings = ne.resolve_transitive_graph(deps, REQ_PY_311)
         assert resolved is None
@@ -417,7 +417,7 @@ class TestResolveTransitiveGraph:
     def test_extra_gated_requirement_excluded_from_base_resolution(self):
         """pandas's hypothesis requirement is extra=='test'-gated; a base install
         (no extras requested) must not pull it into the graph."""
-        deps = [{"name": "pandas", "version": "2.2.1", "flags": []}]
+        deps = [ne.PinnedDependency("pandas", "2.2.1")]
         resolved, findings = ne.resolve_transitive_graph(deps, REQ_PY_311)
         assert "hypothesis" not in resolved
 
@@ -426,53 +426,53 @@ class TestExtrasInTransitiveGraph:
     """A pin like pandas[test] must pull the extra's own requirements into the graph."""
 
     def test_extra_requirements_are_walked(self):
-        deps = [{"name": "pandas[test]", "version": "2.2.1", "flags": []}]
+        deps = [ne.PinnedDependency("pandas[test]", "2.2.1")]
         resolved, findings = ne.resolve_transitive_graph(deps, REQ_PY_311)
         assert findings == []
         assert resolved["hypothesis"] == "6.100.0"
         assert "sortedcontainers" in resolved  # reachable only through the extra
 
     def test_base_pin_still_excludes_extra_requirements(self):
-        deps = [{"name": "pandas", "version": "2.2.1", "flags": []}]
+        deps = [ne.PinnedDependency("pandas", "2.2.1")]
         resolved, _ = ne.resolve_transitive_graph(deps, REQ_PY_311)
         assert "hypothesis" not in resolved
 
     def test_extras_variant_is_not_reported_as_a_separate_package(self):
-        deps = [{"name": "pandas[test]", "version": "2.2.1", "flags": []}]
+        deps = [ne.PinnedDependency("pandas[test]", "2.2.1")]
         resolved, _ = ne.resolve_transitive_graph(deps, REQ_PY_311)
         assert not [name for name in resolved if "[" in name]
         assert resolved["pandas"] == "2.2.1"
 
     def test_every_requested_extra_is_walked(self):
-        deps = [{"name": "multi-extra-pkg[a,b]", "version": "1.0.0", "flags": []}]
+        deps = [ne.PinnedDependency("multi-extra-pkg[a,b]", "1.0.0")]
         resolved, findings = ne.resolve_transitive_graph(deps, REQ_PY_311)
         assert findings == []
         assert {"alpha-dep", "beta-dep", "core-dep"} <= set(resolved)
 
     def test_only_the_requested_extra_is_walked(self):
-        deps = [{"name": "multi-extra-pkg[a]", "version": "1.0.0", "flags": []}]
+        deps = [ne.PinnedDependency("multi-extra-pkg[a]", "1.0.0")]
         resolved, _ = ne.resolve_transitive_graph(deps, REQ_PY_311)
         assert "alpha-dep" in resolved
         assert "beta-dep" not in resolved
         assert "core-dep" in resolved
 
     def test_extra_named_by_a_transitive_requirement_is_walked(self):
-        deps = [{"name": "meta-pkg", "version": "1.0.0", "flags": []}]
+        deps = [ne.PinnedDependency("meta-pkg", "1.0.0")]
         resolved, findings = ne.resolve_transitive_graph(deps, REQ_PY_311)
         assert findings == []
         assert "hypothesis" in resolved  # meta-pkg -> pandas[test] -> hypothesis
 
     def test_conflict_created_by_an_extra_is_reported(self):
         deps = [
-            {"name": "pandas[test]", "version": "2.2.1", "flags": []},
-            {"name": "hypothesis", "version": "5.0.0", "flags": []},  # pandas[test] needs >=6.46.1
+            ne.PinnedDependency("pandas[test]", "2.2.1"),
+            ne.PinnedDependency("hypothesis", "5.0.0"),  # pandas[test] needs >=6.46.1
         ]
         resolved, findings = ne.resolve_transitive_graph(deps, REQ_PY_311)
         assert resolved is None
         assert findings and all(f.signal == "conflict" and f.severity == "confirmed" for f in findings)
 
     def test_unknown_extra_adds_nothing_and_does_not_fail(self):
-        deps = [{"name": "pandas[nonexistent]", "version": "2.2.1", "flags": []}]
+        deps = [ne.PinnedDependency("pandas[nonexistent]", "2.2.1")]
         resolved, findings = ne.resolve_transitive_graph(deps, REQ_PY_311)
         assert findings == []
         assert "hypothesis" not in resolved
@@ -480,11 +480,11 @@ class TestExtrasInTransitiveGraph:
 
     def test_signals_reach_packages_only_reachable_through_the_extra(self):
         with_extra = ne.check_transitive_signals(
-            [{"name": "pandas[test]", "version": "2.2.1", "flags": []}], REQ_PY_311)
+            [ne.PinnedDependency("pandas[test]", "2.2.1")], REQ_PY_311)
         assert [f for f in with_extra if f.signal == "yanked" and f.package == "sortedcontainers"]
 
         without = ne.check_transitive_signals(
-            [{"name": "pandas", "version": "2.2.1", "flags": []}], REQ_PY_311)
+            [ne.PinnedDependency("pandas", "2.2.1")], REQ_PY_311)
         assert not [f for f in without if f.package == "sortedcontainers"]
 
     def test_all_requested_extras_are_parsed(self):
@@ -495,12 +495,12 @@ class TestExtrasInTransitiveGraph:
 
 class TestCheckTransitiveSignals:
     def test_direct_pins_are_skipped(self):
-        deps = [{"name": "pandas", "version": "2.2.1", "flags": []}]
+        deps = [ne.PinnedDependency("pandas", "2.2.1")]
         findings = ne.check_transitive_signals(deps, REQ_PY_311)
         assert all(f.package != "pandas" for f in findings)
 
     def test_transitive_package_checked_against_resolved_version(self):
-        deps = [{"name": "pandas", "version": "2.2.1", "flags": []}]
+        deps = [ne.PinnedDependency("pandas", "2.2.1")]
         findings = ne.check_transitive_signals(deps, {"major": 3, "minor": 8})
         # numpy resolves to 1.26.4 here (only version satisfying pandas's non-3.11/3.12 branch);
         # 1.26.4 declares requires-python >=3.9, which doesn't cover 3.8.
@@ -509,8 +509,8 @@ class TestCheckTransitiveSignals:
 
     def test_unresolvable_graph_short_circuits_to_conflict_findings(self):
         deps = [
-            {"name": "pandas", "version": "2.2.1", "flags": []},
-            {"name": "numpy", "version": "2.5.3", "flags": []},
+            ne.PinnedDependency("pandas", "2.2.1"),
+            ne.PinnedDependency("numpy", "2.5.3"),
         ]
         findings = ne.check_transitive_signals(deps, REQ_PY_311)
         assert all(f.signal == "conflict" for f in findings)
@@ -610,7 +610,7 @@ class TestLocalModuleDriftCheck:
 # Manifest hash verification, shared pin checks, generation-time ordering
 # ---------------------------------------------------------------------------
 
-CLEAN_DEP = {"name": "core-dep", "version": "1.0.0", "flags": []}  # fake package with no findings of any kind
+CLEAN_DEP = ne.PinnedDependency("core-dep", "1.0.0")  # fake package with no findings of any kind
 
 
 def _sha256_of(payload):
@@ -623,7 +623,7 @@ def _old_style_manifest():
     """Shaped and hashed the way a tool version that predates the local_modules field wrote it."""
     manifest = {
         "python_version": {"major": 3, "minor": 11},
-        "dependencies": [dict(CLEAN_DEP)],
+        "dependencies": [CLEAN_DEP.to_dict()],
         "gpu": None,
         "generated_at": "2025-01-01 00:00:00",
         "tool_version": "40",
@@ -654,7 +654,7 @@ class TestManifestHashVerification:
         assert exit_code == 0
 
     def test_freshly_generated_manifest_verifies(self, tmp_path, capsys):
-        result = ne.generate_production_blueprint([dict(CLEAN_DEP)])
+        result = ne.generate_production_blueprint([CLEAN_DEP])
         exit_code, report = _check(_write_literal(tmp_path, result["drift_report"].manifest.to_dict()), capsys)
         assert [f for f in report["confirmed"] if f["signal"] == "tampered"] == []
         assert exit_code == 0
@@ -667,7 +667,7 @@ class TestManifestHashVerification:
         assert exit_code == 1
 
     def test_deleting_a_field_is_detected(self, tmp_path, capsys):
-        result = ne.generate_production_blueprint([dict(CLEAN_DEP)])
+        result = ne.generate_production_blueprint([CLEAN_DEP])
         manifest = result["drift_report"].manifest.to_dict()
         del manifest["local_modules"]
         _, report = _check(_write_literal(tmp_path, manifest), capsys)
@@ -700,9 +700,9 @@ class TestPinChecksAreSharedBetweenGenerationAndCheckDrift:
 
     def test_identical_checks_in_both_paths(self, tmp_path, monkeypatch, capsys):
         deps = [
-            dict(CLEAN_DEP),
-            {"name": "torch", "version": "2.3.1+cu121", "flags": []},  # local version: skipped by direct checks
-            {"name": "pandas[test]", "version": "2.2.1", "flags": []},
+            CLEAN_DEP,
+            ne.PinnedDependency("torch", "2.3.1+cu121"),  # local version: skipped by direct checks
+            ne.PinnedDependency("pandas[test]", "2.2.1"),
         ]
         generated, checked = [], []
 
@@ -718,7 +718,7 @@ class TestPinChecksAreSharedBetweenGenerationAndCheckDrift:
         assert generated == checked
 
     def test_local_version_pin_yields_the_same_finding_in_both_paths(self, tmp_path, capsys):
-        deps = [{"name": "torch", "version": "2.3.1+cu121", "flags": []}]
+        deps = [ne.PinnedDependency("torch", "2.3.1+cu121")]
         result = ne.generate_production_blueprint(deps)
         at_generation = [f.to_dict() for f in result["drift_report"].heuristic]
         path = _write_literal(tmp_path, result["drift_report"].manifest.to_dict())
@@ -742,7 +742,7 @@ class TestGenerationOrdering:
             return real_hash(self)
 
         monkeypatch.setattr(ne.SteadyPyManifest, "compute_and_set_hash", spy)
-        ne.generate_production_blueprint([dict(CLEAN_DEP)])
+        ne.generate_production_blueprint([CLEAN_DEP])
         assert "checks" in order and "hash" in order
         assert order.index("checks") < order.index("hash")
 
@@ -773,9 +773,9 @@ def _by_signal(report, bucket, signal):
     return [f for f in report[bucket] if f["signal"] == signal]
 
 
-REQUESTS_YANKED = {"name": "requests", "version": "2.32.0", "flags": []}  # yanked (confirmed) + stale (heuristic)
-STALE_ONLY = {"name": "stale-package", "version": "1.0.0", "flags": []}   # stale (heuristic) only
-OLD_NUMPY = {"name": "numpy", "version": "1.26.4", "flags": []}           # major_bump (heuristic) only at 3.11
+REQUESTS_YANKED = ne.PinnedDependency("requests", "2.32.0")  # yanked (confirmed) + stale (heuristic)
+STALE_ONLY = ne.PinnedDependency("stale-package", "1.0.0")   # stale (heuristic) only
+OLD_NUMPY = ne.PinnedDependency("numpy", "1.26.4")           # major_bump (heuristic) only at 3.11
 
 
 class TestBaselineKeys:
@@ -813,7 +813,7 @@ class TestBaselineKeys:
         assert ne.finding_baseline_key(ne.DriftFinding("x", "1", signal, severity, "m")) is None
 
     def test_conflict_findings_carry_their_parent(self):
-        deps = [{"name": "pandas", "version": "2.2.1", "flags": []}, {"name": "numpy", "version": "2.5.3", "flags": []}]
+        deps = [ne.PinnedDependency("pandas", "2.2.1"), ne.PinnedDependency("numpy", "2.5.3")]
         _, findings = ne.resolve_transitive_graph(deps, REQ_PY_311)
         assert findings and all("parent" in f.details for f in findings)  # "" for a requirement from a direct pin
         assert any(f.details["parent"] == "pandas" for f in findings)
@@ -821,27 +821,27 @@ class TestBaselineKeys:
 
 class TestGenerationRecordsBaseline:
     def test_findings_at_generation_are_recorded(self):
-        baseline = ne.generate_production_blueprint([dict(REQUESTS_YANKED)])["drift_report"].manifest.baseline
+        baseline = ne.generate_production_blueprint([REQUESTS_YANKED])["drift_report"].manifest.baseline
         assert baseline["version"] == 1
         assert ["yanked", "requests", "2.32.0"] in baseline["findings"]
         assert ["stale", "requests"] in baseline["findings"]
         assert baseline["errors"] == []
 
     def test_clean_generation_records_an_empty_baseline_not_none(self):
-        manifest = ne.generate_production_blueprint([dict(CLEAN_DEP)])["drift_report"].manifest
+        manifest = ne.generate_production_blueprint([CLEAN_DEP])["drift_report"].manifest
         assert manifest.baseline == {"version": 1, "findings": [], "errors": []}
 
     def test_packages_that_could_not_be_checked_are_recorded(self):
-        deps = [{"name": "flaky-package", "version": "1.0.0", "flags": []}]
+        deps = [ne.PinnedDependency("flaky-package", "1.0.0")]
         baseline = ne.generate_production_blueprint(deps)["drift_report"].manifest.baseline
         assert baseline["errors"] == ["flaky-package"]
 
     def test_generation_report_findings_are_not_tagged(self):
-        report = ne.generate_production_blueprint([dict(REQUESTS_YANKED)])["drift_report"]
+        report = ne.generate_production_blueprint([REQUESTS_YANKED])["drift_report"]
         assert report.confirmed and all(f.baseline_status is None for f in report.confirmed + report.heuristic)
 
     def test_baseline_is_covered_by_the_hash(self, tmp_path, capsys):
-        _, manifest = _generate_file(tmp_path, [dict(REQUESTS_YANKED)])
+        _, manifest = _generate_file(tmp_path, [REQUESTS_YANKED])
         forged = manifest.to_dict()
         forged["baseline"] = {"version": 1, "findings": [], "errors": []}  # silences the recorded yank
         _, report = _check(_write_literal(tmp_path, forged, "forged.py"), capsys)
@@ -850,14 +850,14 @@ class TestGenerationRecordsBaseline:
 
 class TestCheckDriftClassifiesAgainstBaseline:
     def test_unchanged_world_reports_everything_as_known(self, tmp_path, capsys):
-        path, _ = _generate_file(tmp_path, [dict(REQUESTS_YANKED)])
+        path, _ = _generate_file(tmp_path, [REQUESTS_YANKED])
         exit_code, report = _check(path, capsys)
         assert [f["baseline_status"] for f in report["confirmed"]] == ["known"]
         assert [f["baseline_status"] for f in report["heuristic"]] == ["known"]
         assert exit_code == 1  # a known confirmed finding still fails the check
 
     def test_new_confirmed_finding_is_tagged_new(self, tmp_path, monkeypatch, capsys):
-        path, _ = _generate_file(tmp_path, [dict(CLEAN_DEP)])
+        path, _ = _generate_file(tmp_path, [CLEAN_DEP])
 
         def yank(world):
             world["core-dep"]["versions"]["1.0.0"]["yanked"] = True
@@ -868,13 +868,13 @@ class TestCheckDriftClassifiesAgainstBaseline:
         assert exit_code == 1
 
     def test_known_heuristic_alone_does_not_fail_the_check(self, tmp_path, capsys):
-        path, _ = _generate_file(tmp_path, [dict(STALE_ONLY)])
+        path, _ = _generate_file(tmp_path, [STALE_ONLY])
         exit_code, report = _check(path, capsys)
         assert [f["baseline_status"] for f in report["heuristic"]] == ["known"]
         assert exit_code == 0
 
     def test_new_heuristic_fails_the_check(self, tmp_path, monkeypatch, capsys):
-        path, _ = _generate_file(tmp_path, [dict(CLEAN_DEP)])
+        path, _ = _generate_file(tmp_path, [CLEAN_DEP])
 
         def go_stale(world):
             world["core-dep"]["releases"]["1.0.0"]["upload_time"] = "2020-01-01T00:00:00.000000Z"
@@ -885,7 +885,7 @@ class TestCheckDriftClassifiesAgainstBaseline:
         assert exit_code == 1
 
     def test_same_signal_with_different_facts_is_new(self, tmp_path, monkeypatch, capsys):
-        path, _ = _generate_file(tmp_path, [dict(OLD_NUMPY)])  # major_bump: latest major was 2
+        path, _ = _generate_file(tmp_path, [OLD_NUMPY])  # major_bump: latest major was 2
 
         def newer_major(world):
             world["numpy"]["latest_version"] = "3.0.0"
@@ -896,7 +896,7 @@ class TestCheckDriftClassifiesAgainstBaseline:
         assert [f["baseline_status"] for f in _by_signal(report, "heuristic", "major_bump")] == ["new"]
 
     def test_finding_on_a_package_that_errored_at_generation_is_not_claimed_new(self, tmp_path, monkeypatch, capsys):
-        path, _ = _generate_file(tmp_path, [{"name": "flaky-package", "version": "1.0.0", "flags": []}])
+        path, _ = _generate_file(tmp_path, [ne.PinnedDependency("flaky-package", "1.0.0")])
 
         def recovers(world):
             world["flaky-package"] = copy.deepcopy(world["stale-package"])
@@ -908,7 +908,7 @@ class TestCheckDriftClassifiesAgainstBaseline:
         assert exit_code == 1
 
     def test_new_findings_are_listed_before_known_ones(self, tmp_path, monkeypatch, capsys):
-        path, _ = _generate_file(tmp_path, [dict(REQUESTS_YANKED), dict(CLEAN_DEP)])
+        path, _ = _generate_file(tmp_path, [REQUESTS_YANKED, CLEAN_DEP])
 
         def yank(world):
             world["core-dep"]["versions"]["1.0.0"]["yanked"] = True
@@ -920,7 +920,7 @@ class TestCheckDriftClassifiesAgainstBaseline:
         ]
 
     def test_console_report_tags_each_finding(self, tmp_path, monkeypatch, capsys):
-        path, _ = _generate_file(tmp_path, [dict(REQUESTS_YANKED), dict(CLEAN_DEP)])
+        path, _ = _generate_file(tmp_path, [REQUESTS_YANKED, CLEAN_DEP])
 
         def yank(world):
             world["core-dep"]["versions"]["1.0.0"]["yanked"] = True
@@ -931,7 +931,7 @@ class TestCheckDriftClassifiesAgainstBaseline:
         assert "[new]" in out and "[known]" in out
 
     def test_json_summarizes_the_split(self, tmp_path, monkeypatch, capsys):
-        path, _ = _generate_file(tmp_path, [dict(REQUESTS_YANKED), dict(CLEAN_DEP)])
+        path, _ = _generate_file(tmp_path, [REQUESTS_YANKED, CLEAN_DEP])
 
         def yank(world):
             world["core-dep"]["versions"]["1.0.0"]["yanked"] = True
@@ -942,7 +942,7 @@ class TestCheckDriftClassifiesAgainstBaseline:
 
     def test_manifest_without_a_baseline_is_reported_flat_as_before(self, tmp_path, capsys):
         manifest = _old_style_manifest()
-        manifest["dependencies"] = [dict(STALE_ONLY)]
+        manifest["dependencies"] = [STALE_ONLY.to_dict()]
         manifest["dependency_hash"] = _sha256_of(manifest)
         path = _write_literal(tmp_path, manifest)
 
@@ -956,7 +956,7 @@ class TestCheckDriftClassifiesAgainstBaseline:
 
     def test_unrecognized_baseline_format_is_treated_as_no_baseline(self, tmp_path, capsys):
         manifest = _old_style_manifest()
-        manifest["dependencies"] = [dict(STALE_ONLY)]
+        manifest["dependencies"] = [STALE_ONLY.to_dict()]
         manifest["baseline"] = {"version": 99, "findings": [["stale", "stale-package"]], "errors": []}
         manifest["dependency_hash"] = _sha256_of(manifest)
 
@@ -971,17 +971,17 @@ class TestCheckDriftClassifiesAgainstBaseline:
 # an expected state (private/custom-index package), not drift.
 # ---------------------------------------------------------------------------
 
-PRIVATE_PKG = {"name": "my-private-pkg", "version": "1.0.0", "flags": []}  # not on the fake PyPI
+PRIVATE_PKG = ne.PinnedDependency("my-private-pkg", "1.0.0")  # not on the fake PyPI
 
 
 class TestKnownCustomSources:
     def test_generation_still_reports_it_as_a_confirmed_finding(self):
-        report = ne.generate_production_blueprint([dict(PRIVATE_PKG)])["drift_report"]
+        report = ne.generate_production_blueprint([PRIVATE_PKG])["drift_report"]
         assert [f.signal for f in report.confirmed] == ["not_found_on_pypi"]
         assert report.confirmed[0].baseline_status is None
 
     def test_known_one_is_a_notice_and_does_not_fail_the_check(self, tmp_path, capsys):
-        path, _ = _generate_file(tmp_path, [dict(PRIVATE_PKG)])
+        path, _ = _generate_file(tmp_path, [PRIVATE_PKG])
         exit_code, report = _check(path, capsys)
         assert report["confirmed"] == []
         assert [(f["signal"], f["severity"], f["baseline_status"]) for f in report["notices"]] == [
@@ -991,7 +991,7 @@ class TestKnownCustomSources:
         assert exit_code == 0
 
     def test_console_report_lists_it_as_a_notice_and_stays_clean(self, tmp_path, capsys):
-        path, _ = _generate_file(tmp_path, [dict(PRIVATE_PKG)])
+        path, _ = _generate_file(tmp_path, [PRIVATE_PKG])
         exit_code = ne.run_check_drift_pipeline(str(path))
         out = capsys.readouterr().out
         assert "CUSTOM SOURCES" in out and "[known] [not_found_on_pypi]" in out
@@ -1000,7 +1000,7 @@ class TestKnownCustomSources:
         assert exit_code == 0
 
     def test_a_package_that_vanished_from_pypi_since_generation_still_fails(self, tmp_path, monkeypatch, capsys):
-        path, _ = _generate_file(tmp_path, [dict(CLEAN_DEP)])
+        path, _ = _generate_file(tmp_path, [CLEAN_DEP])
 
         def vanishes(world):
             del world["core-dep"]
@@ -1012,7 +1012,7 @@ class TestKnownCustomSources:
         assert exit_code == 1
 
     def test_a_real_new_finding_still_fails_alongside_a_known_custom_source(self, tmp_path, monkeypatch, capsys):
-        path, _ = _generate_file(tmp_path, [dict(PRIVATE_PKG), dict(CLEAN_DEP)])
+        path, _ = _generate_file(tmp_path, [PRIVATE_PKG, CLEAN_DEP])
 
         def yank(world):
             world["core-dep"]["versions"]["1.0.0"]["yanked"] = True
@@ -1025,7 +1025,7 @@ class TestKnownCustomSources:
 
     def test_without_a_baseline_it_stays_a_confirmed_finding(self, tmp_path, capsys):
         manifest = _old_style_manifest()
-        manifest["dependencies"] = [dict(PRIVATE_PKG)]
+        manifest["dependencies"] = [PRIVATE_PKG.to_dict()]
         manifest["dependency_hash"] = _sha256_of(manifest)
         exit_code, report = _check(_write_literal(tmp_path, manifest), capsys)
         assert [f["signal"] for f in report["confirmed"]] == ["not_found_on_pypi"]
@@ -1055,7 +1055,7 @@ class TestFindingKeyInJson:
         assert a.to_dict()["key"] == b.to_dict()["key"] and a.to_dict()["message"] != b.to_dict()["message"]
 
     def test_check_drift_json_carries_keys(self, tmp_path, capsys):
-        path, _ = _generate_file(tmp_path, [dict(REQUESTS_YANKED)])
+        path, _ = _generate_file(tmp_path, [REQUESTS_YANKED])
         _, report = _check(path, capsys)
         assert [f["key"] for f in report["confirmed"]] == [["yanked", "requests", "2.32.0"]]
         assert [f["key"] for f in report["heuristic"]] == [["stale", "requests"]]

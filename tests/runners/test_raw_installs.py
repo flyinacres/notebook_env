@@ -219,12 +219,12 @@ def main() -> None:
         merged, manifest, cell2, text = generate(step, [f"%pip install {wheel}\n", verify_code("explicit-path")], "explicit")
         merged_files.append(merged)
         show("raw_installs", manifest.raw_installs)
-        show("pinned", [d["name"] for d in manifest.dependencies])
+        show("pinned", [d.name for d in manifest.dependencies])
         show("Cell 2 says", line_with(cell2, DIST_NAME))
         check(step, "the notebook's own path is carried verbatim in raw_installs",
               manifest.raw_installs == [str(wheel)], raw_installs=manifest.raw_installs)
         check(step, "the package is not pinned as if it were on PyPI",
-              not [d for d in manifest.dependencies if DIST_NAME in d["name"]], dependencies=manifest.dependencies)
+              not [d for d in manifest.dependencies if DIST_NAME in d.name], dependencies=manifest.dependencies)
         check(step, "the installed package is not reported as 'not found'",
               "not found via pip-freeze" not in cell2, cell2=cell2[:1500])
         remove_package(step, verify=True)
@@ -243,12 +243,12 @@ def main() -> None:
         merged_files.append(merged)
         inferred_url_notebook = merged
         show("raw_installs", manifest.raw_installs)
-        show("pinned", [d["name"] for d in manifest.dependencies])
+        show("pinned", [d.name for d in manifest.dependencies])
         show("Cell 2 says", line_with(cell2, DIST_NAME))
         check(step, "the recorded source URL is inferred into raw_installs",
               manifest.raw_installs == [url], raw_installs=manifest.raw_installs)
         check(step, "the package is not pinned as if it were on PyPI",
-              not [d for d in manifest.dependencies if DIST_NAME in d["name"]], dependencies=manifest.dependencies)
+              not [d for d in manifest.dependencies if DIST_NAME in d.name], dependencies=manifest.dependencies)
         check(step, "Cell 2 describes it as installed from a direct URL, not 'not found'",
               "not found via pip-freeze" not in cell2 and "installed from a direct URL" in cell2, cell2=cell2[:1500])
         remove_package(step, verify=True)

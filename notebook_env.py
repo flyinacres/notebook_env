@@ -313,6 +313,10 @@ class DependencyEntry:
             "flags": self.flags
         }
 
+    def to_pin(self) -> "PinnedDependency":
+        """This entry as a manifest pin (only meaningful for an installable, non-comment entry)."""
+        return PinnedDependency(name=self.name, version=self.version, flags=tuple(self.flags))
+
     def to_report_dict(self) -> Dict[str, Any]:
         """Converts to full JSON report representation."""
         return {
@@ -367,6 +371,30 @@ class GpuInfo:
         }
 
 
+@dataclass(frozen=True)
+class PinnedDependency:
+    """One pinned direct dependency as recorded in the manifest and consumed by the drift checks.
+
+    `name` may carry an extras tag ("pandas[test]"). Only the persisted manifest literal uses the
+    dict form (to_dict / from_dict); everything in memory uses this type.
+    """
+    name: str
+    version: str
+    flags: Tuple[str, ...] = ()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"name": self.name, "version": self.version, "flags": list(self.flags)}
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "PinnedDependency":
+        if not isinstance(data, dict):
+            raise TypeError(f"a pinned dependency must be a dict, not {type(data).__name__}")
+        name, version = data.get("name"), data.get("version")
+        if not isinstance(name, str) or not isinstance(version, str):
+            raise TypeError(f"a pinned dependency needs a string 'name' and 'version', got {data!r}")
+        return cls(name=name, version=version, flags=tuple(data.get("flags") or ()))
+
+
 def _manifest_payload_hash(payload: Dict[str, Any]) -> str:
     """SHA-256 of canonical (sorted-key) JSON of every field except dependency_hash itself."""
     body = {k: v for k, v in payload.items() if k != "dependency_hash"}
@@ -392,7 +420,7 @@ class SteadyPyManifest:
     creator's directory structure.
     """
     python_version: Dict[str, int]
-    dependencies: List[Dict[str, Any]]
+    dependencies: List[PinnedDependency]
     gpu: Optional[Dict[str, Any]]
     generated_at: str
     tool_version: str = TOOL_VERSION
@@ -413,14 +441,19 @@ class SteadyPyManifest:
         current field set. Adding a field to the manifest therefore never makes an older
         manifest look hand-edited, and deleting a field from a newer one is still caught.
         """
-        manifest = cls(**data)
+        if not isinstance(data, dict):
+            raise TypeError(f"the manifest literal must be a dict, not {type(data).__name__}")
+        deps = data.get("dependencies")
+        if not isinstance(deps, list):
+            raise TypeError("the manifest's 'dependencies' must be a list")
+        manifest = cls(**{**data, "dependencies": [PinnedDependency.from_dict(d) for d in deps]})
         manifest.verified_hash = _manifest_payload_hash(data)
         return manifest
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "python_version": self.python_version,
-            "dependencies": self.dependencies,
+            "dependencies": [d.to_dict() for d in self.dependencies],
             "gpu": self.gpu,
             "generated_at": self.generated_at,
             "tool_version": self.tool_version,
@@ -2553,7 +2586,7 @@ class _PyPIResolutionProvider(AbstractProvider):
 
 
 def resolve_transitive_graph(
-    dependencies: List[Dict[str, Any]], required_python: Dict[str, int]
+    dependencies: List[PinnedDependency], required_python: Dict[str, int]
 ) -> Tuple[Optional[Dict[str, str]], List[DriftFinding]]:
     """Resolves direct pins + everything transitively required, from PyPI metadata alone.
 
@@ -2564,7 +2597,7 @@ def resolve_transitive_graph(
     """
     root_reqs = []
     for dep in dependencies:
-        raw_name, version = dep.get("name"), dep.get("version")
+        raw_name, version = dep.name, dep.version
         if not raw_name or not version:
             continue
         if _has_local_version_identifier(version):
@@ -2613,7 +2646,7 @@ def resolve_transitive_graph(
 
 
 def check_transitive_signals(
-    dependencies: List[Dict[str, Any]], required_python: Dict[str, int]
+    dependencies: List[PinnedDependency], required_python: Dict[str, int]
 ) -> List[DriftFinding]:
     """Resolves the full graph, then runs yanked/removed, staleness, major-bump, and
     python-support against every transitively-discovered package's resolved version.
@@ -2625,8 +2658,8 @@ def check_transitive_signals(
         return findings  # unresolvable -- conflict findings already built
 
     direct_names = {
-        canonicalize_pkg_name(_split_pin_name(d["name"])[0])
-        for d in dependencies if d.get("name")
+        canonicalize_pkg_name(_split_pin_name(d.name)[0])
+        for d in dependencies if d.name
     }
 
     for name, version in resolved.items():
@@ -2640,7 +2673,7 @@ def check_transitive_signals(
     return findings
 
 
-def run_pin_checks(dependencies: List[Dict[str, Any]], python_version: Dict[str, int]) -> List[DriftFinding]:
+def run_pin_checks(dependencies: List[PinnedDependency], python_version: Dict[str, int]) -> List[DriftFinding]:
     """Every PyPI-based check against a list of pins, direct and transitive.
 
     The single implementation behind both generation-time validation and --check-drift.
@@ -2650,7 +2683,7 @@ def run_pin_checks(dependencies: List[Dict[str, Any]], python_version: Dict[str,
     """
     findings: List[DriftFinding] = []
     for dep in dependencies:
-        name, version = dep.get("name"), dep.get("version")
+        name, version = dep.name, dep.version
         if not name or not version:
             continue
         if _has_local_version_identifier(version):
@@ -2747,7 +2780,7 @@ def classify_against_baseline(findings: List[DriftFinding], manifest: SteadyPyMa
         return False
     known, errored = parsed
     direct = {
-        canonicalize_pkg_name(_split_pin_name(d["name"])[0]) for d in manifest.dependencies if d.get("name")
+        canonicalize_pkg_name(_split_pin_name(d.name)[0]) for d in manifest.dependencies if d.name
     }
     graph_check_failed = "" in errored
     for f in findings:
@@ -3442,7 +3475,7 @@ def resolve_notebook_gpu_info(nb_imports: Any, batch_hw_cache: Optional[GpuInfo]
 # =====================================================================
 
 def generate_production_blueprint(
-    manifest_items: List[Union[DependencyEntry, Dict[str, Any], str]], 
+    manifest_items: List[Union[DependencyEntry, PinnedDependency, str]], 
     full_freeze_lines: Optional[List[str]] = None, 
     local_tagged_info: Optional[List[Tuple[str, List[str]]]] = None, 
     gpu_info: Optional[GpuInfo] = None,
@@ -3453,7 +3486,7 @@ def generate_production_blueprint(
     py_major, py_minor = sys.version_info.major, sys.version_info.minor
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    normalized_items: List[Dict[str, Any]] = []
+    normalized_items: List[PinnedDependency] = []
     comment_lines: List[str] = []
     local_modules_captured: List[Dict[str, str]] = []
     direct_reference_specs: List[str] = []
@@ -3467,8 +3500,8 @@ def generate_production_blueprint(
                 if item.status == DependencyStatus.LOCAL_MODULE and item.anchor:
                     local_modules_captured.append({"name": item.name, "anchor": item.anchor})
             else:
-                normalized_items.append(item.to_dict())
-        elif isinstance(item, dict):
+                normalized_items.append(item.to_pin())
+        elif isinstance(item, PinnedDependency):
             normalized_items.append(item)
         elif isinstance(item, str):
             clean_item = item.strip()
@@ -3478,7 +3511,7 @@ def generate_production_blueprint(
             parts = clean_item.split("==")
             name = parts[0]
             ver = parts[1] if len(parts) > 1 else ""
-            normalized_items.append({"name": name, "version": ver, "flags": []})
+            normalized_items.append(PinnedDependency(name=name, version=ver))
 
     gpu_markdown_section = ""
     if gpu_info and gpu_info.has_gpu:
@@ -3526,7 +3559,7 @@ def generate_production_blueprint(
     # nothing extra -- run_pin_checks below reaches the same pins.
     custom_sourced_names: List[str] = []
     for dep in normalized_items:
-        name, version = dep.get("name"), dep.get("version")
+        name, version = dep.name, dep.version
         if not name or not version:
             continue
         bare_name, _extra = _split_pin_name(name)

@@ -284,7 +284,7 @@ def test_untagged_prior_setup_cells_are_fully_replaced(sample_notebook_file, moc
 
     manifest, error = ne.extract_manifest_from_file(str(out_path))
     assert error is None
-    assert {d["name"]: d["version"] for d in manifest.dependencies}.get("pandas") == "2.2.0"
+    assert {d.name: d.version for d in manifest.dependencies}.get("pandas") == "2.2.0"
 
 
 def test_inplace_keeps_user_cells_that_only_mention_the_manifest(sample_notebook_file, mock_frozen_env):

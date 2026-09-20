@@ -173,7 +173,7 @@ class TestGeneratedManifest:
             {"zzq-remote": REMOTE_PIN}, {"zzqremote": ["zzq-remote"]},
         )
         assert manifest.raw_installs == [REMOTE_URL]
-        assert all("zzq-remote" not in d["name"] for d in manifest.dependencies)
+        assert all("zzq-remote" not in d.name for d in manifest.dependencies)
 
     def test_notebooks_own_install_line_is_not_duplicated(self, tmp_path):
         author_spec = "git+https://example.com/org/zzq-remote.git@v1.0"

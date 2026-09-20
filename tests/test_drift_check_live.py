@@ -106,15 +106,15 @@ class TestLiveTransitiveResolution:
         """pandas 2.2.1 declares numpy<2 in every marker branch; pinning numpy>=2.5
         alongside it is a genuine, permanent conflict."""
         deps = [
-            {"name": "pandas", "version": "2.2.1", "flags": []},
-            {"name": "numpy", "version": "2.5.0", "flags": []},
+            ne.PinnedDependency("pandas", "2.2.1"),
+            ne.PinnedDependency("numpy", "2.5.0"),
         ]
         resolved, findings = ne.resolve_transitive_graph(deps, {"major": 3, "minor": 11})
         assert resolved is None
         assert any(f.signal == "conflict" for f in findings)
 
     def test_real_resolvable_graph(self):
-        deps = [{"name": "pandas", "version": "2.2.1", "flags": []}]
+        deps = [ne.PinnedDependency("pandas", "2.2.1")]
         resolved, findings = ne.resolve_transitive_graph(deps, {"major": 3, "minor": 11})
         assert findings == []
         assert resolved["pandas"] == "2.2.1"
@@ -123,7 +123,7 @@ class TestLiveTransitiveResolution:
 
     def test_real_extra_is_expanded(self):
         """pandas 2.2.1 declares hypothesis under extra == "test" (historical, immutable)."""
-        deps = [{"name": "pandas[test]", "version": "2.2.1", "flags": []}]
+        deps = [ne.PinnedDependency("pandas[test]", "2.2.1")]
         resolved, findings = ne.resolve_transitive_graph(deps, {"major": 3, "minor": 11})
         assert findings == []
         assert resolved["pandas"] == "2.2.1"
